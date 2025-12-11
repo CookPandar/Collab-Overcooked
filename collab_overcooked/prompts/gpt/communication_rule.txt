@@ -1,41 +1,38 @@
-Input:
-- For each step, you will receive input like the following:
-  - 1. Your successful action history in the past steps is: XXX  
-    - A dictionary of all actions you've successfully performed in recent time steps. Use this information to infer your past plans and continue forward.
-  - 2. Here are lessons learned from past failures that can guide your decisions:  
-    - Reflect on past mistakes to avoid repeating them when making new plans.
-  - 3. {role} space: utensil1, utensil2, utensil3, XXX  
-    - The {role} can only use the utensils in the {role} space; you cannot use any utensils outside this area.
-  - 4. Order: order  
-    - You only need to complete the current order.
-  - 5. Scene: The planned sequence of actions (yet to be performed) for you and your teammate, status of each ingredient and utensil.  
-    - "The planned sequence of actions" refers to what each role intends to do in the upcoming time step, and none of these actions are completed yet.  
-    - Based on the "Scene", gather the existing plans for both roles, along with the status of utensils and ingredients, to plan the next steps efficiently.  
-    - If a dish is already finished, the {role} should consider serving it immediately.
-  - 6. Past conversation turns:  
-    - {teammate} says (turn 1): XXX  
-    - {role} says (turn 1): XXX  
-    - {teammate} says (turn 2): XXX  
-    - {role} says (turn 2): XXX  
-    - ...  
-    - Each line of conversation history follows this structure: sender of the message + "says" + "turn number". Messages with the same turn number are grouped together.  
-    - Read the conversation history from top to bottom, with the most recent messages at the bottom.  
-    - You need to respond to your teammate's most recent message.
-Output:
+Input
+-----
+For every timestep you receive a full snapshot containing:
+1. The last three decision records, each with:
+   - `Order`: the current recipe to complete.
+   - `Scene`: status of every ingredient and utensil.
+   - `Agent State`: what you and your teammate are holding or doing.
+   - `Past conversation turns`: chronological dialogue such as  
+     `{teammate} says (turn 1): ...` / `{role} says (turn 1): ...` etc.  
+     Read from top to bottom; the newest message appears last. You must answer your teammate's latest turn.
+2. `Recent Goal`: the multi-step plan you produced previously.
 
-You must provide output in three fields, formatted as follows:
-    {role} analysis: xxxxx
-    {role} plan: action1(params1,params2);action2(params1);...;actionN(params1)
-    {role} say: xxxxx
-   - The first field should include your analysis of the environmental conditions and your reasoning for the actions you plan to take. There are two things to focus on:  
-     1. Analyze the environment step by step, considering your conversation history with your teammate if "Past conversation turn" exists. Understand where you are in the order and plan based on the recipe.  
-     2. Analyze which actions are available to you based on the '{role} space' and '{teammate} space'. Actions that must be done by your teammate should be surrounded by 'request'. 
-   - This second field contains the actions you intend to perform in the next time step. Four things to note:  
-     1. Only generate actions for yourself. If a teammate must perform an action, generate a 'request' with the action as an argument.  
-     2. The arguments for your actions must all be in your interactive space, or the action is invalid.  
-     3. Actions should be written in sequence, separated by semicolons, with no additional descriptions or serial numbers. You cannot add any comments or actions not listed in your skill set.
-   - This third field refers to the communication you need to convey to your teammate. If you do not plan to communicate, the field should always be [NOTHING].  
-   - You can either:  
-     1. [NOTHING] — Meaning there’s no need to communicate with your teammate.  
-     2. The content to pass to your teammate — If you generated a 'request' action in your plan, include a message here to tell your teammate what to do.  
-   - If you want to end the conversation, add [END] to the last line of your response.
+Output
+------
+Produce exactly three fields in order:
+```
+Recent Goal: ...
+Think: ...
+Action: ...
+```
+
+### Recent Goal
+- Keep the previous goal if it is still valid.
+- If it is finished or no longer appropriate, overwrite it with an updated multi-step plan.
+
+### Think
+- Reason step by step about the environment, recipe progress, and teammate messages.
+- Respect the utensil constraints of `{role}` and `{teammate}` spaces.
+- If a step must be executed by your teammate, wrap it inside `request(...)` while reasoning.
+
+### Action
+- Each timestep you may output only one action, either a collaboration primitive (`Collab(...)`) or a physical action, but never both. Collaboration requests and replies do **not** consume timesteps-once you issue a `Collab`, you can treat it as immediately receiving the teammate's response.
+  1. **If the current focus is coordinating with your teammate**, output `Collab(...)` as the sole action for this timestep.  
+     - Allowed cooperative primitives: `request`, `seek`, `deny`, `ack`. Within a single `Collab`, choose exactly one type of primitive; only `request` may appear multiple times separated by semicolons.  
+     - Example: `Collab(request(pickup(bell_pepper, ingredient_dispenser));request(place_obj_on_counter()))` or `Collab(ack(Chef))`.  
+     - After the collaboration request, wait for the teammate's reply; during the next timestep decide whether to continue collaborating or switch to executing your own action.
+  2. **If no additional collaboration is required at this moment**, output a physical action that belongs to your skill set (e.g., `pickup(...)`, `put_obj_in_utensil(...)`).  
+     - Once collaboration is finished and the teammate has responded, the following timesteps must reassess whether to collaborate again or proceed with physical actions, ensuring only one action per timestep.

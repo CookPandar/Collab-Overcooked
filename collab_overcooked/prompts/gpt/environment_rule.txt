@@ -12,10 +12,9 @@ Due to the numerous settings that differ from the original Overcooked game, you 
   4. Check if you need a dish to hold the cooked food. If so, the chef must pick up a dish first and then fill it with food from the utensil. Otherwise, the chef can directly pick up the cooked food from the utensil.
   5. Deliver the food to the serving location immediately.
 
-*You cannot complete all of these steps alone. You need to think about what you can do in the situation and what you need your teammate to help you with.*
-- {workflow}
+*Tips*
 
-- The recipe contains all the steps necessary to complete the order. Every choice you make must be based on the recipe.
+- The recipe contains every step needed to complete the order, but only the chef has access to the recipe. Therefore, when the assistant does not know the task procedure, he/she must seek help from the chef.
 - You only need to complete one order, so focus solely on the progress of that dish.
 - Only the assistant can pick up ingredients from the ingredient dispenser, which has an unlimited supply.
 - The utensil is a stationary unit that cannot be moved.

@@ -36,13 +36,28 @@ def wait(num):
     if isinstance(num, int) and 0 < num <= 20:
         return
         
-**'Cooperative action'**: 
-""" 
-Ask a teammate to do an operation action. Each request can only contain one action with quotation marks, so if you need a teammate to perform multiple actions, you need to generate multiple requests. The detailed conversation content you want to convey is contained in '{role} says'. 
-Example: request('pickup(potato, ingredient_dispenser)'); request('place_obj_on_counter()');... 
-"""
-def request(operation_action):
-    teammate.plan_list.append(operation_action)
-    send_message(content=self.say, to=teammate)
-    return
+**'Cooperative action'**:  
+Use `Collab(...)` to express cooperation within a timestep. Collaboration does not consume extra timesteps: once you emit a `Collab`, treat it as if the teammate instantly replied. A `Collab` can only contain **one** primitive type; only `request` may appear multiple times separated by semicolons. Examples:
+- `Collab(request(Chef,pickup(bell_pepper, ingredient_dispenser));request(Chef,place_obj_on_counter()))`
+- `Collab(seek(Chef, "What should I do？"))`
+- `Collab(deny(Chef, "I cannot reach the oven"))`
+- `Collab(ack(Chef))`
+
+Available cooperative primitives:
 ```
+def request(receiver,operation_action):
+    send_message(content=operation_action, to=receiver)
+    return
+
+def seek(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+
+def deny(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+
+def ack(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+``` 

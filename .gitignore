@@ -152,11 +152,14 @@ configs/*_personal.yaml
 configs/*_private.yaml
 configs/*_key.txt
 configs/*_keys.txt
+configs/*.yaml
+!configs/default.yaml
 logs/
 *.log
 .DS_Store
 .vscode/
 .idea/
+data/
 
 # Temporary files
 *.tmp

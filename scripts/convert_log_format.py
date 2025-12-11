@@ -8,7 +8,7 @@ import json
 import argparse
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 
 def clean_observation(observation: str) -> str:
@@ -68,6 +68,60 @@ def format_communication_history(comm_turns: List[str], current_agent_id: int) -
     return "\n".join(comm_text)
 
 
+def parse_input_metadata(input_path: Path) -> Tuple[str, str, str]:
+    """
+    从输入路径中提取LLM名称、任务名称和时间戳
+    """
+    llm_name = input_path.parent.parent.name if len(input_path.parents) >= 2 else "unknown_model"
+    task_name = input_path.parent.name if len(input_path.parents) >= 1 else "unknown_task"
+
+    timestamp = input_path.stem
+    match = re.search(r'experiment_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})', input_path.stem)
+    if match:
+        timestamp = match.group(1)
+
+    return llm_name, task_name, timestamp
+
+
+def build_output_path(input_file: str, output_target: str) -> Path:
+    """
+    根据输入路径元信息构造输出文件名,确保包含LLM名称、任务和时间
+    """
+    input_path = Path(input_file)
+    llm_name, task_name, timestamp = parse_input_metadata(input_path)
+
+    target_path = Path(output_target)
+    if target_path.suffix:
+        output_dir = target_path.parent if target_path.parent else Path(".")
+        base_stem = target_path.stem
+        suffix = target_path.suffix
+    else:
+        output_dir = target_path if output_target else Path(".")
+        if not output_dir.name or output_dir.name == ".":
+            base_stem = "converted"
+        else:
+            base_stem = output_dir.name
+        suffix = ".json"
+
+    if not suffix:
+        suffix = ".json"
+
+    file_name = f"{base_stem}_{llm_name}_{task_name}_{timestamp}{suffix}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / file_name
+
+
+def format_plan_content(agent_name: str, plan_text: str, say_text: str) -> str:
+    """
+    根据是否存在say内容决定plan字段的实际输出
+    """
+    say_text = (say_text or "").strip()
+    if say_text and say_text != "[NOTHING]":
+        receiver = "Assistant" if agent_name == "Chef" else "Chef"
+        return f"say({receiver}, {json.dumps(say_text, ensure_ascii=False)})"
+    return plan_text or ""
+
+
 def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id: int) -> str:
     """
     构建历史上下文:最近两次有效调用的完整输入输出
@@ -91,10 +145,12 @@ def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id:
         hist_content_lists = hist_content_obj.get("content", [])
         hist_communications = hist_data.get("statistical_data", {}).get("communication", [])
 
-        # 获取基础observation
+        # 获取基础observation,若缺失则跳过该时间步
         base_obs = ""
         if len(hist_observations) > agent_id and hist_observations[agent_id]:
             base_obs = clean_observation(hist_observations[agent_id])
+        else:
+            continue
 
         # 在所有call block中查找最后一次该智能体的完整输入输出
         last_history_entry = None
@@ -122,10 +178,10 @@ def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id:
                     hist_str = f"timestep {hist_timestamp}:{full_observation}\n"
                     if call.get('analysis'):
                         hist_str += f"analysis: {call['analysis']}\n"
-                    if call.get('plan'):
-                        hist_str += f"plan: {call['plan']}\n"
-                    if call.get('say'):
-                        hist_str += f"say: {call['say']}"
+                    agent_name = "Chef" if agent_id == 0 else "Assistant"
+                    formatted_plan = format_plan_content(agent_name, call.get('plan', ''), call.get('say', ''))
+                    if formatted_plan:
+                        hist_str += f"plan: {formatted_plan}\n"
 
                     last_history_entry = hist_str
 
@@ -146,17 +202,19 @@ def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id:
     return "\n\n".join(history_entries)
 
 
-def convert_log_to_training_format(input_file: str, output_file: str):
+def convert_log_to_training_format(input_file: str, output_target: str):
     """
     转换日志格式,自动处理两个智能体
 
     Args:
         input_file: 输入的JSON日志文件路径
-        output_file: 输出的JSON文件路径
+        output_target: 输出路径(文件或目录),实际文件名会附加LLM、任务和时间戳
     """
     # 读取输入文件
     with open(input_file, 'r', encoding='utf-8') as f:
         log_data = json.load(f)
+
+    output_path = build_output_path(input_file, output_target)
 
     content_list = log_data.get("content", [])
 
@@ -246,11 +304,11 @@ def convert_log_to_training_format(input_file: str, output_file: str):
                 analysis = call.get("analysis", "")
                 plan = call.get("plan", "")
                 say = call.get("say", "")
+                formatted_plan = format_plan_content(agent_name, plan, say)
 
                 output_parts = [
                     f"{agent_name}'s analysis: {analysis}" if analysis else f"{agent_name}'s analysis: ",
-                    f"{agent_name}'s plan: {plan}" if plan else f"{agent_name}'s plan: ",
-                    f"{agent_name} say: {say}" if say else f"{agent_name} say: "
+                    f"{agent_name}'s plan: {formatted_plan}" if formatted_plan else f"{agent_name}'s plan: "
                 ]
                 full_output = "\n".join(output_parts)
 
@@ -270,12 +328,12 @@ def convert_log_to_training_format(input_file: str, output_file: str):
                     call_comm_history.append(f"{agent_name}:{history_text}")
 
     # 保存输出文件
-    with open(output_file, 'w', encoding='utf-8') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(training_samples, f, ensure_ascii=False, indent=2)
 
     print(f"转换完成!")
     print(f"- 输入文件: {input_file}")
-    print(f"- 输出文件: {output_file}")
+    print(f"- 输出文件: {output_path}")
     print(f"- 生成样本数: {len(training_samples)}")
 
     # 统计每个智能体的样本数

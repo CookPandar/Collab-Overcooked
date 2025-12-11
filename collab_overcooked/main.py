@@ -369,13 +369,18 @@ if __name__ == '__main__':
 
     #
     parser.add_argument('--statistics_save_dir', type=str, default='data', help='save directory of LLM statistics')
+    parser.add_argument('--config_path', type=str, default=None, help='Path to YAML config (overrides CLI arguments)')
 
 
     args = parser.parse_args()
-    variant = vars(args)
 
     start_time = time.time()
-    main(variant)
+    if args.config_path:
+        main(config_path=args.config_path)
+    else:
+        variant = vars(args)
+        variant.pop('config_path', None)
+        main(variant)
     end_time = time.time()
     print(f"\n=======Finshed all=========\n")
     print(f"Cost time : {end_time - start_time:.3f}s-----\n\n")

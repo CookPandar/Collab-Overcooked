@@ -13,8 +13,8 @@ environment:
 agents:
   num_agents: 2
   agent_0:
-    type: "openai"  # openai, vllm, custom_api
-    model: "gpt-3.5-turbo"
+    type: "custom_api"  # openai, vllm, custom_api
+    model: "gpt-4o
     api_key: ""  # Required for OpenAI/custom API
     base_url: "https://api.openai.com/v1"  # Optional for OpenAI, required for custom_api
     temperature: 0.1
@@ -23,7 +23,7 @@ agents:
     max_retries: 3
     role: "Chef"
   agent_1:
-    type: "openai"
+    type: "custom_api"
     model: "gpt-3.5-turbo"
     api_key: ""  # Required for OpenAI/custom API
     base_url: "https://api.openai.com/v1"
