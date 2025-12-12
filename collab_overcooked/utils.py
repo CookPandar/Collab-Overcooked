@@ -159,7 +159,7 @@ class LLMAgentsWrapper:
                 "reflection": [],
                 "content": [],
                 "action_list": [],
-                "original_log": "",
+                "original_log": [],
             },
         }
     
@@ -312,7 +312,10 @@ def combine_statistic_dict(turn_statistics_dict_agent0, turn_statistics_dict_age
                 turn_statistics_dict_agent0.get("content", {}).get("action_list", []),
                 turn_statistics_dict_agent1.get("content", {}).get("action_list", [])
             ],
-            "original_log": "",
+            "original_log": [
+                turn_statistics_dict_agent0.get("content", {}).get("original_log", []),
+                turn_statistics_dict_agent1.get("content", {}).get("original_log", []),
+            ],
         },
     }
     

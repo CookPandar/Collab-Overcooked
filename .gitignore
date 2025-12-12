@@ -192,3 +192,6 @@ src/embedding_cache.json
 # Misc
 roadmap.md
 src/batch_run.sh
+
+# Temporary debug scripts
+scripts/run_debug_main.py

@@ -1,6 +1,6 @@
 import itertools, os, json, re
 from collections import defaultdict
-from typing import Union
+from typing import Union, Optional, List
 import numpy as np
 import pkg_resources
 from collections import deque
@@ -81,6 +81,8 @@ class LLMAgents(LLMPair):
         debug_mode="N",
         agent_index=None,
         outdir=None,
+        history_window=3,
+        reward_tracker=None,
     ):
         super().__init__(
             model=model, model_dirname=model_dirname, local_server_api=local_server_api
@@ -121,6 +123,24 @@ class LLMAgents(LLMPair):
         self.state = None
         # dict to record if the error in T timestamp  was corrected, or just 'wait(1)'
         self.error_correct = {}
+        self.history_records = []
+        self.conversation_history = []
+        self.current_turn_conversation = []
+        self.conversation_history_timestamp = None
+        self.current_observation_snapshot = None
+        self.current_recent_goal_text = "[EMPTY]"
+        self.pending_collab_reply = False
+        self.pending_llm_logs = []
+        self.reward_tracker = reward_tracker
+        self._pending_reward_event = None
+        if history_window is None:
+            window_value = 0
+        else:
+            try:
+                window_value = int(history_window)
+            except (TypeError, ValueError):
+                window_value = 0
+        self.history_window = max(0, window_value)
         turn_statistics_dict_cp = copy.deepcopy(turn_statistics_dict)
         self.turn_statistics_dict = turn_statistics_dict_cp
         # self.generate_layout_prompt()
@@ -250,6 +270,7 @@ class LLMAgents(LLMPair):
         self.teammate_intentions_dict = {}
 
         self.teammate = teammate
+        self._pending_reward_event = None
 
     def set_agent_index(self, agent_index):
         self.agent_index = agent_index
@@ -285,7 +306,13 @@ class LLMAgents(LLMPair):
         return layout_prompt
 
     def generate_state_prompt(self, state):
+        # Ensure both agents have populated utensil accessibility lists before describing layout
+        self.build_access_utensil(state)
+        if getattr(self, "teammate", None):
+            self.teammate.build_access_utensil(state)
+        self._ensure_conversation_timestamp(state.timestep)
         self.layout_prompt = self.generate_layout_prompt()
+        self.current_timestep = state.timestep
         ego = state.players[self.agent_index]
         teammate = state.players[1 - self.agent_index]
 
@@ -304,14 +331,10 @@ class LLMAgents(LLMPair):
         else:
             ego_state_prompt += f"one {ego_object}. "
 
-        action_list = self.current_ml_action if self.current_ml_action else ""
-        actions = list(self.action_wait_parse.queue)
-        for index, a in enumerate(actions):
-            if index == 0 and self.current_ml_action is None:
-                action_list += f"{a}"
-            else:
-                action_list += f";{a}"
-        action_state_prompt = f"The planned sequence of actions (yet to be performed) for {self.name} is [{action_list}] "
+        current_action_text = self.current_ml_action if self.current_ml_action else "[EMPTY]"
+        action_state_prompt = (
+            f"The current action being executed by {self.name} is [{current_action_text}] "
+        )
 
         teammate_state_prompt = f"<{self.teammate.name}> holds "
         if teammate_object == "soup":
@@ -321,33 +344,12 @@ class LLMAgents(LLMPair):
         else:
             teammate_state_prompt += f"one {teammate_object}. "
 
-        action_list = (
-            self.teammate.current_ml_action if self.teammate.current_ml_action else ""
+        teammate_current_action = (
+            self.teammate.current_ml_action if self.teammate.current_ml_action else "[EMPTY]"
         )
-        actions = list(self.teammate.action_wait_parse.queue)
-        for index, a in enumerate(actions):
-            if index == 0 and self.teammate.current_ml_action is None:
-                action_list += f"{a}"
-            else:
-                action_list += f";{a}"
-        teammate_action_state_prompt = f"The planned sequence of actions (yet to be performed) for {self.teammate.name} is [{action_list}] "
-
-        if self.actor == "chef":
-            chef = self
-        else:
-            chef = self.teammate
-        order_prompt = (
-            "Order:" + self.order
-        )  # +("(Has recipe)"if self.order in chef.recipe.keys() else "(No recipe)")
-        if not self.mdp.one_task_mode:
-            order_prompt += (
-                "<<" + state.current_k_order[1]
-            )  # +("(Has recipe)"if state.current_k_order[1] in chef.recipe.keys() else "(No recipe)")
-            order_prompt += (
-                "<<" + state.current_k_order[2] + "\n"
-            )  # +("(Has recipe)\n"if state.current_k_order[2] in chef.recipe.keys() else "(No recipe)\n")
-        else:
-            order_prompt += "\n"
+        teammate_action_state_prompt = (
+            f"The current action being executed by {self.teammate.name} is [{teammate_current_action}] "
+        )
 
         kitchen_state_prompt = "Kitchen states: "
         prompt_dict = {
@@ -391,16 +393,21 @@ class LLMAgents(LLMPair):
                     now_cook_time = self.mdp.utensil_state_dict[utensil]["soup"].state[
                         2
                     ]
+                    food_desc = self._format_food_description(
+                        self.mdp.utensil_state_dict[utensil]["soup"].state[0]
+                    )
 
                     kitchen_state_prompt += prompt_dict[key].format(
                         utensil_name=utensil,
-                        food="chopped_onion",
+                        food=food_desc,
                         t=recipe_cook_time - now_cook_time,
                     )
                 elif key == "ready":
                     kitchen_state_prompt += prompt_dict[key].format(
                         utensil_name=utensil,
-                        food=self.mdp.utensil_state_dict[utensil]["soup"].state[0],
+                        food=self._format_food_description(
+                            self.mdp.utensil_state_dict[utensil]["soup"].state[0]
+                        ),
                     )
                 elif key == "full":
                     for rpe_name, rpe in self.mdp.recipes[utensil[:-1]].items():
@@ -410,7 +417,7 @@ class LLMAgents(LLMPair):
                             transition = rpe_name
                     kitchen_state_prompt += prompt_dict[key].format(
                         utensil_name=utensil,
-                        food=" ".join(
+                        food=self._format_food_description(
                             self.mdp.utensil_state_dict[utensil]["soup"].state[0]
                         ),
                         transition=transition,
@@ -430,7 +437,7 @@ class LLMAgents(LLMPair):
                             transition = rpe_name
                     kitchen_state_prompt += prompt_dict[key].format(
                         utensil_name=utensil,
-                        food=" ".join(
+                        food=self._format_food_description(
                             self.mdp.utensil_state_dict[utensil]["soup"].state[0]
                         ),
                         transition=transition,
@@ -438,7 +445,7 @@ class LLMAgents(LLMPair):
                 elif key == "wrong":
                     kitchen_state_prompt += prompt_dict[key].format(
                         utensil_name=utensil,
-                        food=" ".join(
+                        food=self._format_food_description(
                             self.mdp.utensil_state_dict[utensil]["soup"].state[0]
                         ),
                     )
@@ -503,19 +510,55 @@ class LLMAgents(LLMPair):
         self.planner.layout = self.layout_prompt
         self.planner.wong_message_prompt = wong_message_prompt
         self.planner.long_term_memory_prompt = reflection_memory
-        # 	teammate_state_prompt = ""
-        return (
-            long_term_memory_prompt
-            + self.planner.long_term_memory_prompt
-            + self.layout_prompt
-            + order_prompt
-            + time_prompt
-            + ego_state_prompt
+
+        order_text = (self.order or "").strip()
+        if order_text.lower().startswith("order:"):
+            order_text = order_text.split(":", 1)[1].strip()
+        if not self.mdp.one_task_mode and len(state.current_k_order) > 1:
+            tail_orders = [
+                o.strip()
+                for o in state.current_k_order[1:]
+                if isinstance(o, str) and o.strip()
+            ]
+            if tail_orders:
+                order_text += "".join(f"<<{o}" for o in tail_orders)
+
+        layout_section = self.layout_prompt.strip()
+        kitchen_section = kitchen_state_prompt.strip()
+        scene_components = [f"Scene {state.timestep}:"]
+        if layout_section:
+            scene_components.append(layout_section)
+        if kitchen_section:
+            scene_components.append(kitchen_section)
+        scene_text = "\n".join(scene_components)
+        agent_state_text = (
+            ego_state_prompt
             + action_state_prompt
             + teammate_state_prompt
             + teammate_action_state_prompt
-            + kitchen_state_prompt
+        ).strip()
+        conversation_text = self.format_conversation_history()
+        self.current_observation_snapshot = {
+            "timestamp": self.current_timestep,
+            "order": order_text,
+            "scene": scene_text,
+            "agent_state": agent_state_text,
+            "past_conversation": conversation_text,
+        }
+        current_block = self.format_current_observation_block(
+            self.current_timestep,
+            order_text,
+            scene_text,
+            agent_state_text,
+            conversation_text,
+            self.current_recent_goal_text,
         )
+        history_prompt = self.build_history_prompt()
+        sections = []
+        if history_prompt:
+            sections.append("History (latest decisions):\n" + history_prompt + "\n")
+        sections.append("Current Observation:\n" + current_block)
+        return "".join(sections)
 
     def build_access_utensil(self, state):
         am = self.mlam
@@ -597,6 +640,8 @@ class LLMAgents(LLMPair):
         count = 0
         if self.current_ml_action_steps == 0:
             self.failed_message = self.validate_current_ml_action(state)
+            self._handle_validator_failure(self.failed_message)
+            self._flush_reward_event()
             if "success" in self.failed_message and self.test_mode:
                 self.test_ml_action.popleft()
             # only try to self-correct 1 time
@@ -627,6 +672,8 @@ class LLMAgents(LLMPair):
                     self.current_ml_action = self.generate_ml_action(state)
                     count += 1
                 self.failed_message = self.validate_current_ml_action(state)
+                self._handle_validator_failure(self.failed_message)
+                self._flush_reward_event()
         # generate rethink if the problem is solved and not just 'wait(1)'
         if not self.trace and count < 1:
             self.turn_statistics_dict["statistical_data"]["error_correction"][
@@ -644,12 +691,10 @@ class LLMAgents(LLMPair):
         self.turn_statistics_dict["content"]["reflection"][self.agent_index] = (
             copy.deepcopy(self.failed_history)
         )
-        action_list = []
-        actions = list(self.action_wait_parse.queue)
-        if self.current_ml_action is not None:
-            action_list.append(self.current_ml_action)
-        for index, a in enumerate(actions):
-            action_list.append(f"{a}")
+        queue_snapshot = list(self.action_wait_parse.queue)
+        action_list = self._gather_pending_actions(
+            self.current_ml_action, queue_snapshot
+        )
         self.turn_statistics_dict["content"]["action_list"][self.agent_index] = (
             copy.deepcopy(action_list)
         )
@@ -674,7 +719,7 @@ class LLMAgents(LLMPair):
             chosen_action = (0, 0)
             # Use version 0.0.1 logic (from dependencies/overcooked_ai)
             self.prev_state = state
-            return chosen_action, ""
+            return self._finalize_action_return(chosen_action, "")
         else:
             possible_motion_goals = self.find_motion_goals(state)
             current_motion_goal, chosen_action = self.choose_motion_goal(
@@ -733,11 +778,11 @@ class LLMAgents(LLMPair):
         # print(f'P{self.agent_index} : {Action.to_char(chosen_action)}')
         # Use version 0.0.1 logic (from dependencies/overcooked_ai)
         if "pickup" in self.current_ml_action:
-            return chosen_action, self.parse_action_params[0]
+            return self._finalize_action_return(chosen_action, self.parse_action_params[0])
         elif any(s in self.current_ml_action for s in self.mdp.interact_actions):
-            return chosen_action, "[START]"
+            return self._finalize_action_return(chosen_action, "[START]")
         else:
-            return chosen_action, ""
+            return self._finalize_action_return(chosen_action, "")
 
     # Parse action as function(parms1,parms2)
     def parse_params_in_action(self, action: str, need_output=False):
@@ -768,7 +813,7 @@ class LLMAgents(LLMPair):
         else:
             pattern = r"^\"?\d*\.?\"?\s*(\w+)\((.*)\)"
             if need_output:
-                print(f"No match function like plan in {action}")
+                print(f"No match function like action in {action}")
             return function_name, params
         if need_output:
             print(f"function_name : {function_name},params_name:{params}")
@@ -788,6 +833,295 @@ class LLMAgents(LLMPair):
         with open(PROMPT_DIR + "/recipe/" + recipe_filename) as r:
             self.recipe[self.order] = r.read()
 
+    def _collab_requires_reply(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return ("collab(request" in lowered) or ("collab(seek" in lowered)
+
+    def _strip_action_prefix(self, action_text: Optional[str]) -> str:
+        if not isinstance(action_text, str):
+            return ""
+        stripped = action_text.strip()
+        if stripped.lower().startswith("action:"):
+            return stripped.split(":", 1)[1].strip()
+        return stripped
+
+    def _is_collab_action(self, action_text: Optional[str]) -> bool:
+        normalized = self._strip_action_prefix(action_text)
+        if not normalized:
+            return False
+        return normalized.lower().startswith("collab(")
+
+    def _preview_primary_action(self, action_block: Optional[str]) -> str:
+        body = self._strip_action_prefix(action_block or "")
+        body = self._sanitize_action_text(body)
+        tokens = [token.strip() for token in body.split(";") if token.strip()]
+        for token in tokens:
+            if not self._is_collab_action(token):
+                return token
+        return tokens[0] if tokens else ""
+
+    def _queue_reward_event(self, action_text: Optional[str], call_index: Optional[int], call_type: str):
+        if not self.reward_tracker or self.agent_index is None:
+            self._pending_reward_event = None
+            return
+        timestamp = getattr(self, "current_timestep", None)
+        normalized = (action_text or "").strip()
+        self._pending_reward_event = {
+            "action": normalized,
+            "call_index": call_index,
+            "call_type": call_type,
+            "timestamp": timestamp,
+        }
+
+    def _flush_reward_event(self):
+        if not self._pending_reward_event or not self.reward_tracker or self.agent_index is None:
+            self._pending_reward_event = None
+            return
+        event = self._pending_reward_event
+        self.reward_tracker.register_llm_action(
+            agent_index=self.agent_index,
+            timestamp=event.get("timestamp", self.current_timestep),
+            action_text=event.get("action"),
+            agent_name=self.name,
+            call_index=event.get("call_index"),
+            call_type=event.get("call_type"),
+        )
+        self._pending_reward_event = None
+
+    def _gather_pending_actions(self, primary_action: Optional[str], queued_actions):
+        pending = []
+        if primary_action and not self._is_collab_action(primary_action):
+            pending.append(primary_action)
+        for action in queued_actions or []:
+            if action and not self._is_collab_action(action):
+                pending.append(action)
+        return pending
+
+    def _ensure_conversation_timestamp(self, timestamp: int):
+        if self.conversation_history_timestamp != timestamp:
+            self.conversation_history_timestamp = timestamp
+            self.current_turn_conversation = []
+
+    def _sanitize_action_text(self, text: Optional[str]) -> str:
+        if not isinstance(text, str):
+            return ""
+        cleaned = text.replace("```", "").replace("```]", "")
+        cleaned = cleaned.replace("[```", "").replace("```", "")
+        cleaned = cleaned.strip()
+        # Remove stray markdown fences or unmatched brackets
+        cleaned = cleaned.rstrip("`")
+        cleaned = cleaned.rstrip("]")
+        return cleaned
+
+    def append_conversation_line(self, speaker, message: str, propagate: bool = True):
+        text = (message or "").strip()
+        if not text or text == "[NOTHING]":
+            return
+        if self.current_timestep is not None:
+            self._ensure_conversation_timestamp(self.current_timestep)
+        line = f"{speaker}: {text}"
+        self.conversation_history.append(line)
+        if len(self.conversation_history) > 30:
+            self.conversation_history = self.conversation_history[-30:]
+        self.current_turn_conversation.append(line)
+        if len(self.current_turn_conversation) > 20:
+            self.current_turn_conversation = self.current_turn_conversation[-20:]
+        if (
+            self.current_observation_snapshot
+            and self.current_observation_snapshot.get("timestamp") == self.conversation_history_timestamp
+        ):
+            self.current_observation_snapshot["past_conversation"] = self.format_conversation_history()
+        if propagate:
+            lower_text = text.lower()
+            teammate = getattr(self, "teammate", None)
+            if speaker == self.name:
+                self.pending_collab_reply = False
+                if teammate is not None:
+                    teammate.pending_collab_reply = self._collab_requires_reply(lower_text)
+            elif teammate is not None and speaker == teammate.name:
+                self.pending_collab_reply = self._collab_requires_reply(lower_text)
+                teammate.pending_collab_reply = False
+        if propagate and getattr(self, "teammate", None) is not None:
+            teammate_history = getattr(self.teammate, "conversation_history", None)
+            if teammate_history is not None:
+                self.teammate.append_conversation_line(speaker, message, propagate=False)
+
+    def format_conversation_history(self) -> str:
+        if not self.current_turn_conversation:
+            return "[EMPTY]"
+        return "\n".join(self.current_turn_conversation[-10:])
+
+    def update_recent_goal_text(self, new_goal: Optional[str], reset_on_empty: bool = False):
+        if new_goal is None:
+            return
+        cleaned = (new_goal or "").strip()
+        if cleaned:
+            self.current_recent_goal_text = cleaned
+        elif reset_on_empty:
+            self.current_recent_goal_text = "[EMPTY]"
+
+    def _log_llm_call(self, call_type: str, prompt_text: str, response_text: str, tokens: int = 0, metadata: Optional[dict] = None):
+        prompt = (prompt_text or "").strip()
+        response = (response_text or "").strip()
+        entry = {
+            "timestamp": self.current_timestep,
+            "agent": self.name,
+            "call_index": len(self.pending_llm_logs),
+            "call_type": call_type,
+            "input": prompt,
+            "output": response,
+            "tokens": tokens,
+        }
+        if metadata:
+            entry["metadata"] = metadata
+        self.pending_llm_logs.append(entry)
+    
+    def _annotate_last_log_metadata(self, **fields):
+        if not self.pending_llm_logs:
+            return
+        entry = self.pending_llm_logs[-1]
+        metadata = entry.get("metadata") or {}
+        for key, value in fields.items():
+            if key in {"format_issues", "validator_feedbacks"}:
+                existing = metadata.get(key, [])
+                if not isinstance(existing, list):
+                    existing = [existing] if existing else []
+                items = value if isinstance(value, list) else [value]
+                for item in items:
+                    if item not in existing:
+                        existing.append(item)
+                metadata[key] = existing
+            elif key == "has_failure_context":
+                metadata[key] = bool(value or metadata.get(key))
+            else:
+                metadata[key] = value
+        entry["metadata"] = metadata
+
+    def _handle_format_issues(self, issues: List[str]):
+        if not issues:
+            return
+        self._annotate_last_log_metadata(format_issues=issues, has_failure_context=True)
+        if self.reward_tracker and self.agent_index is not None:
+            for issue in issues:
+                self.reward_tracker.register_format_error(self.agent_index, issue)
+
+    def _handle_validator_failure(self, message: Optional[str]):
+        if not message:
+            return
+        normalized = message.strip()
+        if not normalized or "success" in normalized.lower():
+            return
+        self._annotate_last_log_metadata(
+            has_failure_context=True, validator_feedbacks=[normalized]
+        )
+        if self.reward_tracker and self.agent_index is not None:
+            self.reward_tracker.register_validator_error(self.agent_index, normalized)
+    
+    def _format_food_description(self, food_state):
+        if isinstance(food_state, str):
+            return food_state
+        if isinstance(food_state, (list, tuple)):
+            items = [str(x) for x in food_state if str(x)]
+            if not items:
+                return "[EMPTY]"
+            if len(items) == 1:
+                return items[0]
+            return ", ".join(items)
+        return str(food_state)
+
+    def record_history_entry(self, think_text: str, recent_goal_text: str, action_text: str, error_text: str = ""):
+        if not self.current_observation_snapshot:
+            return
+        entry = {
+            "timestamp": self.current_observation_snapshot["timestamp"],
+            "order": self.current_observation_snapshot["order"],
+            "scene": self.current_observation_snapshot["scene"],
+            "agent_state": self.current_observation_snapshot["agent_state"],
+            "past_conversation": self.current_observation_snapshot["past_conversation"],
+            "think": (think_text or "").strip() or "[EMPTY]",
+            "recent_goal": (recent_goal_text or "").strip() or "[EMPTY]",
+            "action": (action_text or "").strip() or "[EMPTY]",
+        }
+        if error_text:
+            entry["error"] = error_text.strip()
+        window = max(0, getattr(self, "history_window", 0))
+        if window <= 0:
+            self.history_records = []
+            self.current_recent_goal_text = entry["recent_goal"]
+            return
+        self.history_records = [h for h in self.history_records if h["timestamp"] != entry["timestamp"]]
+        self.history_records.append(entry)
+        if len(self.history_records) > window:
+            self.history_records = self.history_records[-window:]
+        self.current_recent_goal_text = entry["recent_goal"]
+
+    def build_history_prompt(self) -> str:
+        window = max(0, getattr(self, "history_window", 0))
+        if window <= 0 or not self.history_records:
+            return ""
+        current_ts = getattr(self, "current_timestep", None)
+        usable_entries = (
+            [h for h in self.history_records if current_ts is None or h["timestamp"] < current_ts]
+            if current_ts is not None
+            else self.history_records
+        )
+        if not usable_entries:
+            return ""
+        blocks = []
+        for entry in usable_entries[-window:]:
+            blocks.append(self.format_history_entry(entry))
+        return "\n".join(blocks)
+
+    def format_history_entry(self, entry: dict) -> str:
+        block = [
+            f"timestep {entry['timestamp']}:",
+            f"Order: {entry['order']}",
+            entry["scene"],
+            f"Agent State: {entry['agent_state']}",
+            "Past conversation:",
+            entry.get("past_conversation", "[EMPTY]") or "[EMPTY]",
+            f"Think: {entry.get('think', '[EMPTY]')}",
+            f"Recent Goal: {entry.get('recent_goal', '[EMPTY]')}",
+            f"Action: {entry.get('action', '[EMPTY]')}",
+        ]
+        if entry.get("error"):
+            block.append(f"Error: {entry['error']}")
+        return "\n".join(block)
+
+    def format_current_observation_block(self, timestamp: int, order_text: str, scene_text: str, agent_state_text: str, conversation_text: str, recent_goal_text: str) -> str:
+        return (
+            f"timestep {timestamp}:\n"
+            f"Order: {order_text}\n"
+            f"{scene_text}\n"
+            f"Agent State: {agent_state_text}\n"
+            "Past conversation:\n"
+            f"{conversation_text}\n"
+            f"Recent Goal: {recent_goal_text or '[EMPTY]'}\n"
+        )
+
+    def _append_with_newline(self, base: str, extra: str, blank_line: bool = False) -> str:
+        base = base or ""
+        extra = extra or ""
+        if not extra:
+            return base
+        if not base:
+            return extra
+        if not base.endswith("\n"):
+            base += "\n"
+        if blank_line and not base.endswith("\n\n"):
+            base += "\n"
+        return base + extra
+
+    def _finalize_action_return(self, chosen_action, interaction_param):
+        logs_copy = copy.deepcopy(getattr(self, "pending_llm_logs", []))
+        original_log = self.turn_statistics_dict["content"].get("original_log")
+        if not isinstance(original_log, list):
+            original_log = [[], []]
+            self.turn_statistics_dict["content"]["original_log"] = original_log
+        original_log[self.agent_index] = logs_copy
+        self.pending_llm_logs = []
+        return chosen_action, interaction_param
+
     def parse_ml_action(self, action_string):
         ml_action = ""
         action, params = self.parse_params_in_action(action_string)
@@ -801,17 +1135,17 @@ class LLMAgents(LLMPair):
             for i in self.mdp.default_ingredients:
                 if p == i.lower():
                     self.parse_action_params[index] = i
-        # parse function like return false,meaning the return plan is a sentence or other wrong content.
+        # parse function like return false,meaning the return action list is invalid.
         if self.parse_action == "":
             print(action_string)
             print(
-                "please check the plan,the plan does not follow the format of function"
+                "Please check the Action field; it does not follow the required function-call format."
             )
             return (
                 False,
-                f"please check your plan,make sure your plan is a sequence of action seperated by ';' in one line, without any description or serial number.",
+                f"Please ensure the Action field lists semicolon-separated function calls without extra narration.",
             )
-        if "place_obj_on_counter()" == action_string:
+        if "place_obj_on_counter()" in action_string:
             ml_action = f"place_obj_on_counter()"
         elif "pickup(" in action_string:
             if len(params) != 2:
@@ -875,16 +1209,16 @@ class LLMAgents(LLMPair):
                 ml_action = f"fill_dish_with_food({params[0]})"
             else:
                 return False, f"Wrong fill_dish_with_food() parmas:{params[0]}"
-        elif "deliver_soup()" == action_string:
+        elif "deliver_soup()" in action_string:
             ml_action = "deliver_soup()"
-        elif "check_recipe()" == action_string:
+        elif "check_recipe()" in action_string:
             ml_action = "check_recipe()"
         # 	check all the action need to interact with utensils
         elif any(item in action_string for item in self.mdp.interact_actions.keys()):
             if len(params) != 1:
                 return (
                     False,
-                    f"please check your plan,make sure your plan is a sequence of action seperated by ';' in one line, without any description or serial number.",
+                    "Please ensure the Action field is a semicolon-separated list of function calls without narration.",
                 )
             for interact_action, utensils in self.mdp.interact_actions.items():
                 if interact_action in action_string:
@@ -902,11 +1236,11 @@ class LLMAgents(LLMPair):
         else:
             print(action_string)
             print(
-                "please check the plan,the plan does not follow the format of function"
+                "Please check the Action field; it does not follow the required function-call format."
             )
             return (
                 False,
-                f"please check your plan,make sure your plan is a sequence of action seperated by ';' in one line, without any description or serial number.",
+                "Please ensure the Action field is a semicolon-separated list of function calls without narration.",
             )
 
         return True, ml_action
@@ -941,8 +1275,47 @@ class LLMAgents(LLMPair):
         a = self.load_prompt_file()
         b = self.teammate.load_prompt_file()
 
+    def build_correction_suffix(self):
+        failure_notes = [
+            dialog["content"]
+            for dialog in self.planner.dialog_history_list
+            if dialog.get("role") == "failure_explanation"
+        ]
+        suffix_lines = ["\n\n### Correction Guidance"]
+        if failure_notes:
+            suffix_lines.append("Controller feedback from the previous attempt:")
+            suffix_lines.extend(failure_notes)
+        suffix_lines.append(
+            "Regenerate a complete response that strictly follows the Think / Recent Goal / Action format and resolves the issue above."
+        )
+        return "\n".join(suffix_lines)
+
     def change_correct_prompt(self):
-        self.load_prompt_file(mode="correct")
+        base_prompt = self.load_prompt_file(mode="origin")
+        correction_suffix = self.build_correction_suffix()
+        self.planner.instruction_head_list[0]["content"] = base_prompt + correction_suffix
+
+    def enforce_collab_reply(self, last_response: str):
+        base_prompt = self.planner.current_user_message.get("content", "")
+        correction_prompt = (
+            base_prompt
+            + "\n\nYou just received a collaboration request from your teammate. "
+            "You must respond with a Collab(...) message (request/seek/deny/ack) acknowledging or addressing the request. "
+            "Rewrite your previous reply accordingly.\n\nYour last reply was:\n"
+            + last_response
+            + "\n\nReturn a corrected response that includes a Collab(...) action."
+        )
+        self.planner.current_user_message = {"role": "user", "content": correction_prompt}
+        response, correction_tokens = self.planner.query(
+            proxy=self.proxy, stop="Scene", trace=True
+        )
+        fmt_error = self.turn_statistics_dict["statistical_data"]["error"][self.agent_index]["format_error"]
+        fmt_error["error_num"] += 1
+        fmt_error["error_message"].append(correction_prompt)
+        fmt_corr = self.turn_statistics_dict["statistical_data"]["error_correction"][self.agent_index]["format_correction"]
+        fmt_corr["correction_num"] += 1
+        fmt_corr["correction_tokens"].append(correction_tokens)
+        return response, correction_tokens
 
     def name(self):
         return "Player " + str(self.agent_index)
@@ -955,65 +1328,65 @@ class LLMAgents(LLMPair):
     ):
         pre_message = ""
         answer_num = 1
-        analysis_num = 1
+        think_turn = 1
         flag = False
         # turn 0
-        # pre_message += f'''{self.name} analysis history turn 0 : [EMPTY]\n'''
+        # pre_message += f'''{self.name} think history turn 0 : [EMPTY]\n'''
         ##As asker, generate message for self
         # <example>:
         # Order:Onion_soup(No recipe)
         # Scene 0: Chef holds nothing. Assistant holds nothing. Assistant's action:None.Kitchen states: Chef space:Pot0 empty.Pot1 empty.chopping_board1 empty.Stirrer empty. Assistant space:chopping_board0 empty.Cooker empty.Counter:empty.
-        # Assistant analysis history turn 0 : [EMPTY]
-        # Assistant analysis history turn 1 : I do not know what to do. I should ask chef.
+        # Assistant think history turn 0 : [EMPTY]
+        # Assistant think history turn 1 : I do not know what to do. I should ask chef.
         # Assistant say turn 1 : Can you give me advice?
         # Chef  say turn 1 : You should wait.<END>
-        # Assistant analysis : I need to wait.
+        # Assistant think : I need to wait.
         # Assistant say : [NOTHING]
         # Assistant plan: wait(1)
         # </example>
         if role == "asker":
             for t in turn_dialog_self:
-                # if t["role"] == "analysis":
-                # 	pre_message +=  f'''{self.name} analysis history turn {analysis_num} : {t['content']}\n'''  #"L: Analysis:" + t["content"]+"\n"
+                # if t["role"] == "think":
+                # 	pre_message +=  f'''{self.name} think history turn {think_turn} : {t['content']}\n'''
                 if t["role"] == "talk":
-                    pre_message += f"""{self.name} say history turn {analysis_num} : {t['content']}\n"""
+                    pre_message += f"""{self.name} say history turn {think_turn} : {t['content']}\n"""
                     # search teammate response
                     for r in turn_dialog_team:
                         if r["role"] == "talk":
-                            if analysis_num == answer_num:
-                                pre_message += f"""{self.teammate.name} say history turn {analysis_num} : {r['content']}\n"""
+                            if think_turn == answer_num:
+                                pre_message += f"""{self.teammate.name} say history turn {think_turn} : {r['content']}\n"""
                                 break
                             else:
                                 answer_num += 1
-                    analysis_num += 1
+                    think_turn += 1
         ##As answer, generate message for self
         # <example>:
-        # Assistant analysis history turn 0 : [EMPTY]
+        # Assistant think history turn 0 : [EMPTY]
         # Chef say history turn 1 : Can you pick up an onion for me ?
-        # Assistant analysis history turn 1: I can go the ingredient_dispenser pick an onion for chef. I do not know if it is right.
+        # Assistant think history turn 1: I can go the ingredient_dispenser pick an onion for chef. I do not know if it is right.
         # Assistant say history turn 1: Do you want me pick onion from ingredient_dispenser?
         # Chef say history turn 2 : YES.
-        # Assistant analysis: I known i need to pick onion from ingredient_dispenser.
+        # Assistant think: I known i need to pick onion from ingredient_dispenser.
         # Assistant say : OK<END>
         # Assistant plan : pickup(onion,ingredient_dispenser)
         # </example>
         elif role == "answer":
             for t in turn_dialog_team:
                 if t["role"] == "talk":
-                    pre_message += f"""{self.teammate.name} say history turn {analysis_num} : {t['content']}\n"""
-                    # search self analysis and talk
+                    pre_message += f"""{self.teammate.name} say history turn {think_turn} : {t['content']}\n"""
+                    # search self think and talk
                     for r in turn_dialog_self:
-                        if r["role"] == "analysis":
-                            if analysis_num == answer_num:
-                                # pre_message += f'''{self.name} analysis history turn {analysis_num} : {r['content']}\n'''
+                        if r["role"] == "think":
+                            if think_turn == answer_num:
+                                # pre_message += f'''{self.name} think history turn {think_turn} : {r['content']}\n'''
                                 flag = True
                             else:
                                 answer_num += 1
                         if r["role"] == "talk" and flag:
-                            pre_message += f"""{self.name} say history turn {analysis_num} : {r['content']}\n"""
+                            pre_message += f"""{self.name} say history turn {think_turn} : {r['content']}\n"""
                             flag = False
                             break
-                    analysis_num += 1
+                    think_turn += 1
         else:
             raise ValueError("Wrong actor for build communication message!")
         return pre_message
@@ -1024,22 +1397,33 @@ class LLMAgents(LLMPair):
         you_response = message
         team_response = ""
         communication_turn = 0
+        max_communication_turns = 3
         last_message = ""
 
         print("\n\n>>>>>>>>>>>>>>>>>>Begin communication<<<<<<<<<<<<<\n")
         while self.end_talk is False:
             communication_turn += 1
+            if communication_turn > max_communication_turns:
+                print(
+                    f"[Warning] Communication exceeded {max_communication_turns} exchanges. Forcing termination."
+                )
+                self.end_talk = True
+                you_response = "Action: wait(1)"
+                break
             print(f"Input for {self.teammate.name}" + ":\n")
             format_you_response = self.teammate.message_formate_control(
                 "answer",
                 self.teammate.planner.dialog_history_list,
                 self.planner.dialog_history_list,
             )
+            self.teammate.current_timestep = state.timestep
             self.teammate.state_prompt = self.teammate.generate_state_prompt(state)
             print(
-                self.teammate.state_prompt
-                + format_you_response
-                + self.teammate.planner.wong_message_prompt
+                self._append_with_newline(
+                    self.teammate.state_prompt,
+                    self.teammate.planner.wong_message_prompt,
+                    blank_line=True,
+                )
             )
             # teammate must reply
             self.end_talk, team_response = self.teammate.answer(
@@ -1047,6 +1431,8 @@ class LLMAgents(LLMPair):
             )
             print(f"Answer of {self.teammate.name}" + ":\n")
             print(team_response + "\n\n")
+            teammate_talk, _ = self.teammate.parse_response(team_response, "talk")
+            self.append_conversation_line(self.teammate.name, teammate_talk)
 
             print(f"Input for {self.name}" + ":\n")
             format_team_response = self.message_formate_control(
@@ -1054,11 +1440,14 @@ class LLMAgents(LLMPair):
                 self.planner.dialog_history_list,
                 self.teammate.planner.dialog_history_list,
             )
+            self.current_timestep = state.timestep
             self.state_prompt = self.generate_state_prompt(state)
             print(
-                self.state_prompt
-                + format_team_response
-                + self.planner.wong_message_prompt
+                self._append_with_newline(
+                    self.state_prompt,
+                    self.planner.wong_message_prompt,
+                    blank_line=True,
+                )
             )
             last_message = format_team_response + "\n\n"
             self.pre_message = last_message
@@ -1073,21 +1462,28 @@ class LLMAgents(LLMPair):
                     f">>>>>>>>>>>>>>>>>>>>{self.name} decide to make action:<<<<<<<<<<<<<<<<<\n"
                 )
             print(you_response + "\n\n\n")
+            you_talk, _ = self.parse_response(you_response, "talk")
+            self.append_conversation_line(self.name, you_talk)
         print("\n\n>>>>>>>>>>>>>>>>>>Finish communication<<<<<<<<<<<<<\n")
         # parse
-        plan = self.parse_response(you_response, "plan")
-        if plan == "":
-            print("You have not make plan last time.\n")
-            plan, _ = self.important_part_no_create(1, "plan", you_response)
-        return plan
+        action_block = self.parse_response(you_response, "action")
+        if action_block == "":
+            print("You did not provide an action last time.\n")
+            action_block, _ = self.important_part_no_create(1, "action", you_response)
+        return action_block
 
     def important_part_no_create(self, retry_num, part_type, response):
-        # Analsysis did not generate error handling
+        part_display = {
+            "think": "Think",
+            "action": "Action",
+            "talk": "Action",
+            "recent_goal": "Recent Goal",
+        }.get(part_type, part_type)
         prompt = (
             "\n\nYou did not create correct "
-            + part_type
+            + part_display
             + " part last time, now please remember to add "
-            + part_type
+            + part_display
             + " according to the format of example strictly!Below is the history:<BEGAIN>\n"
         )
         retry_num_max = retry_num
@@ -1106,6 +1502,13 @@ class LLMAgents(LLMPair):
             response, correction_tokens = self.planner.query(
                 proxy=self.proxy, stop="Scene", trace=True
             )
+            self._log_llm_call(
+                "format_correction",
+                self.planner.current_user_message["content"],
+                response,
+                correction_tokens,
+                {"missing_part": part_type},
+            )
             # statistic
             self.turn_statistics_dict["statistical_data"]["error"][self.agent_index][
                 "format_error"
@@ -1122,12 +1525,12 @@ class LLMAgents(LLMPair):
             if retry_num == 0 and parse_result == "":
                 warnings.warn(
                     "Failed to create "
-                    + part_type
+                    + part_display
                     + " for "
                     + str(retry_num_max)
                     + " times"
                 )
-                parse_result = "You do not have " + part_type + " last time."
+                parse_result = "You do not have " + part_display + " last time."
             if parse_result != "":
                 # correction_num means the number of truly correct the format error ,maybe a success need several trys.
                 # correction_tokens means all the tokens for trying, so len(correction_tokens)>= correction_num
@@ -1140,29 +1543,60 @@ class LLMAgents(LLMPair):
                 break
         return parse_result, final_response
 
-    # It is used to give organized messages to gpt and organize the generated analysis, talk and other information
+    # It is used to give organized messages to gpt and organize the generated think, talk and other information
     def answer(self, message, role, state):
         self.state_prompt = self.generate_state_prompt(state)
         self.planner.current_user_message = {
             "role": "user",
-            "content": self.state_prompt + message,
+            "content": self._append_with_newline(self.state_prompt, message, blank_line=True),
         }
         response, tokens_num = self.planner.query(
             proxy=self.proxy, stop="Scene", trace=True
         )
-        parse_analysis = self.parse_response(response, "analysis")
-        # Analsysis did not generate error handling:
-        if parse_analysis == "":
-            print("Do not create analysis", response)
+        extra_tokens = 0
+        if role == "team" and self.pending_collab_reply:
+            preview_talk, _ = self.parse_response(response, "talk")
+            if "collab(" not in (preview_talk or "").lower():
+                response, correction_tokens = self.enforce_collab_reply(response)
+                extra_tokens += correction_tokens
+        self._log_llm_call(
+            "communication",
+            self.planner.current_user_message["content"],
+            response,
+            tokens_num + extra_tokens,
+            {"role": role},
+        )
+        format_issues: List[str] = []
+        think_text = self.parse_response(response, "think")
+        if think_text == "":
+            format_issues.append("missing_think")
+        # Think did not generate error handling:
+        if think_text == "":
+            print("Do not create think", response)
             # print(self.planner.current_user_message["content"])
-            parse_analysis, _ = self.important_part_no_create(1, "analysis", message)
+            think_text, _ = self.important_part_no_create(1, "think", message)
 
         # Agent1 has decided to stop talking
         # if ~self.end_talk:
         parse_talk, end_talk = self.parse_response(response, "talk")
-        self.planner.dialog_history_list.append(
-            {"role": "analysis", "content": parse_analysis}
-        )
+        action_text = self.parse_response(response, "action")
+        if action_text == "":
+            format_issues.append("missing_action")
+        recent_goal_text = self.parse_response(response, "recent_goal")
+        if recent_goal_text == "":
+            format_issues.append("missing_recent_goal")
+        self.update_recent_goal_text(recent_goal_text)
+        recent_goal_entry = recent_goal_text or self.current_recent_goal_text
+        if (
+            role == "team"
+            and self.pending_collab_reply
+            and "collab(" not in (parse_talk or "").lower()
+        ):
+            parse_talk = f"Collab(ack({self.teammate.name}))"
+            end_talk = False
+        self.planner.dialog_history_list.append({"role": "think", "content": think_text})
+        total_tokens = tokens_num + extra_tokens
+        self._handle_format_issues(format_issues)
 
         # statistic
         if role == "you":
@@ -1172,13 +1606,14 @@ class LLMAgents(LLMPair):
             ]["turn"].append(parse_talk)
             self.turn_statistics_dict["statistical_data"]["communication"][
                 communication_index
-            ]["token"].append(tokens_num)
+            ]["token"].append(total_tokens)
             self.turn_statistics_dict["content"]["content"][communication_index].append(
                 {
                     "agent": self.agent_index,
-                    "analysis": self.parse_response(response, "analysis"),
+                    "think": think_text,
                     "say": parse_talk,
-                    "plan": self.parse_response(response, "plan"),
+                    "action": action_text,
+                    "recent_goal": recent_goal_entry,
                 }
             )
         else:
@@ -1188,15 +1623,16 @@ class LLMAgents(LLMPair):
             ]["turn"].append(parse_talk)
             self.teammate.turn_statistics_dict["statistical_data"]["communication"][
                 communication_index
-            ]["token"].append(tokens_num)
+            ]["token"].append(total_tokens)
             self.teammate.turn_statistics_dict["content"]["content"][
                 communication_index
             ].append(
                 {
                     "agent": self.agent_index,
-                    "analysis": self.parse_response(response, "analysis"),
+                    "think": think_text,
                     "say": parse_talk,
-                    "plan": self.parse_response(response, "plan"),
+                    "action": action_text,
+                    "recent_goal": recent_goal_entry,
                 }
             )
 
@@ -1205,23 +1641,16 @@ class LLMAgents(LLMPair):
         parse_talk, end_talk = self.parse_response(response, "talk")
         if parse_talk == "[NOTHING]" and end_talk:
             parse_talk = "OK.<END>"
-        # check if agent repeat same say
-
-        for d in self.planner.dialog_history_list:
-            # embedding for every dialog of agent
-            if d["role"] == "talk":
-                if if_two_sentence_similar_meaning(
-                    key=self.api_key, proxy=self.proxy, sentence1=d["content"], sentence2=parse_talk
-                ):
-                    return True, response
         self.planner.dialog_history_list.append({"role": "talk", "content": parse_talk})
 
         # check if there is action
         # nothing did not produce an action
-        new_plan = self.parse_response(response, "plan")
+        new_plan = self.parse_response(response, "action")
         pattern = r"(?i)nothing"
         matches = re.findall(pattern, new_plan)
         if matches:
+            return end_talk, response
+        if self._is_collab_action(new_plan):
             return end_talk, response
 
         new_plan = self.parse_ml_action_top(new_plan, False)
@@ -1230,7 +1659,8 @@ class LLMAgents(LLMPair):
             while not self.action_wait_parse.empty():
                 self.action_wait_parse.get()
 
-            for index, a in enumerate(new_plan):
+            clean_plan = [a for a in new_plan if not self._is_collab_action(a)]
+            for index, a in enumerate(clean_plan):
                 if index > 0:
                     self.action_wait_parse.put(a)
             v = list(self.action_wait_parse.queue)
@@ -1242,9 +1672,10 @@ class LLMAgents(LLMPair):
         # If the number of action to do >2 : new generated action may not follow the timestep in the queue actions, it will perform badly.
 
         if self.action_wait_parse.qsize() == 0:
-            v = new_plan
+            clean_plan = [a for a in new_plan if not self._is_collab_action(a)]
+            v = clean_plan
             print(f"\nGenerate new action list <{v}>\n")
-            for p in new_plan:
+            for p in clean_plan:
                 self.action_wait_parse.put(p)
                 # rprint(f"[green][ADD][/green]:Add new plan {p}\n")
         elif self.action_wait_parse.qsize() >= 1:
@@ -1255,53 +1686,82 @@ class LLMAgents(LLMPair):
 
         return end_talk, response
 
-    # Extract the analysis and TALK from the GPT reply.
-    # mode:analysis,<TALK>
+    # Extract the think and TALK from the GPT reply.
+    # mode:think,<TALK>
     def parse_response(self, response, mode, need_correct=False):
-        if self.agent_index == 0:
-            role = "Chef"
-        else:
-            role = "Assistant"
-        if mode == "analysis":
-            pattern = f"(?:{role})\s+analysis\s*:?\s*(.*?)\s*(?:{role})\s+plan:"
-            match = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+        role = "Chef" if self.agent_index == 0 else "Assistant"
+        text = response or ""
+
+        section_pattern = re.compile(
+            r"^\s*(Think|Recent Goal|Action)\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
+            re.IGNORECASE | re.DOTALL | re.MULTILINE,
+        )
+        sections = {}
+        for match in section_pattern.finditer(text):
+            header = match.group(1).strip().lower()
+            content = (match.group(2) or "").strip()
+            sections[header] = content
+
+        if mode == "think":
+            think_block = sections.get("think")
+            if think_block:
+                return think_block
+            pattern = r"Think\s*:\s*(.*?)(?:\n\s*Recent Goal:|\n\s*Action:|\Z)"
+            match = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
             if match:
                 return match[0]
             if need_correct:
-                response, _ = self.important_part_no_create(1, "analysis", response)
+                response, _ = self.important_part_no_create(1, "think", response)
             else:
                 response = ""
             return response
+        elif mode == "recent_goal":
+            recent_block = sections.get("recent goal")
+            if recent_block:
+                return recent_block
+            pattern = r"Recent Goal\s*:\s*(.*?)(?:\n\s*Action:|\Z)"
+            match = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                return match[0].strip()
+            return ""
         elif mode == "talk":
-            pattern = f"(?:{role})\s+say\s*:?\s*(.*?)(?:\s+|\n+)?$"
-            match = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+            action_block = sections.get("action")
+            if action_block:
+                stripped = action_block.strip()
+                if stripped.lower().startswith("collab"):
+                    return stripped, False
+                if "[NOTHING]" in stripped.upper():
+                    return "[NOTHING]", True
+                return "[NOTHING]", True
+            pattern = f"(?:{role})\\s+say\\s*:?\\s*(.*?)(?:\\s+|\\n+)?$"
+            match = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
             if match:
                 if "[NOTHING]" in match[0]:
                     return "[NOTHING]", True
-                pattern = r"(.*?)(END)"
                 end_match = (
                     True
-                    if re.findall(pattern, match[0], re.DOTALL | re.IGNORECASE)
+                    if re.findall(r"(.*?)(END)", match[0], re.DOTALL | re.IGNORECASE)
                     else False
                 )
                 return match[0], end_match
-            else:
-                # response = self.important_part_no_create(1,"talk",response)
-                return "[NOTHING]", True
-        elif mode == "plan":
-            pattern = f"({role})\s+plan\s*:?\s*(.*?)[\s\n]*(?=\s+({role})\s+say:)\s*"
-            match = re.search(pattern, response)
+            return "[NOTHING]", True
+        elif mode == "action":
+            action_block = sections.get("action")
+            if action_block:
+                cleaned = self._sanitize_action_text(action_block)
+                return f"Action: {cleaned}"
+            action_pattern = r"Action\s*:\s*(.*)"
+            match = re.search(action_pattern, text, re.IGNORECASE | re.DOTALL)
             if match:
-                # In case of generating output like: "Chef plan: a sentence
-                temp_action = match.group(0).replace("\n", "").strip().split(";")
-                first_action = temp_action[0].split(":")
-                if len(first_action) == 2:
-                    action, params = self.parse_params_in_action(first_action[1], False)
-                    # max length of action is smaller than 30.
-                    if action != "" and len(action) < 30:
-                        return match.group(0).strip()
+                cleaned = self._sanitize_action_text(match.group(1))
+                return f"Action: {cleaned}"
+            plan_pattern = rf"{role}\s+plan\s*:?\s*(.*)"
+            plan_match = re.search(plan_pattern, text, re.IGNORECASE | re.DOTALL)
+            if plan_match:
+                plan_body = self._sanitize_action_text(plan_match.group(1))
+                return f"Action: {plan_body}"
             if need_correct:
-                response, _ = self.important_part_no_create(1, "plan", response)
+                response, _ = self.important_part_no_create(1, "action", response)
             else:
                 response = ""
             return response
@@ -1330,9 +1790,18 @@ class LLMAgents(LLMPair):
         success_message = f"Solution: Your action '{self.current_ml_action}' successes at solving the problem.\n"
         self.load_prompt_file("reflection")
         self.state_prompt = self.generate_state_prompt(state)
+        combined_prompt = self._append_with_newline(
+            self._append_with_newline(
+                self._append_with_newline(self.state_prompt, message, blank_line=True),
+                failure_message,
+                blank_line=True,
+            ),
+            success_message,
+            blank_line=True,
+        )
         self.planner.current_user_message = {
             "role": "user",
-            "content": self.state_prompt + message + failure_message + success_message,
+            "content": combined_prompt,
         }
         print(f"rethink input content: {self.planner.current_user_message['content']}")
         response, correction_tokens = self.planner.query(
@@ -1340,6 +1809,13 @@ class LLMAgents(LLMPair):
             stop="Scene",
             trace=self.trace,
             rethink=True,
+        )
+        self._log_llm_call(
+            "rethink",
+            self.planner.current_user_message["content"],
+            response,
+            correction_tokens,
+            {"failure": failture},
         )
         print(f"response of rethink: {response}")
         pattern = r"Rethink:(.*?)\."
@@ -1399,6 +1875,9 @@ class LLMAgents(LLMPair):
         # At most one error at a time
         failure_message = ""
         ml_action = ""
+        think_output = ""
+        recent_goal_entry = self.current_recent_goal_text
+        planner_call_index = None
         if self.action_wait_parse.empty() or (not self.trace):
             state_prompt = self.generate_state_prompt(state)
             # Error checking
@@ -1411,7 +1890,7 @@ class LLMAgents(LLMPair):
                         )
                     else:
                         failure_message = (
-                            "\nBelow are the failed and analysis history about your last chosed action,you can use the information to reach correct action alone AND DO NOT COMMUNICATE WITH YOUR TEAMMATE :\n"
+                            "\nBelow are the failed and think history about your last chosen action. Use this information to reach a correct action alone AND DO NOT COMMUNICATE WITH YOUR TEAMMATE:\n"
                             + s["content"]
                             + "\n"
                         )
@@ -1419,16 +1898,15 @@ class LLMAgents(LLMPair):
 
             print(f"\n\n### Observation module to " + self.name + "\n")
 
-            send_message = self.message_formate_control(
-                "asker",
-                self.planner.dialog_history_list,
-                self.teammate.planner.dialog_history_list,
-            )
+            state_prompt = self.generate_state_prompt(state)
+            self.state_prompt = state_prompt
             state_message = {
                 "role": "user",
-                "content": state_prompt
-                + send_message
-                + self.planner.wong_message_prompt,
+                "content": self._append_with_newline(
+                    state_prompt,
+                    self.planner.wong_message_prompt,
+                    blank_line=True,
+                ),
             }
             self.state_prompt = state_prompt
             self.planner.current_user_message = state_message
@@ -1447,40 +1925,68 @@ class LLMAgents(LLMPair):
                 trace=self.trace,
                 map=self.mdp.state_string(self.state).replace("ø", "o"),
             )
+            self._log_llm_call(
+                "planner_main",
+                state_message["content"],
+                response,
+                tokens_num,
+            )
+            planner_call_index = len(self.pending_llm_logs) - 1
             print(response)
             # check whether need communication
-            # check whether has the plan
+            # check whether has the action
+            format_issues: List[str] = []
             communicate_response, _ = self.parse_response(response, "talk")
-            analysis = self.parse_response(response, "analysis")
-            plan = self.parse_response(response, "plan")
-            if analysis == "":
-                print("\n\n\n******No Analysis Part, Correcting*********\n\n\n")
-                analysis, response = self.important_part_no_create(1, "plan", response)
-            if plan == "":
-                print("\n\n\n******No   Plan   Part, Correcting**********\n\n\n")
-                plan, response = self.important_part_no_create(1, "plan", response)
+            think_text = self.parse_response(response, "think")
+            if think_text == "":
+                format_issues.append("missing_think")
+            recent_goal_text = self.parse_response(response, "recent_goal")
+            if recent_goal_text == "":
+                format_issues.append("missing_recent_goal")
+            action_text_block = self.parse_response(response, "action")
+            if action_text_block == "":
+                format_issues.append("missing_action")
+            think_output = think_text
+            if think_text == "":
+                print("\n\n\n******No Think Part, Correcting*********\n\n\n")
+                think_text, response = self.important_part_no_create(1, "think", response)
+                think_output = think_text
+            if recent_goal_text == "":
+                print("\n\n\n******No Recent Goal Part, Correcting*********\n\n\n")
+                recent_goal_text, response = self.important_part_no_create(
+                    1, "recent_goal", response
+                )
+            if action_text_block == "":
+                print("\n\n\n******No Action Part, Correcting**********\n\n\n")
+                action_text_block, response = self.important_part_no_create(1, "action", response)
+            self._handle_format_issues(format_issues)
+            self.update_recent_goal_text(recent_goal_text)
+            recent_goal_entry = self.current_recent_goal_text
             # If important keyword still miss, this timestamp is failed.
-            if analysis == "" or plan == "":
+            if think_text == "" or action_text_block == "":
                 print(
                     "\n\n\nMiss important part after several retry. This timstep is failed!\n\n\n"
                 )
                 ml_action = "wait(1)"
+                if planner_call_index is not None:
+                    self._queue_reward_event(ml_action, planner_call_index, "planner_main")
                 return ml_action
 
             self.planner.add_msg_to_dialog_history(
                 {"role": "scene", "content": state_message["content"]}
             )
             self.planner.add_msg_to_dialog_history(
-                {"role": "analysis", "content": analysis}
+                {"role": "think", "content": think_text}
             )
 
             # statistic
             self.turn_statistics_dict["content"]["content"][self.agent_index].append(
                 {
                     "agent": self.agent_index,
-                    "analysis": self.parse_response(response, "analysis"),
+                    "think": think_text,
                     "say": communicate_response,
-                    "plan": self.parse_response(response, "plan"),
+                    "action": action_text_block,
+                    "recent_goal": recent_goal_entry,
                 }
             )
             # If this function call is to correct action, the tokens should count into the number of correction_tokens.
@@ -1488,24 +1994,23 @@ class LLMAgents(LLMPair):
                 self.turn_statistics_dict["statistical_data"]["error_correction"][
                     self.agent_index
                 ]["validator_correction"]["correction_tokens"].append(tokens_num)
-                # check if the  plan is empty
-                if "plan" == "":
-                    plan_parse, plan = self.important_part_no_create(
-                        1, "plan", response
-                    )
-                    if "plan_parse" == "":
+                # check if the action is empty
+                if action_text_block == "":
+                    action_parse, action_text_block = self.important_part_no_create(1, "action", response)
+                    if action_parse == "":
                         self.error_correct[self.current_timestep] = False
                         ml_action = "wait(1)"
                     else:
-                        ml_action = self.parse_ml_action_top(plan, True)
+                        ml_action = self.parse_ml_action_top(action_text_block, True)
                 else:
-                    ml_action = self.parse_ml_action_top(plan, True)
+                    ml_action = self.parse_ml_action_top(action_text_block, True)
             elif ("[NOTHING]" not in communicate_response) and (
                 "[EMPTY]" not in communicate_response
             ):
                 self.planner.add_msg_to_dialog_history(
                     {"role": "talk", "content": communicate_response}
                 )
+                self.append_conversation_line(self.name, communicate_response)
                 # statistic
                 self.turn_statistics_dict["statistical_data"]["communication"][
                     self.agent_index
@@ -1517,22 +2022,29 @@ class LLMAgents(LLMPair):
                     self.agent_index
                 ]["call"] += 1
                 response = self.communication(communicate_response, state)
-            elif ("[NOTHING]" not in plan) and (plan != ""):
-                ml_action = self.parse_ml_action_top(plan, True)
+            elif ("[NOTHING]" not in action_text_block) and (action_text_block != ""):
+                ml_action = self.parse_ml_action_top(action_text_block, True)
             else:
-                # No plan and no communication content, wait
+                # No action and no communication content, wait
                 ml_action == "wait(1)"
         else:
             temp_list = []
             while not self.action_wait_parse.empty():
                 item = self.action_wait_parse.get()
                 temp_list.append(item)
-            for index, t in enumerate(temp_list):
+            actionable_list = [
+                act for act in temp_list if not self._is_collab_action(act)
+            ]
+            for index, t in enumerate(actionable_list):
                 if index == 0:
                     continue
                 self.action_wait_parse.put(t)
-            print(f"\n\n\n### Already have plan in pre-communication:\n {temp_list}")
-            response = f"{self.name} plan :{';'.join(temp_list)}"
+            if actionable_list:
+                print(f"\n\n\n### Already have action sequence in pre-communication:\n {actionable_list}")
+                response = f"Action: {';'.join(actionable_list)}"
+            else:
+                response = ""
+            recent_goal_entry = self.current_recent_goal_text
         # when handle several failure, the precious communication history should be jumped
         if self.planner.dialog_history_list_storage == [] and not self.trace:
             self.planner.dialog_history_list_storage = self.planner.dialog_history_list
@@ -1543,45 +2055,56 @@ class LLMAgents(LLMPair):
         if ml_action == "":
             ml_action = self.parse_ml_action_top(response, True)
         self.current_ml_action_steps = 0
+        failed_message_value = getattr(self, "failed_message", "success")
+        if isinstance(failed_message_value, str):
+            cleaned_failure = failed_message_value.strip()
+            if cleaned_failure.lower() == "success":
+                cleaned_failure = ""
+        else:
+            cleaned_failure = ""
+
+        self.record_history_entry(
+                think_output, self.current_recent_goal_text, ml_action, cleaned_failure
+        )
+        if planner_call_index is not None:
+            reward_action = ml_action or self._preview_primary_action(action_text_block)
+            if not reward_action:
+                reward_action = "[EMPTY]"
+            self._queue_reward_event(reward_action, planner_call_index, "planner_main")
         return ml_action
 
     # parse ml_action from  response and self correct
     def parse_ml_action_top(self, response, add_to_queue):
         # add_to_queue: if replace the old action_wait_parse with  new action list.
         print("\n===== Parser =====\n")
-        # parse the sentence in plan into action_string
-        if self.agent_index == 0:
-            pattern = r"Chef\s+plan\s*:?\s*(.*?)(?:\s+|\n+)?$"
-        elif self.agent_index == 1:
-            pattern = r"Assistant\s+plan\s*:?\s*(.*?)(?:\s+|\n+)?$"
-        else:
-            return "wait(1)" if add_to_queue else ["wait(1)"]
-        match = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
-        action_string = ""
-        if match:
-            action_string = match[0]
-        else:
+        normalized_input = (response or "").strip()
+        action_string = normalized_input
+        if not action_string.lower().startswith("action"):
+            extracted = self.parse_response(response, "action")
+            if extracted:
+                action_string = extracted.strip()
+        if action_string == "":
             print(f"Response does not follow the format rules:{response}")
             return "wait(1)" if add_to_queue else ["wait(1)"]
-        # divide the action list into several action by split ';'
-        action_string = action_string.lower()
-        action_list = action_string.split(";")
-        ml_action_list = action_list
-
-        ml_action = ""
-        for i in ml_action_list:
-            if any(s in i for s in ["request", "accept", "deny", "clarify"]):
-                continue
-            else:
-                ml_action = i
-                break
+        action_body = self._strip_action_prefix(action_string)
+        action_body = self._sanitize_action_text(action_body)
+        lowered_action_string = action_body.lower()
+        action_tokens = [
+            token.strip()
+            for token in lowered_action_string.split(";")
+            if token.strip()
+        ]
+        non_collab_tokens = [
+            token for token in action_tokens if not self._is_collab_action(token)
+        ]
+        ml_action = non_collab_tokens[0] if non_collab_tokens else ""
         if ml_action == "":
             ml_action = "wait(1)"
-            ml_action_list = ["wait(1)"]
+            non_collab_tokens = ["wait(1)"]
         if add_to_queue:
             while not self.action_wait_parse.empty():
                 self.action_wait_parse.get()
-            for index, a in enumerate(ml_action_list):
+            for index, a in enumerate(non_collab_tokens):
                 if index > 0:
                     self.action_wait_parse.put(a)
             if "wait" in ml_action:
@@ -1591,7 +2114,7 @@ class LLMAgents(LLMPair):
                 {"role": "assistant", "content": ml_action}
             )
         # print(f"{self.name}: {ml_action}")
-        return ml_action if add_to_queue else ml_action_list
+        return ml_action if add_to_queue else non_collab_tokens
 
     ##################
     """
@@ -1854,7 +2377,7 @@ class LLMAgents(LLMPair):
     def del_dialog_history(self):
         del_list = []
         for index, dialog in enumerate(self.planner.dialog_history_list):
-            if any(s == dialog["role"] for s in ["talk", "analysis"]):
+            if any(s == dialog["role"] for s in ["talk", "think"]):
                 del_list.append(index)
         self.planner.dialog_history_list = [
             value
@@ -1863,7 +2386,7 @@ class LLMAgents(LLMPair):
         ]
         del_list = []
         for index, dialog in enumerate(self.teammate.planner.dialog_history_list):
-            if any(s == dialog["role"] for s in ["talk", "analysis", "plan"]):
+            if any(s == dialog["role"] for s in ["talk", "think"]):
                 del_list.append(index)
         self.teammate.planner.dialog_history_list = [
             value
@@ -1920,8 +2443,12 @@ class LLMAgents(LLMPair):
             self.current_ml_action
         )
         # pickup dish or ingredients
+        ml_manager = am.ml_action_manager if hasattr(am, "ml_action_manager") else None
+        if ml_manager is None:
+            raise AttributeError("MediumLevelPlanner missing ml_action_manager")
+
         if "pick" in self.current_ml_action:
-            motion_goals = am.ml_action_manager.pickup_obj_actions(
+            motion_goals = ml_manager.pickup_obj_actions(
                 state,
                 self.parse_action_params[0],
                 self.parse_action_params[1],
@@ -1929,29 +2456,29 @@ class LLMAgents(LLMPair):
                 counter_objects,
             )
         elif "add_toast" in self.current_ml_action:
-            motion_goals = am.ml_action_manager.pickup_obj_actions(
+            motion_goals = ml_manager.pickup_obj_actions(
                 state, "toast", "counter", self.agent_index, counter_objects
             )
         elif "put" in self.current_ml_action:
-            motion_goals = am.ml_action_manager.go_to_utensil_actions(
+            motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
         elif "place_obj_on_counter" in self.current_ml_action:
             motion_goals = self.find_shared_counters(state, self.mlam)
             if len(motion_goals) == 0:
-                motion_goals = am.place_obj_on_counter_actions(state)
+                motion_goals = ml_manager.place_obj_on_counter_actions(state)
         elif "fill_dish_with_food" in self.current_ml_action:
-            motion_goals = am.ml_action_manager.go_to_utensil_actions(
+            motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
         elif "deliver_soup" in self.current_ml_action:
-            motion_goals = am.deliver_soup_actions()
+            motion_goals = ml_manager.deliver_soup_actions()
         elif any(s in self.parse_action for s in ["cook", "cut", "stir", "bake"]):
-            motion_goals = am.ml_action_manager.go_to_utensil_actions(
+            motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
         elif "wait" in self.current_ml_action:
-            motion_goals = am.wait_actions(player)
+            motion_goals = ml_manager.wait_actions(player)
         else:
             raise ValueError("Invalid action: {}".format(self.current_ml_action))
 

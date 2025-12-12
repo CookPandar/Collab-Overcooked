@@ -111,7 +111,7 @@ def build_output_path(input_file: str, output_target: str) -> Path:
     return output_dir / file_name
 
 
-def format_plan_content(agent_name: str, plan_text: str, say_text: str) -> str:
+def format_action_content(agent_name: str, action_text: str, say_text: str) -> str:
     """
     根据是否存在say内容决定plan字段的实际输出
     """
@@ -119,7 +119,10 @@ def format_plan_content(agent_name: str, plan_text: str, say_text: str) -> str:
     if say_text and say_text != "[NOTHING]":
         receiver = "Assistant" if agent_name == "Chef" else "Chef"
         return f"say({receiver}, {json.dumps(say_text, ensure_ascii=False)})"
-    return plan_text or ""
+    action_text = (action_text or "").strip()
+    if action_text.lower().startswith("action:"):
+        action_text = action_text.split(":", 1)[1].strip()
+    return action_text
 
 
 def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id: int) -> str:
@@ -176,12 +179,16 @@ def build_history_context(all_timesteps: List[Dict], current_idx: int, agent_id:
                         full_observation = f"{full_observation}\ncommunication history:\n{comm_text}"
 
                     hist_str = f"timestep {hist_timestamp}:{full_observation}\n"
-                    if call.get('analysis'):
-                        hist_str += f"analysis: {call['analysis']}\n"
+                    if call.get('think'):
+                        hist_str += f"think: {call['think']}\n"
                     agent_name = "Chef" if agent_id == 0 else "Assistant"
-                    formatted_plan = format_plan_content(agent_name, call.get('plan', ''), call.get('say', ''))
+                    formatted_plan = format_action_content(
+                        agent_name,
+                        call.get('action', ''),
+                        call.get('say', '')
+                    )
                     if formatted_plan:
-                        hist_str += f"plan: {formatted_plan}\n"
+                        hist_str += f"action: {formatted_plan}\n"
 
                     last_history_entry = hist_str
 
@@ -301,14 +308,14 @@ def convert_log_to_training_format(input_file: str, output_target: str):
                 full_input = f"{agent_name}'s input: " + "\n\n".join(input_parts)
 
                 # 构建输出
-                analysis = call.get("analysis", "")
-                plan = call.get("plan", "")
+                think_note = call.get("think", "")
+                plan = call.get("action", "")
                 say = call.get("say", "")
-                formatted_plan = format_plan_content(agent_name, plan, say)
+                formatted_plan = format_action_content(agent_name, plan, say)
 
                 output_parts = [
-                    f"{agent_name}'s analysis: {analysis}" if analysis else f"{agent_name}'s analysis: ",
-                    f"{agent_name}'s plan: {formatted_plan}" if formatted_plan else f"{agent_name}'s plan: "
+                    f"{agent_name}'s think: {think_note}" if think_note else f"{agent_name}'s think: ",
+                    f"{agent_name}'s action: {formatted_plan}" if formatted_plan else f"{agent_name}'s action: "
                 ]
                 full_output = "\n".join(output_parts)
 

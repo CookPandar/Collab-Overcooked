@@ -25,6 +25,7 @@ statistics_dict = {
     "total_score": 0,
     "total_action_list": [[], []],
     "content": [],
+    "process_rewards": [],
 }
 
 # Turn statistics
@@ -68,13 +69,13 @@ turn_statistics_dict = {
             },
         ],
     },
-    "content": {
-        "observation": [[], []],
-        "reflection": [[], []],
-        "content": [[], []],
-        "action_list": [[], []],
-        "original_log": "",
-    },
+        "content": {
+            "observation": [[], []],
+            "reflection": [[], []],
+            "content": [[], []],
+            "action_list": [[], []],
+            "original_log": [[], []],
+        },
 }
 
 # Token limits for different models
@@ -279,7 +280,7 @@ class Module:
         error_start = human_message.find("DO NOT COMMUNICATE WITH YOUR TEAMMATE :\n")
         if error_start != -1:
             error = human_message[error_start + len("DO NOT COMMUNICATE WITH YOUR TEAMMATE :\n"):]
-            human_message = human_message[:human_message.find("Below are the failed and analysis history")]
+            human_message = human_message[:human_message.find("Below are the failed and think history")]
         
         return output_to_port(receiver, human_message, map=map, recipe=recipe, error=error)
 
@@ -365,10 +366,15 @@ class Module:
     def _parse_human_response(self, response):
         """Parse human interface response"""
         role = "Assistant" if response.get("agent") == "agent1" else "Chef"
-        plan = response.get("plan", "")
+        action_text = response.get("action", "")
         say = response.get("say", "")
-        
-        return f"{role} analysis: [NOTHING]\n{role} plan: {plan}\n{role} say: {say if say else '[NOTHING]'}"
+        action_line = action_text if action_text else "[NOTHING]"
+        return (
+            f"{role} think: [NOTHING]\n"
+            f"Recent Goal: [EMPTY]\n"
+            f"Action: {action_line}\n"
+            f"{role} say: {say if say else '[NOTHING]'}"
+        )
 
     def reset(self):
         """Reset dialog history"""

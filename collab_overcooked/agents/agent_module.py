@@ -368,6 +368,7 @@ statistics_dict = {
     "total_score": 0,
     "total_action_list": [[], []],
     "content": [],
+    "process_rewards": [],
 }
 
 turn_statistics_dict = {
@@ -410,11 +411,11 @@ turn_statistics_dict = {
             },
         ],
     },
-    "content": {
-        "observation": [[], []],
-        "reflection": [[], []],
-        "content": [[], []],
-        "action_list": [[], []],
-        "original_log": "",
-    },
+        "content": {
+            "observation": [[], []],
+            "reflection": [[], []],
+            "content": [[], []],
+            "action_list": [[], []],
+            "original_log": [[], []],
+        },
 }

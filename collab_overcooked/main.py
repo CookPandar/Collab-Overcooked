@@ -4,6 +4,7 @@ import os
 import json
 import datetime
 from argparse import ArgumentParser
+from pathlib import Path
 import numpy as np
 from rich import print as rprint
 import copy
@@ -50,6 +51,7 @@ from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld, OvercookedS
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.agents.agent import AgentGroup
 from overcooked_ai_py.mdp.actions import Action
+from .reward import ProcessRewardTracker
 
 # Import from new modular system
 try:
@@ -58,36 +60,66 @@ try:
     from .utils import make_agent, get_example_embedding, combine_statistic_dict
     
     # Define make_agent_from_config for new system
-    def make_agent_from_config(agent_config, mdp, layout):
+    def make_agent_from_config(agent_config, mdp, layout, history_window=3, reward_tracker=None):
         """Create agent from YAML configuration using existing LLMAgents"""
         from .agents.collab import LLMAgents
-        from overcooked_ai_py.planning.planners import MediumLevelPlanner, NO_COUNTERS_PARAMS
-        
-        # Create planner
+        from overcooked_ai_py.planning.planners import MediumLevelPlanner
+
+        # Prepare MLAM parameters just like legacy make_agent
+        mlam_params = {
+            "start_orientations": False,
+            "wait_allowed": True,
+            "counter_goals": [],
+            "counter_drop": [],
+            "counter_pickup": [],
+            "same_motion_goals": True,
+        }
+        counter_locations = mdp.get_counter_locations()
+        mlam_params["counter_goals"] = counter_locations
+        mlam_params["counter_drop"] = counter_locations
+        mlam_params["counter_pickup"] = counter_locations
+
+        # Build planner with proper counter awareness
         mlam = MediumLevelPlanner.from_pickle_or_compute(
-            mdp, NO_COUNTERS_PARAMS, force_compute=False
+            mdp, mlam_params, force_compute=True
         )
-        
+
         # Map role to actor name
-        role = agent_config.get('role', 'Chef')
-        actor = 'chef' if role.lower() == 'chef' else 'assistant'
-        
-        # Create LLMAgents with config
-        agent = LLMAgents(
-            mlam, 
-            layout, 
-            model=agent_config.get('model', 'gpt-3.5-turbo'),
-            model_dirname=agent_config.get('model_dirname', '~/'),
-            local_server_api=agent_config.get('base_url', 'http://localhost:8000/v1'),
-            retrival_method=agent_config.get('retrieval_method', 'recent_k'),
-            K=agent_config.get('history_k', 1),
-            actor=actor
+        role = agent_config.get("role", "Chef")
+        actor = "chef" if role.lower() == "chef" else "assistant"
+
+        # Backward-compatible config fields
+        retrival_method = agent_config.get(
+            "retrieval_method", agent_config.get("retrival_method", "recent_k")
         )
-        
-        # Set API key and other config if needed
-        if agent_config.get('api_key'):
-            agent.api_key = agent_config['api_key']
-        
+        history_k = int(agent_config.get("history_k", agent_config.get("K", 1)))
+        local_server_api = agent_config.get(
+            "base_url", agent_config.get("local_server_api", "http://localhost:8000/v1")
+        )
+
+        agent_history_window = agent_config.get("history_window", history_window)
+
+        agent = LLMAgents(
+            mlam,
+            layout,
+            model=agent_config.get("model", "gpt-3.5-turbo"),
+            model_dirname=agent_config.get("model_dirname", "~/"),
+            local_server_api=local_server_api,
+            retrival_method=retrival_method,
+            K=history_k,
+            actor=actor,
+            auto_unstuck=agent_config.get("auto_unstuck", False),
+            controller_mode=agent_config.get("controller_mode", "new"),
+            debug_mode=agent_config.get("debug_mode", "Y"),
+            outdir=agent_config.get("outdir"),
+            history_window=agent_history_window,
+            reward_tracker=reward_tracker,
+        )
+
+        if agent_config.get("api_key"):
+            agent.api_key = agent_config["api_key"]
+
+        agent.set_mdp(mdp)
         return agent
 except ImportError:
     # Fallback to old system  
@@ -114,24 +146,27 @@ def convert_yaml_to_variant(config):
     """Convert YAML config to old-style variant dict"""
     env_config = config.get('environment', {})
     agents_config = config.get('agents', {})
-    
-    # Get model from first agent config
-    gpt_model = 'gpt-3.5-turbo'  # default
-    if agents_config:
-        first_agent = next(iter(agents_config.values()))
-        if isinstance(first_agent, dict) and 'model' in first_agent:
-            gpt_model = first_agent['model']
+    run_config = config.get('run', {})
     
     variant = {
         'layout': env_config.get('layout', 'cramped_room'),
         'horizon': env_config.get('horizon', 10),
         'order': env_config.get('order', 'boiled_egg'),
-        'episode': 1,  # Single episode for now
-        'mode': 'exp',
-        'test_mode': 'single_task',  # Default test mode
-        'p0': 'LLMPair',
-        'p1': 'LLMPair',
-        'gpt_model': gpt_model,
+        'episode': config.get('episode', run_config.get('episode', 1)),
+        'mode': config.get('mode', run_config.get('mode', 'exp')),
+        'test_mode': config.get('test_mode', run_config.get('test_mode', 'single_task')),
+        'p0': config.get('p0', run_config.get('p0', 'LLMPair')),
+        'p1': config.get('p1', run_config.get('p1', 'LLMPair')),
+        'collab_mode': config.get('collab_mode', run_config.get('collab_mode', 'llm')),
+        'llm_model': config.get(
+            'llm_model',
+            run_config.get(
+                'llm_model',
+                config.get('gpt_model', 'gpt-3.5-turbo'),
+            ),
+        ),
+        'reward': config.get('reward', run_config.get('reward', {})),
+        'history_window': config.get('history_window', run_config.get('history_window', 3)),
         'agent_configs': agents_config,
         'use_new_system': True
     }
@@ -153,13 +188,36 @@ def main(variant=None, config_path=None):
     if variant is None:
         raise ValueError("Either variant dict or config_path must be provided")
 
+    statistics_dict.setdefault("process_rewards", [])
+    statistics_dict["process_rewards"].clear()
+
     layout = variant['layout']
     horizon = variant['horizon']
     episode = variant['episode']
 
     mode = variant.get('mode', 'exp')
+    collab_mode = variant.get('collab_mode', 'llm').lower()
+    llm_model_name = variant.get('llm_model', 'gpt-3.5-turbo')
+    try:
+        history_window = max(0, int(variant.get('history_window', 3)))
+    except (TypeError, ValueError):
+        history_window = 0
     
     mdp = OvercookedGridworld.from_layout_name(layout)
+
+    reward_tracker = None
+    reward_reference_dir = Path(PROMPT_DIR) / "reference"
+    reward_settings = variant.get('reward', {})
+    try:
+        reward_tracker = ProcessRewardTracker(
+            order=variant['order'],
+            mdp=mdp,
+            reference_dir=reward_reference_dir,
+            settings=reward_settings,
+        )
+    except Exception as exc:
+        print(f"[ProcessRewardTracker] disabled: {exc}")
+        reward_tracker = None
 
     #set order according to parser
     if variant['order'] !="" and check_recipe_parse(variant):
@@ -181,7 +239,9 @@ def main(variant=None, config_path=None):
     actor_num = 0
     actor_list = ['chef','assistant']
     for i in range(episode):  
-        
+        if reward_tracker:
+            reward_tracker.reset()
+
         agents_list = []
 
         current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -190,10 +250,12 @@ def main(variant=None, config_path=None):
         if variant.get('use_new_system'):
             save_dir = f"results/{current_time}_{variant['order']}"
         else:
-            save_dir = f"{args.statistics_save_dir}/{args.gpt_model}/{args.order}"
+            stats_dir = variant.get('statistics_save_dir', 'data')
+            order_name = variant.get('order', 'task')
+            save_dir = f"{stats_dir}/{llm_model_name}/{order_name}"
         
         if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
         filename = f"{save_dir}/experiment_{current_time}_{variant['order']}.json"
 
         if mode == 'develop':
@@ -234,30 +296,47 @@ def main(variant=None, config_path=None):
             for i, (agent_id, agent_config) in enumerate(agent_configs.items()):
                 if agent_id.startswith('agent_'):
                     print(f"\n----Use {agent_config.get('model', 'unknown')} ({agent_config.get('type', 'unknown')})----\n")
-                    agent = make_agent_from_config(agent_config, mdp, layout)
+                    agent = make_agent_from_config(
+                        agent_config,
+                        mdp,
+                        layout,
+                        history_window=history_window,
+                        reward_tracker=reward_tracker,
+                    )
                     agents_list.append(agent)
         else:
             # Use old system
             for alg in [p0_algo, p1_algo]:
                 if alg == "LLMPair":
-                    if mode!="human":
-                        assert variant.get('gpt_model') is not None, print(f'you should choose a gpt model')
+                    if collab_mode != "human":
+                        assert llm_model_name is not None, print('you should choose a llm model')
                     if mode == "OpenSource":
                         assert os.path.exists(variant.get('model_dirname', '')), print(f"you should input right open-source model absolute path")
-                    print(f"\n----Use {variant.get('gpt_model', 'gpt-3.5-turbo')}----\n")
-                    if variant.get('gpt_model') == "human":
+                    display_name = "Human" if collab_mode == "human" else llm_model_name
+                    print(f"\n----Use {display_name} ({collab_mode})----\n")
+                    if collab_mode == "human":
                         assert check_port_in_use(variant.get("local_server_api", "http://localhost:8080")), print(f"port {variant.get('local_server_api', 'http://localhost:8080')} is busy")
                         change_port(variant.get("local_server_api", "http://localhost:8080"))
                     
-                    gpt_model = variant.get('gpt_model', 'gpt-3.5-turbo')
+                    gpt_model = "human" if collab_mode == "human" else llm_model_name
                     model_dirname = variant.get('model_dirname', '~/')
                     local_server_api = variant.get('local_server_api', 'http://localhost:8000/v1')
                     retrival_method = variant.get('retrival_method', 'recent_k')
                     K = variant.get('K', 3)
                     
-                    agent = make_agent(alg, mdp, layout, model=gpt_model, model_dirname=model_dirname,
-                                     local_server_api=local_server_api, retrival_method=retrival_method, 
-                                     K=K, actor=actor_list[actor_num])
+                    agent = make_agent(
+                        alg,
+                        mdp,
+                        layout,
+                        model=gpt_model,
+                        model_dirname=model_dirname,
+                        local_server_api=local_server_api,
+                        retrival_method=retrival_method,
+                        K=K,
+                        actor=actor_list[actor_num],
+                        history_window=history_window,
+                        reward_tracker=reward_tracker,
+                    )
                 else:
                     agent = make_agent(alg, mdp, layout)
                 agents_list.append(agent)
@@ -294,6 +373,12 @@ def main(variant=None, config_path=None):
                     skills += f"P{i} finished <{ml_action}>. "
                 print(skills)
 
+                reward_info = None
+                if reward_tracker:
+                    # 记录过程奖励，便于日志与可视化分析
+                    reward_info = reward_tracker.after_step(t, ml_actions, env.state)
+                    statistics_dict["process_rewards"].append(reward_info)
+
                 r_total += reward
                 if reward>0:
                     statistics_dict['total_order_finished'].append(s_t.current_k_order[0])
@@ -308,6 +393,8 @@ def main(variant=None, config_path=None):
                 turn_statistics_dict_agent1 = team.agents[1].turn_statistics_dict
 
                 turn_statistics_dict_both = combine_statistic_dict(turn_statistics_dict_agent0,turn_statistics_dict_agent1,map,reward)
+                if reward_info:
+                    turn_statistics_dict_both["statistical_data"]["process_reward"] = reward_info
 
                 statistics_dict['total_timestamp'].append(t)
                 statistics_dict['total_score'] = r_total
@@ -322,14 +409,24 @@ def main(variant=None, config_path=None):
                     if reward != 0:
                         print("Task successed!")
                         #Human-eval: set task success message
-                        if variant['gpt_model'] == "human":
+                        if collab_mode == "human":
                             for a in range(len(team.agents)):
-                                output_to_port(f"agent{a}","Success!",mission="success",port=variant['local_server_api'])
+                                output_to_port(
+                                    f"agent{a}",
+                                    "Success!",
+                                    mission="success",
+                                    port=variant.get('local_server_api', "http://localhost:8080"),
+                                )
                         break
             #Human-eval: set task failed message
-            if variant['gpt_model'] == "human":
+            if collab_mode == "human":
                 for a in range(len(team.agents)):
-                    output_to_port(f"agent{a}","Fail to finish task in time!",mission="fail",port=variant['local_server_api'])
+                    output_to_port(
+                        f"agent{a}",
+                        "Fail to finish task in time!",
+                        mission="fail",
+                        port=variant.get('local_server_api', "http://localhost:8080"),
+                    )
         print(f"Episode {i+1}/{episode}: {r_total}\n====\n\n")
         results.append(r_total)
    
@@ -351,11 +448,13 @@ if __name__ == '__main__':
 
     # these parsers are only required when using LLMPair.
 
-    # model:'gpt-3.5-turbo-0125', 'gpt-3.5-turbo', 'gpt-4', 'gpt-4o','gpt-o1mini','gpt4-turbo','llama3-8B','Llama-3.1-8B-Instruct','Llama-3.1-70B-Instruct',"Yi-1.2-34B","yi-lightning","yi-large",'yi-medium',"Qwen2.5-7B-Instruct","Qwen2.5-72B-Instruct","Qwen2.5-14B-Instruct","Qwen2.5-32B-Instruct",'claude3_sonnet'
-    parser.add_argument('--gpt_model', type=str, default='gpt-3.5-turbo-0125')
+    parser.add_argument('--collab_mode', type=str, default='llm', choices=['llm', 'human'], help='Whether collaborators are LLMS or humans')
+    parser.add_argument('--llm_model', '--gpt_model', dest='llm_model', type=str, default='gpt-3.5-turbo-0125',
+                        help='LLM identifier when collab_mode=llm')
     
     parser.add_argument('--retrival_method', type=str, default="recent_k", choices=['recent_k', 'bert_topk'], help='Use similarity-based(BERT, CLIP) retrieval or retrieve recent K history in dialog.')
     parser.add_argument('--K', type=int, default=0, help="The number of dialogues you want to retrieve.")
+    parser.add_argument('--history_window', type=int, default=3, help='Number of past decision snippets to include (0 disables history)')
 
     # 
     parser.add_argument('--model_dirname', type=str, default='.', help='absolute path of open-source model')      

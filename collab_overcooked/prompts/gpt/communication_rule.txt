@@ -14,19 +14,21 @@ Output
 ------
 Produce exactly three fields in order:
 ```
-Recent Goal: ...
 Think: ...
+Recent Goal: ...
 Action: ...
 ```
 
-### Recent Goal
-- Keep the previous goal if it is still valid.
-- If it is finished or no longer appropriate, overwrite it with an updated multi-step plan.
 
 ### Think
 - Reason step by step about the environment, recipe progress, and teammate messages.
 - Respect the utensil constraints of `{role}` and `{teammate}` spaces.
 - If a step must be executed by your teammate, wrap it inside `request(...)` while reasoning.
+
+### Recent Goal
+- Keep the previous goal if it is still valid.
+- If it is finished or no longer appropriate, overwrite it with an updated multi-step plan.
+
 
 ### Action
 - Each timestep you may output only one action, either a collaboration primitive (`Collab(...)`) or a physical action, but never both. Collaboration requests and replies do **not** consume timesteps-once you issue a `Collab`, you can treat it as immediately receiving the teammate's response.

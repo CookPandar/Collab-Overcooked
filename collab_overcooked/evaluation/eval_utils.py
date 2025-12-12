@@ -1296,7 +1296,7 @@ class Evaluation:
 
             for content in item["content"]:
                 if content["agent"] == 1 - int(begin_agent):
-                    plan_text = content.get("plan", "")
+                    plan_text = content.get("action", "")
                     plan_requests = re.findall(r"\w+\(.*?\)", plan_text)
                     if len(plan_requests) != 0:
 
@@ -1329,7 +1329,7 @@ class Evaluation:
             for content in item["content"]:
                 if content["agent"] == begin_agent:
                     # Extract the requested action from the plan
-                    plan_text = content.get("plan", "")
+                    plan_text = content.get("action", "")
                     plan_requests = re.findall(r"request\((.+?)\)", plan_text)
                     # Add the missing closing bracket for each matching request action
                     cleaned_plan_requests = [

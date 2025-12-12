@@ -14,6 +14,7 @@ Due to the numerous settings that differ from the original Overcooked game, you 
 
 *Tips*
 
+- Each action takes several timesteps to execute, so if you plan to have your teammate collaborate on an action, after aligning you need to handle other tasks first or wait a few timesteps until they finish.
 - The recipe contains every step needed to complete the order, but only the chef has access to the recipe. Therefore, when the assistant does not know the task procedure, he/she must seek help from the chef.
 - You only need to complete one order, so focus solely on the progress of that dish.
 - Only the assistant can pick up ingredients from the ingredient dispenser, which has an unlimited supply.

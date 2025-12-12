@@ -127,5 +127,9 @@ def combine_statistic_dict(dict1, dict2, map, score):
     rs["content"]["reflection"][1] = dict2["content"]["reflection"][1]
     rs["content"]["content"][1] = dict2["content"]["content"][1]
     rs["content"]["action_list"][1] = dict2["content"]["action_list"][1]
+    if "original_log" not in rs["content"] or not isinstance(rs["content"]["original_log"], list):
+        rs["content"]["original_log"] = [[], []]
+    if "original_log" in dict2["content"]:
+        rs["content"]["original_log"][1] = dict2["content"]["original_log"][1]
 
     return rs

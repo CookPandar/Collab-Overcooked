@@ -1,0 +1,4 @@
+{
+  "azure-gpt-4o": "configs/cloud.yaml",
+  "qwen2.5-7B-instruct": "configs/qwen_local.yaml"
+}

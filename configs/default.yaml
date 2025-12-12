@@ -8,13 +8,24 @@ environment:
   order: "boiled_egg"  # Available: boiled_egg, soup, salad
   layout: "cramped_room"  # Available: cramped_room, coordination_ring, etc.
   max_steps: 400
+
+# Runtime / control loop settings
+run:
+  episode: 1
+  mode: "exp"              # exp | develop
+  test_mode: "fix_task" # single_task | fix_task
+  p0: "LLMPair"
+  p1: "LLMPair"
+  collab_mode: "llm"
+  llm_model: "gpt-3.5-turbo"
+  history_window: 3
   
 # Agent settings
 agents:
   num_agents: 2
   agent_0:
     type: "custom_api"  # openai, vllm, custom_api
-    model: "gpt-4o
+    model: "gpt-4o"
     api_key: ""  # Required for OpenAI/custom API
     base_url: "https://api.openai.com/v1"  # Optional for OpenAI, required for custom_api
     temperature: 0.1
