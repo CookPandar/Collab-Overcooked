@@ -15,7 +15,7 @@ We propose a new LLM-powered Multi-Agent System (LLM-MAS) benchmark, **Collab-Ov
 ## 🎯 Key Features
 
 - **Multiple Cooking Tasks**: Boiled egg, soup, salad, and more
-- **Diverse Kitchen Layouts**: Various configurations requiring different collaboration strategies  
+- **Diverse Kitchen Layouts**: Various configurations requiring different collaboration strategies
 - **LLM Agent Support**: Works with GPT models, local LLMs, and custom agents
 - **Comprehensive Evaluation**: F1 score, similarity, redundancy, and collaboration metrics
 - **Easy Installation**: One-command setup with conda environment
@@ -52,11 +52,11 @@ pip install -e .
 
 1. **Set up API configuration**:
    Copy and edit the configuration file:
+
    ```bash
    cp configs/default.yaml configs/test_personal.yaml
    # Edit configs/test_personal.yaml and add your API key
    ```
-
 2. **Customize configuration** (optional):
    Edit `configs/test_personal.yaml` to modify settings and add your API key
 
@@ -80,7 +80,7 @@ This runs a 3-step collaboration scenario between two GPT agents making a boiled
 ## 📖 Documentation
 
 - **[Installation Guide](docs/installation.md)**: Detailed installation instructions
-- **[Usage Guide](docs/usage.md)**: Comprehensive usage examples and tutorials  
+- **[Usage Guide](docs/usage.md)**: Comprehensive usage examples and tutorials
 - **[API Reference](docs/api_reference.md)**: Complete API documentation
 
 ## 🔧 Usage Examples
@@ -138,8 +138,36 @@ bash scripts/run_evaluation.sh
 This runs the complete evaluation pipeline:
 
 1. **evaluation.py**: Calculates metrics for each task
-2. **organize_result.py**: Summarizes results into `statistics_data.csv`  
+2. **organize_result.py**: Summarizes results into `statistics_data.csv`
 3. **convert_result.py**: Computes complexity-level metrics in `converted_data.csv`
+
+### Batch Testing Multiple Models
+
+We provide a parallel-friendly driver to benchmark multiple LLM setups across all 30 recipe tasks:
+
+```bash
+# Optional: map each model to its own YAML template
+cat > configs/model_configs.json <<'EOF'
+{
+  "azure-gpt-4o": "configs/azure-gpt-4o.yaml",
+  "qwen2.5-7B-instruct": "configs/qwen2.5-7B-instruct.yaml"
+}
+EOF
+
+python scripts/run_model_suite.py \
+  --models azure-gpt-4o qwen2.5-7B-instruct \
+  --model-configs configs/model_configs.json \
+  --temperatures 0 0.7 \
+  --repeats 3 \
+  --max-workers 4 \
+  --output-dir assets/data/batch_results
+```
+
+- `--models`: list of model identifiers; both Chef/Assistant share the same entry per run.
+- `--model-configs` (optional): JSON/YAML mapping from model name to a dedicated YAML config; falls back to `--base-config` otherwise.
+- `--temperatures` / `--repeats`: sweep temperatures and repeat full suites N times.
+- `--max-workers`: number of parallel worker processes (each runs all tasks once).
+- Outputs per-model logs under `{output_dir}/{model}/logs/{order}/` and copied JSON summaries under `{output_dir}/{model}/json/{order}/`. Aggregated statistics are stored in `results.json`, `aggregate.json`, and `success_rates.png`.
 
 ### Key Metrics
 
@@ -171,11 +199,12 @@ class CustomAgent(BaseAgent):
 ### Environment Modification
 
 The environment logic is in `dependencies/overcooked_ai/`. Modify:
+
 - Layout files in `data/layouts/` for new recipes/ingredients
 - Environment logic in `mdp/` for new interactive elements
 
-
 ## Reference
+
 ```bibtex
 @inproceedings{zhang2024proagent,
   title={Proagent: building proactive cooperative agents with large language models},
@@ -196,4 +225,3 @@ The environment logic is in `dependencies/overcooked_ai/`. Modify:
  year={2019},
 }
 ```
-
