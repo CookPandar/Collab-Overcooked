@@ -26,6 +26,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
+import uuid
 
 import matplotlib.pyplot as plt
 import yaml
@@ -162,7 +163,7 @@ def load_orders(recipe_dir: Path):
     return orders
 
 
-def update_config(base_cfg, order, model_name, temperature, episodes):
+def update_config(base_cfg, order, model_name, temperature, episodes, run_id=None):
     cfg = json.loads(json.dumps(base_cfg))
     cfg.setdefault("environment", {})
     cfg["environment"]["order"] = order
@@ -171,6 +172,8 @@ def update_config(base_cfg, order, model_name, temperature, episodes):
 
     cfg.setdefault("run", {})
     cfg["run"]["episode"] = episodes
+    if run_id:
+        cfg["run"]["run_id"] = run_id
 
     for key, value in cfg.get("agents", {}).items():
         if key.startswith("agent_") and isinstance(value, dict):
@@ -201,19 +204,41 @@ def invoke_main(config_path: Path, console_log_path: Path):
             raise subprocess.CalledProcessError(retcode, cmd)
 
 
-def collect_new_log(order: str, seen_dirs: set, start_time: float):
-    base = Path("results")
+def collect_new_log(order: str, run_id: str):
+    base = Path("results") / f"{run_id}_{order}"
     if not base.exists():
         return None
-    order_dirs = {p for p in base.glob(f"*_{order}") if p.is_dir()}
-    new_dirs = [
-        p for p in order_dirs - seen_dirs if p.stat().st_mtime >= start_time
-    ]
-    if not new_dirs:
-        return None
-    latest = max(new_dirs, key=lambda p: p.stat().st_mtime)
-    json_files = list(latest.glob("*.json"))
-    return json_files[0] if json_files else None
+    json_files = sorted(base.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    return json_files[-1] if json_files else None
+
+
+def wait_for_file_stable(path: Path, timeout: float = 60.0, poll_interval: float = 0.5):
+    """
+    Wait until file size stops changing for at least one poll interval or timeout expires.
+    Collab-Overcooked writes the JSON after every timestep, so copying too early would
+    capture only a prefix. This helper avoids truncated logs when multiple workers run.
+    """
+    deadline = time.time() + timeout
+    last_size = -1
+    stable_start = None
+
+    while time.time() < deadline:
+        try:
+            current_size = path.stat().st_size
+        except OSError:
+            time.sleep(poll_interval)
+            continue
+
+        if current_size == last_size and current_size > 0:
+            if stable_start is None:
+                stable_start = time.time()
+            if time.time() - stable_start >= poll_interval:
+                return True
+        else:
+            last_size = current_size
+            stable_start = None
+        time.sleep(poll_interval)
+    return False
 
 
 def run_single_task(
@@ -227,27 +252,26 @@ def run_single_task(
     worker_id: str,
 ):
     order = order_entry["order"]
-    cfg = update_config(base_cfg, order, model, temperature, episodes)
+    run_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    run_id = f"{worker_id}-{run_ts}-{uuid.uuid4().hex[:6]}"
+    cfg = update_config(base_cfg, order, model, temperature, episodes, run_id=run_id)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
         yaml.safe_dump(cfg, tmp)
         tmp_path = Path(tmp.name)
 
-    before_dirs = (
-        {p for p in Path("results").glob(f"*_{order}")} if Path("results").exists() else set()
-    )
     start = time.time()
     success = False
     steps = None
     log_path = None
-    run_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-    base_filename = f"{worker_id}_{run_ts}_{order}"
+    base_filename = f"{run_id}_{order}"
     order_log_dir = logs_dir / order
     order_log_dir.mkdir(parents=True, exist_ok=True)
     console_log_path = order_log_dir / f"{base_filename}.log"
     try:
         invoke_main(tmp_path, console_log_path)
-        log_file = collect_new_log(order, before_dirs, start)
+        log_file = collect_new_log(order, run_id)
         if log_file and log_file.exists():
+            wait_for_file_stable(log_file)
             data = json.loads(log_file.read_text())
             success = bool(data.get("total_order_finished"))
             timestamps = data.get("total_timestamp") or []
@@ -283,14 +307,15 @@ def run_single_task(
         "log_path": log_path,
         "copied_log_path": copied_log_path,
         "console_log_path": str(console_log_path),
+        "run_id": run_id,
     }
 
 
-def run_trial_job(job):
+def run_order_job(job):
     model = job["model"]
     temperature = job["temperature"]
     repeat_idx = job["repeat"]
-    orders = job["orders"]
+    entry = job["order_entry"]
     base_cfg = job["base_cfg"]
     episodes = job["episodes"]
     logs_dir = job["logs_dir"]
@@ -299,23 +324,21 @@ def run_trial_job(job):
     logs_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[Worker] Model={model} T={temperature} Repeat={repeat_idx} started")
-    results = []
-    for entry in orders:
-        print(f"[Worker] ({model}, T={temperature}, R={repeat_idx}) -> {entry['order']}")
-        result = run_single_task(
-            entry,
-            model,
-            temperature,
-            episodes,
-            base_cfg,
-            logs_dir,
-            json_dir,
-            worker_id,
-        )
-        result["repeat"] = repeat_idx
-        results.append(result)
-    return results
+    print(
+        f"[Worker] ({model}, T={temperature}, R={repeat_idx}) -> {entry['order']} started"
+    )
+    result = run_single_task(
+        entry,
+        model,
+        temperature,
+        episodes,
+        base_cfg,
+        logs_dir,
+        json_dir,
+        worker_id,
+    )
+    result["repeat"] = repeat_idx
+    return result
 
 
 def aggregate_summary(summary: List[Dict]):
@@ -381,36 +404,36 @@ def run_suite(
         model_dir = output_dir / model
         logs_dir = model_dir / "logs"
         json_dir = model_dir / "json"
+        cfg_path = model_config_map.get(model, base_config_path)
+        base_cfg = yaml.safe_load(cfg_path.read_text())
         for temp in temperatures:
             for repeat_idx in range(repeats):
                 safe_temp = str(temp).replace(".", "_")
-                worker_id = f"worker{repeat_idx}_{safe_temp}_{job_counter}"
-                job_counter += 1
-                # choose base config for this model
-                cfg_path = model_config_map.get(model, base_config_path)
-                base_cfg = yaml.safe_load(cfg_path.read_text())
-                jobs.append(
-                    {
-                        "model": model,
-                        "temperature": temp,
-                        "repeat": repeat_idx,
-                        "orders": orders,
-                        "base_cfg": base_cfg,
-                        "episodes": episodes,
-                        "logs_dir": logs_dir,
-                        "json_dir": json_dir,
-                        "worker_id": worker_id,
-                    }
-                )
+                for order_entry in orders:
+                    worker_id = f"worker{repeat_idx}_{safe_temp}_{order_entry['order']}_{job_counter}"
+                    job_counter += 1
+                    jobs.append(
+                        {
+                            "model": model,
+                            "temperature": temp,
+                            "repeat": repeat_idx,
+                            "order_entry": order_entry,
+                            "base_cfg": base_cfg,
+                            "episodes": episodes,
+                            "logs_dir": logs_dir,
+                            "json_dir": json_dir,
+                            "worker_id": worker_id,
+                        }
+                    )
 
     summary = []
     if max_workers <= 1:
         for job in jobs:
-            summary.extend(run_trial_job(job))
+            summary.append(run_order_job(job))
     else:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            for job_results in executor.map(run_trial_job, jobs):
-                summary.extend(job_results)
+            for job_result in executor.map(run_order_job, jobs):
+                summary.append(job_result)
 
     combo_stats, level_stats = aggregate_summary(summary)
 

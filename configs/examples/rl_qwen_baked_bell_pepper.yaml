@@ -1,0 +1,19 @@
+environment:
+  layout: "cramped_room"
+  order: "baked_bell_pepper"
+  horizon: 24
+
+trainer:
+  type: "mappo"
+  model_path: "/lpai/inputs/models/Qwen__Qwen2.5-7B-Instruct-main"
+  device: "cuda"
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 1.0e-5
+  steps_per_update: 256
+  total_updates: 100
+  clip_coef: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  reward:
+    shaping: 1.0

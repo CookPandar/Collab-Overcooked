@@ -1738,8 +1738,10 @@ class LLMAgents(LLMPair):
         elif mode == "talk":
             action_block = sections.get("action")
             if action_block:
-                stripped = action_block.strip()
-                if stripped.lower().startswith("collab"):
+                stripped = self._strip_action_prefix(action_block)
+                stripped = self._sanitize_action_text(stripped)
+                lowered = stripped.lower()
+                if lowered.startswith("collab("):
                     return stripped, False
                 if "[NOTHING]" in stripped.upper():
                     return "[NOTHING]", True

@@ -28,10 +28,12 @@ class ProcessRewardTracker:
         self.product_reward_value = float(self.settings.get("product_reward", 0.5))
         self.format_penalty_value = -abs(self.settings.get("format_penalty", 0.2))
         self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 0.5))
+        self.enable_collab_reward = bool(self.settings.get("collab_reward_enabled", False))
 
         self.references = self._load_references()
         self.sequence_histories: List[List[str]] = [[], []]
         self.sequence_scores: List[float] = [0.0, 0.0]
+        self.collab_sequence_scores: List[float] = [0.0, 0.0]
 
         self.recipe_lookup = self._build_recipe_lookup()
         self.intermediate_targets = self._resolve_recipe_targets(self.order)
@@ -58,6 +60,7 @@ class ProcessRewardTracker:
         """Reset histories when the environment starts a new episode."""
         self.sequence_histories = [[], []]
         self.sequence_scores = [0.0, 0.0]
+        self.collab_sequence_scores = [0.0, 0.0]
         self.observed_targets.clear()
         self.call_events.clear()
         self.step_call_records.clear()
@@ -79,8 +82,16 @@ class ProcessRewardTracker:
             return {}
 
         normalized_action = (action_text or "").strip()
-        seq_reward = self._process_sequence_reward(agent_index, normalized_action)
+        is_collab = self._is_collab_action(normalized_action)
+        if is_collab:
+            if self.enable_collab_reward:
+                seq_reward = self._process_collab_reward(agent_index, normalized_action)
+            else:
+                seq_reward = 0.0
+        else:
+            seq_reward = self._process_sequence_reward(agent_index, normalized_action)
         penalty_total, penalty_details = self._consume_penalties(agent_index)
+        format_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "format")
         total = seq_reward + penalty_total
 
         ts = -1 if timestamp is None else int(timestamp)
@@ -92,7 +103,10 @@ class ProcessRewardTracker:
             "call_type": call_type,
             "action": normalized_action or "[EMPTY]",
             "sequence_reward": seq_reward,
+            "progress_reward": seq_reward,
+            "format_reward": format_reward,
             "penalties": penalty_details,
+            "is_collab": is_collab,
             "total": total,
         }
         self.call_events.append(entry)
@@ -164,6 +178,9 @@ class ProcessRewardTracker:
         delta = max(0.0, new_score - self.sequence_scores[agent_index])
         if delta > 0:
             self.sequence_scores[agent_index] = new_score
+            self.collab_sequence_scores[agent_index] = max(
+                self.collab_sequence_scores[agent_index], new_score
+            )
             return delta * self.sequence_weight
         return 0.0
 
@@ -177,6 +194,34 @@ class ProcessRewardTracker:
         else:
             scores = [self._tes_score(history, ref) for ref in refs]
         return max(scores)
+
+    def _best_sequence_score_from_history(self, agent_index: int, history: List[str]) -> float:
+        refs = self.references.get(agent_index, [])
+        if not refs or not history:
+            return 0.0
+        if self.sequence_metric == "lcs":
+            scores = [self._lcs_ratio(history, ref) for ref in refs]
+        else:
+            scores = [self._tes_score(history, ref) for ref in refs]
+        return max(scores) if scores else 0.0
+
+    def _process_collab_reward(self, agent_index: int, action: str) -> float:
+        requests = self._extract_collab_requests(action)
+        if not requests:
+            return 0.0
+        reward = 0.0
+        for target_idx, actions in requests:
+            if target_idx == agent_index or target_idx not in (0, 1):
+                continue
+            history = list(self.sequence_histories[target_idx])
+            history.extend(actions)
+            new_score = self._best_sequence_score_from_history(target_idx, history)
+            baseline = self.collab_sequence_scores[target_idx]
+            delta = max(0.0, new_score - baseline)
+            if delta > 0:
+                self.collab_sequence_scores[target_idx] = new_score
+                reward += delta * self.sequence_weight
+        return reward
 
     def _lcs_ratio(self, seq_a: List[str], seq_b: List[str]) -> float:
         if not seq_a or not seq_b:
@@ -352,5 +397,93 @@ class ProcessRewardTracker:
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
+    def _extract_collab_requests(self, action: str) -> List[Tuple[int, List[str]]]:
+        if not self._is_collab_action(action or ""):
+            return []
+        body = self._unwrap_function_body(action)
+        if body is None:
+            return []
+        segments = self._split_top_level_segments(body)
+        results: List[Tuple[int, List[str]]] = []
+        for segment in segments:
+            parsed = self._parse_request_segment(segment)
+            if not parsed:
+                continue
+            target_idx, command = parsed
+            normalized = self._normalize_action(command)
+            if not normalized:
+                continue
+            results.append((target_idx, [normalized]))
+        return results
+
+    def _parse_request_segment(self, text: str) -> Optional[Tuple[int, str]]:
+        stripped = (text or "").strip()
+        if not stripped.lower().startswith("request("):
+            return None
+        body = self._unwrap_function_body(stripped)
+        if body is None:
+            return None
+        target_raw, action_raw = self._split_first_argument(body)
+        target_idx = self._agent_index_from_label(target_raw)
+        if target_idx is None:
+            return None
+        command = (action_raw or "").strip()
+        if not command:
+            return None
+        return target_idx, command
+
+    def _split_top_level_segments(self, text: str, delimiter: str = ";") -> List[str]:
+        segments: List[str] = []
+        depth = 0
+        start = 0
+        for idx, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == delimiter and depth == 0:
+                segment = text[start:idx].strip()
+                if segment:
+                    segments.append(segment)
+                start = idx + 1
+        tail = text[start:].strip()
+        if tail:
+            segments.append(tail)
+        return segments
+
+    def _split_first_argument(self, text: str) -> Tuple[str, str]:
+        depth = 0
+        for idx, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                return text[:idx], text[idx + 1 :]
+        return text, ""
+
+    def _unwrap_function_body(self, text: str) -> Optional[str]:
+        stripped = (text or "").strip()
+        start = stripped.find("(")
+        if start == -1:
+            return None
+        end = len(stripped) - 1
+        if stripped[end] != ")":
+            return None
+        return stripped[start + 1 : end]
+
+    def _agent_index_from_label(self, label: Optional[str]) -> Optional[int]:
+        if not label:
+            return None
+        normalized = label.strip().lower()
+        if "assistant" in normalized or "player1" in normalized:
+            return 1
+        if "chef" in normalized or "player0" in normalized:
+            return 0
+        return None
+
     def _normalize_action(self, action: str) -> str:
         return action.replace(" ", "")
+
+    def _is_collab_action(self, action: str) -> bool:
+        return action.strip().lower().startswith("collab(") if action else False

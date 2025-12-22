@@ -155,11 +155,11 @@ cat > configs/model_configs.json <<'EOF'
 EOF
 
 python scripts/run_model_suite.py \
-  --models azure-gpt-4o qwen2.5-7B-instruct \
+  --models azure-gpt-4o  \
   --model-configs configs/model_configs.json \
-  --temperatures 0 0.7 \
-  --repeats 3 \
-  --max-workers 4 \
+  --temperatures 0.7 \
+  --repeats 10 \
+  --max-workers 10 \
   --output-dir assets/data/batch_results
 ```
 
@@ -168,6 +168,157 @@ python scripts/run_model_suite.py \
 - `--temperatures` / `--repeats`: sweep temperatures and repeat full suites N times.
 - `--max-workers`: number of parallel worker processes (each runs all tasks once).
 - Outputs per-model logs under `{output_dir}/{model}/logs/{order}/` and copied JSON summaries under `{output_dir}/{model}/json/{order}/`. Aggregated statistics are stored in `results.json`, `aggregate.json`, and `success_rates.png`.
+- 每次调用 `collab_overcooked.main` 都会写入 `results/<run_id>_<order>/experiment_*.json`。`run_id` 可以通过 `--run-id` 或 YAML 中的 `run.run_id` 显式指定；如果缺省，程序会自动生成一个带微秒时间戳与随机后缀的 ID。批量脚本会自动注入唯一 `run_id`，避免并发进程互相覆盖输出。
+- 日志 JSON 顶层新增 `prompt_templates` 字段，内含 Chef/Assistant 的完整 system prompt（含规则与对应食谱）；做 SFT 或重现输入时可直接读取该字段，拼接 observation 即可还原原始提示。
+
+若在无交互机群上运行，可使用一键脚本：
+
+```bash
+bash scripts/run_cluster_suite.sh \
+  /path/to/qwen2.5-7B-instruct \
+  qwen2.5-7B-instruct \
+  configs/model_configs.json \
+  assets/data/batch_results \
+  8000 \
+  0.9 \
+  --max-workers 8 --repeats 1
+```
+
+脚本会在本地节点启动 vLLM 服务、等待端口就绪、执行 `run_model_suite.py`，最后自动关闭服务。请确保模型配置中的 `base_url` 指向 `http://127.0.0.1:PORT/v1` 并与脚本端口保持一致。
+
+如果节点完全裸机（无 conda / vLLM），可以运行：
+
+```bash
+bash scripts/install_and_run_suite.sh \
+  /path/to/qwen2.5-7B-instruct \
+  qwen2.5-7B-instruct \
+  configs/model_configs.json \
+  assets/data/batch_results \
+  8000 \
+  0.9 \
+  --max-workers 8 --repeats 1
+```
+
+### Utility / Analysis Scripts
+
+| Script | 作用 | 备注 |
+| --- | --- | --- |
+| `scripts/start_vllm.sh` | 启动本地 vLLM OpenAI-API 服务。默认会以 `--gpu-memory-utilization 0.8` 拉起指定模型，你也可以传入 `MODEL PORT HOST GPU_USAGE` 覆盖。批量脚本在裸机环境下会调用它来托管推理服务。 |
+| `scripts/run_evaluation.sh` | 执行旧版三段式评估 (`evaluation.py` → `organize_result.py` → `convert_result.py`) 并把结果放进 `results/`。 |
+| `scripts/run_model_suite.py` | 新版多模型基准驱动，支持并发 worker、重复次数、温度网格等；推荐使用它跑日常评测。 |
+| `scripts/run_cluster_suite.sh` | 一键在有现成 conda/vLLM 环境的节点上启动 `start_vllm.sh` + `run_model_suite.py`。 |
+| `scripts/install_and_run_suite.sh` | 面向完全裸机：先用 conda/venv 装依赖，再调用 `start_vllm.sh` 与 `run_model_suite.py`。 |
+| `scripts/summarize_split_metrics.py` | 汇总 `assets/data/batch_results/<model>/json/` 中的 per-order JSON 日志，输出每个菜品、每个 split 的成功率及 Chef/Assistant 奖励指标。支持 `--per-order-csv` / `--split-csv` 导出 CSV，并可通过 `--plot-per-order-csv label=path ... --plot-output-dir plots/` 对多个模型的 per-order 指标画对比折线图（测试/验证任务自动用淡色虚线标记）。 |
+
+> **提示**：`start_vllm.sh` 只是一个简单的 vLLM 启动器，用于单机器调试或被 `run_cluster_suite.sh` / `install_and_run_suite.sh` 间接调用；如果已经手动拉起了 API 服务，就无需再次运行它。
+
+它会自动创建 Python 虚拟环境、安装 `collab_overcooked` 与 `vllm`，然后复用 `run_cluster_suite.sh` 完成整套流程。
+
+### Aggregating Historical Runs
+
+批量测试会把所有原始 JSON 写入 `assets/data/batch_results/<model>/json/<order>/`。若后续想统一统计成功率并绘制图表，可运行：
+
+```bash
+MPLCONFIGDIR=/tmp/mpl python scripts/analyze_batch_results.py --models azure-gpt-4o qwen2.5-7B-instruct
+```
+
+该脚本会：
+
+- 输出 `results.json`（按订单列出所有 run 的成功与耗时）
+- 生成 `aggregate.json`（整体 + 各 level 成功率）
+- 绘制 `success_rates.png`（整体柱状图）与 `level_success.png`（分 level 折线图）
+
+如未指定 `--models`，脚本会遍历 `assets/data/batch_results` 下所有模型文件夹。若只想统计某个温度（例如 0.7），追加 `--temperature 0.7` 即可，脚本会自动过滤出对应温度的运行记录。
+
+### Exporting SFT Data
+
+成功日志中包含完整的 system prompt、observation 与模型输出，可直接整理成 SFT 数据：
+
+```bash
+python scripts/export_sft_dataset.py \
+  --source-dir assets/data/batch_results \
+  --models azure-gpt-4o \
+  --levels 1 2 \
+  --temperature 0.7 \
+  --agents Chef Assistant \
+  --output data/sft/gpt4o_level12.jsonl
+```
+
+每行 JSON 结构如下：
+
+```json
+{
+  "system": "<system prompt>",
+  "prompt": "<observation + 历史对话>",
+  "response": "<Think/Recent Goal/Action>",
+  "meta": {"model": "azure-gpt-4o", "order": "baked_bell_pepper", "level": 1, ...}
+}
+```
+
+可通过 `--levels` / `--temperature` / `--agents` 控制样本筛选，`--max-samples` 则限制导出数量。
+
+若希望按“任务级”划分训练/验证/测试（例如 Level1&2 菜谱按 7:1:2 划分，保证验证/测试订单在训练中从未出现），可运行：
+
+```bash
+python scripts/export_sft_dataset.py \
+  --source-dir assets/data/batch_results \
+  --models azure-gpt-4o \
+  --levels 1 2 \
+  --temperature 0.7 \
+  --agents Chef Assistant \
+  --train-output data/sft/train_level12.jsonl \
+  --val-output data/sft/dev_level12.jsonl \
+  --test-output data/sft/test_level12.jsonl \
+  --train-ratio 0.7 --val-ratio 0.1 --test-ratio 0.2 \
+  --split-seed 42
+```
+
+脚本会先收集符合条件的订单，然后按比例随机分配到 train/val/test，确保同一订单的所有轨迹只会出现在一个 split 中。若同时指定 `--output`，还会额外生成一个合并后的全集。
+
+### Fine-tuning Qwen2.5 with Exported Data
+
+准备好 JSONL 后，可使用 `scripts/train_qwen_sft.py` 进行（LoRA）微调：
+
+```bash
+pip install transformers datasets accelerate peft
+
+python scripts/train_qwen_sft.py \
+  --data-path data/sft/gpt4o_level12.jsonl \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --output-dir runs/qwen2.5-sft-level12 \
+  --epochs 1 \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 16 \
+  --learning-rate 5e-5 \
+  --max-length 2048 \
+  --use-lora \
+  --eval-ratio 0.05
+```
+
+脚本依赖 HuggingFace Transformers + PEFT：若开启 `--use-lora`，默认在 `q_proj/k_proj/v_proj/o_proj` 上注入 LoRA；也可通过 `--lora-r/--lora-alpha/--lora-dropout` 调整。训练完成后，`--output-dir` 下会保存可直接推理的模型与 tokenizer。
+
+如果已经通过 `export_sft_dataset.py` 生成了拆分好的 `train/dev/test` JSONL，可以直接传入：
+
+```bash
+python scripts/train_qwen_sft.py \
+  --train-data data/sft/train_level12.jsonl \
+  --eval-data data/sft/dev_level12.jsonl \
+  --model-name Qwen/Qwen2.5-7B-Instruct \
+  --output-dir runs/qwen2.5-sft-level12 \
+  ...
+```
+
+`--eval-data` 不提供时，可以继续使用 `--eval-ratio` 从训练集划分验证集；`--test-data` 可留作离线评估（训练过程中不会使用）。
+
+### RL Baseline (MAPPO + Qwen2.5)
+
+我们提供 `python -m collab_overcooked.main_rl` 作为扩展入口：当配置文件包含 `trainer` 字段时，会自动切换到 MAPPO 训练流程，否则保持原有推理模式。例如：
+
+```bash
+python -m collab_overcooked.main_rl --config configs/examples/rl_qwen.yaml
+```
+
+`trainer.model_path` 需要指向本地可用的 Hugging Face 检查点（如 Qwen2.5-7B-Instruct）；脚本会加载该模型作为共享的 actor-critic，对 Collab-Overcooked 奖励进行 RL 微调。
 
 ### Key Metrics
 

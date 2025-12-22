@@ -26,7 +26,7 @@ echo "Checking model availability..."
 
 # Start vLLM server
 echo "Starting vLLM API server..."
-python -m vllm.entrypoints.api_server \
+python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_NAME" \
     --host "$HOST" \
     --port "$PORT" \

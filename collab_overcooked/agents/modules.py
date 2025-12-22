@@ -26,6 +26,7 @@ statistics_dict = {
     "total_action_list": [[], []],
     "content": [],
     "process_rewards": [],
+    "prompt_templates": {},
 }
 
 # Turn statistics

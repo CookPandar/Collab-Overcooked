@@ -1,4 +1,4 @@
 {
-  "azure-gpt-4o": "configs/cloud.yaml",
-  "qwen2.5-7B-instruct": "configs/qwen_local.yaml"
+  "azure-gpt-4o": "configs/azure-gpt-4o.yaml",
+  "qwen2.5-7B-instruct": "configs/qwen2.5-7B-instruct.yaml"
 }

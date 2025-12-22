@@ -29,7 +29,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-root",
         type=Path,
-        required=True,
         help="Directory containing per-order JSON folders (e.g., assets/data/batch_results/<model>/json).",
     )
     parser.add_argument("--train-data", type=Path, help="JSONL file containing SFT training split.")
@@ -46,9 +45,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV path for aggregated split statistics.",
     )
     parser.add_argument(
-        "--allow-unknown",
-        action="store_true",
-        help="Allow orders missing from the provided split JSONLs (default: error).",
+        "--plot-per-order-csv",
+        nargs="+",
+        help="Plot per-order metrics from CSV files (format label=path or plain path).",
+    )
+    parser.add_argument(
+        "--plot-output-dir",
+        type=Path,
+        help="Directory to save per-order metric plots when --plot-per-order-csv is used.",
     )
     return parser.parse_args()
 
@@ -176,6 +180,34 @@ class OrderStats:
         reward_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_rewards"]  # type: ignore[assignment]
         sequence_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_sequence_rewards"]  # type: ignore[assignment]
         penalty_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_format_penalties"]  # type: ignore[assignment]
+        for idx, col_prefix in agent_columns:
+            agent_name = self.agent_names.get(idx, default_agent_name(idx))
+            reward_metrics = reward_summary.get(agent_name)
+            seq_metrics = sequence_summary.get(agent_name)
+            penalty_metrics = penalty_summary.get(agent_name)
+            values = self.agent_totals.get(idx, [])
+            row[f"{col_prefix}_avg_reward"] = reward_metrics["avg"] if reward_metrics else None
+            row[f"{col_prefix}_total_reward"] = sum(values) if values else 0.0
+            row[f"{col_prefix}_avg_sequence_reward"] = seq_metrics["avg"] if seq_metrics else None
+            row[f"{col_prefix}_avg_format_reward"] = penalty_metrics["avg"] if penalty_metrics else None
+        return row
+
+    def agent_metric_row(
+        self,
+        name: str,
+        split: str,
+        agent_columns: Iterable[Tuple[int, str]],
+    ) -> Dict[str, Optional[float]]:
+        summary = self.summary()
+        reward_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_rewards"]  # type: ignore[assignment]
+        sequence_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_sequence_rewards"]  # type: ignore[assignment]
+        penalty_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_format_penalties"]  # type: ignore[assignment]
+        row: Dict[str, Optional[float]] = {
+            "name": name,
+            "split": split,
+            "success_rate": summary["success_rate"],
+            "episodes": summary["episodes"],
+        }
         for idx, col_prefix in agent_columns:
             agent_name = self.agent_names.get(idx, default_agent_name(idx))
             reward_metrics = reward_summary.get(agent_name)
@@ -384,31 +416,201 @@ def print_split_summary(split_stats: Dict[str, OrderStats]) -> None:
             )
 
 
+def print_order_metrics(
+    order_metrics: Dict[str, OrderStats],
+    mapping: Dict[str, str],
+    agent_columns: List[Tuple[int, str]],
+) -> None:
+    header_parts = ["order", "split", "success_rate"]
+    for _, col_prefix in agent_columns:
+        header_parts.extend(
+            [
+                f"{col_prefix}_avg_reward",
+                f"{col_prefix}_total_reward",
+                f"{col_prefix}_avg_sequence_reward",
+                f"{col_prefix}_avg_format_reward",
+            ]
+        )
+    print("\n=== PER-ORDER METRICS ===")
+    print("\t".join(header_parts))
+    for order_name in sorted(order_metrics.keys()):
+        split = mapping.get(order_name)
+        if split is None:
+            continue
+        row = order_metrics[order_name].agent_metric_row(order_name, split, agent_columns)
+        values = [order_name, split, _fmt(row.get("success_rate"))]
+        for _, col_prefix in agent_columns:
+            values.append(_fmt(row.get(f"{col_prefix}_avg_reward")))
+            values.append(_fmt(row.get(f"{col_prefix}_total_reward")))
+            values.append(_fmt(row.get(f"{col_prefix}_avg_sequence_reward")))
+            values.append(_fmt(row.get(f"{col_prefix}_avg_format_reward")))
+        print("\t".join(values))
+
+
+def parse_plot_sources(entries: List[str]) -> List[Tuple[str, Path]]:
+    result: List[Tuple[str, Path]] = []
+    for entry in entries:
+        if "=" in entry:
+            label, path_str = entry.split("=", 1)
+            label = label.strip() or Path(path_str).stem
+        else:
+            path_str = entry
+            label = Path(entry).stem
+        result.append((label, Path(path_str.strip())))
+    return result
+
+
+def _to_float(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_per_order_csv(path: Path) -> Dict[str, Dict[str, Optional[float]]]:
+    rows: Dict[str, Dict[str, Optional[float]]] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            order = row.get("name") or row.get("order")
+            split = (row.get("split") or "").strip().lower()
+            if not order or split == "unknown":
+                continue
+            entry = {
+                "split": split,
+                "assistant_avg_reward": _to_float(row.get("assistant_avg_reward")),
+                "assistant_avg_format_reward": _to_float(row.get("assistant_avg_format_reward")),
+                "assistant_avg_sequence_reward": _to_float(row.get("assistant_avg_sequence_reward")),
+                "chef_avg_reward": _to_float(row.get("chef_avg_reward")),
+                "chef_avg_format_reward": _to_float(row.get("chef_avg_format_reward")),
+                "chef_avg_sequence_reward": _to_float(row.get("chef_avg_sequence_reward")),
+                "success_rate": _to_float(row.get("success_rate")),
+            }
+            rows[order] = entry
+    return rows
+
+
+def plot_per_order_metrics(datasets: List[Tuple[str, Dict[str, Dict[str, Optional[float]]]]], output_dir: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[plot] matplotlib 未安装，跳过绘图。")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    order_names = sorted({order for _, data in datasets for order in data.keys()})
+    if not order_names:
+        print("[plot] 无可用的菜品数据，跳过绘图。")
+        return
+
+    metric_specs = [
+        ("assistant_avg_reward", "Assistant Avg Reward"),
+        ("assistant_avg_format_reward", "Assistant Avg Format Reward"),
+        ("assistant_avg_sequence_reward", "Assistant Avg Process Reward"),
+        ("chef_avg_reward", "Chef Avg Reward"),
+        ("chef_avg_format_reward", "Chef Avg Format Reward"),
+        ("chef_avg_sequence_reward", "Chef Avg Process Reward"),
+        ("success_rate", "Success Rate"),
+    ]
+
+    x_idx = list(range(len(order_names)))
+    for metric_key, title in metric_specs:
+        plt.figure(figsize=(max(10, len(order_names) * 0.4), 5))
+        for label, data in datasets:
+            y_values = []
+            for order in order_names:
+                val = data.get(order, {}).get(metric_key)
+                y_values.append(float(val) if val is not None else float("nan"))
+            line, = plt.plot(x_idx, y_values, label=label)
+            color = line.get_color()
+            non_test_indices = [
+                idx for idx, order in enumerate(order_names) if data.get(order, {}).get("split") != "test"
+            ]
+            if non_test_indices:
+                non_test_values = [y_values[idx] for idx in non_test_indices]
+                plt.scatter(
+                    [x_idx[idx] for idx in non_test_indices],
+                    non_test_values,
+                    marker="o",
+                    color=color,
+                    label=None,
+                    zorder=4,
+                )
+            special_indices = [
+                idx
+                for idx, order in enumerate(order_names)
+                if data.get(order, {}).get("split") in {"test", "dev"}
+            ]
+            for idx in special_indices:
+                plt.axvline(
+                    x_idx[idx],
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.3,
+                    zorder=3,
+                )
+        plt.xticks(x_idx, order_names, rotation=45, ha="right")
+        plt.ylabel(title)
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+        plt.tight_layout()
+        plot_path = output_dir / f"{metric_key}.png"
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"[plot] Saved {plot_path}")
+
+
 def main() -> None:
     args = parse_args()
+    ran_plot = False
+    if args.plot_per_order_csv:
+        if not args.plot_output_dir:
+            raise ValueError("请通过 --plot-output-dir 指定绘图输出目录。")
+        plot_entries = parse_plot_sources(args.plot_per_order_csv)
+        datasets = []
+        for label, csv_path in plot_entries:
+            if not csv_path.exists():
+                print(f"[plot] Warning: CSV not found at {csv_path}, skip.")
+                continue
+            data = load_per_order_csv(csv_path)
+            if not data:
+                print(f"[plot] Warning: No valid rows found in {csv_path}, skip.")
+                continue
+            datasets.append((label, data))
+        if datasets:
+            plot_per_order_metrics(datasets, args.plot_output_dir)
+            ran_plot = True
+        else:
+            print("[plot] No datasets available for plotting.")
+
+    if not args.log_root:
+        if ran_plot:
+            return
+        raise ValueError("--log-root is required unless plotting only CSV inputs.")
+
     order_metrics = aggregate_order_metrics(args.log_root)
     mapping = build_order_split_map(args)
     missing_orders = sorted(o for o in order_metrics.keys() if o not in mapping)
-    if missing_orders and not args.allow_unknown:
+    if missing_orders:
         preview = ", ".join(missing_orders[:10])
-        raise ValueError(
-            "未能在提供的 SFT 数据集中找到以下任务的 split 标签，请补充后重试："
-            f"{preview}{' ...' if len(missing_orders) > 10 else ''}\n"
-            "如需临时允许这些任务归入 unknown，请添加 --allow-unknown。"
-        )
-    if missing_orders and args.allow_unknown:
         print(
-            f"[split-map] Warning: {len(missing_orders)} orders lack split mapping; "
-            "they will be reported under 'unknown'."
+            "[split-map] Warning: 以下任务未在 train/dev/test 数据集中找到标签，将被跳过: "
+            f"{preview}{' ...' if len(missing_orders) > 10 else ''}"
         )
     split_stats = build_split_stats(order_metrics, mapping)
-    print_split_summary(split_stats)
-
     agent_columns = make_agent_columns(order_metrics)
+    print_order_metrics(order_metrics, mapping, agent_columns)
+    print_split_summary(split_stats)
     per_order_rows: List[Dict[str, Optional[float]]] = []
     for order_name in sorted(order_metrics.keys()):
-        split = mapping.get(order_name, "unknown")
-        row = order_metrics[order_name].to_row(order_name, split, agent_columns)
+        split = mapping.get(order_name)
+        if split is None:
+            continue
+        row = order_metrics[order_name].agent_metric_row(order_name, split, agent_columns)
         per_order_rows.append(row)
     if args.per_order_csv:
         write_csv(per_order_rows, args.per_order_csv)
@@ -419,6 +621,9 @@ def main() -> None:
         split_rows.append(row)
     if args.split_csv:
         write_csv(split_rows, args.split_csv)
+
+    if args.plot_per_order_csv and not ran_plot:
+        print("[plot] 未能绘制任何图表（数据为空）。")
 
 
 if __name__ == "__main__":

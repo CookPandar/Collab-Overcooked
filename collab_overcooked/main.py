@@ -3,6 +3,7 @@ import datetime
 import os
 import json
 import datetime
+import uuid
 from argparse import ArgumentParser
 from pathlib import Path
 import numpy as np
@@ -168,7 +169,9 @@ def convert_yaml_to_variant(config):
         'reward': config.get('reward', run_config.get('reward', {})),
         'history_window': config.get('history_window', run_config.get('history_window', 3)),
         'agent_configs': agents_config,
-        'use_new_system': True
+        'use_new_system': True,
+        'run_id': run_config.get('run_id', config.get('run_id')),
+        'results_root': run_config.get('results_root', config.get('results_root', 'results')),
     }
     
     return variant
@@ -190,14 +193,25 @@ def main(variant=None, config_path=None):
 
     statistics_dict.setdefault("process_rewards", [])
     statistics_dict["process_rewards"].clear()
+    statistics_dict["prompt_templates"] = {}
 
     layout = variant['layout']
     horizon = variant['horizon']
     episode = variant['episode']
+    order_name = variant.get('order', 'task')
 
     mode = variant.get('mode', 'exp')
     collab_mode = variant.get('collab_mode', 'llm').lower()
     llm_model_name = variant.get('llm_model', 'gpt-3.5-turbo')
+
+    run_id = variant.get('run_id')
+    if not run_id:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        run_id = f"{timestamp}-{uuid.uuid4().hex[:6]}"
+        variant['run_id'] = run_id
+    print(f"[Run] 使用 run_id: {run_id}")
+
+    results_root = Path(variant.get('results_root', variant.get('statistics_save_dir', 'results')))
     try:
         history_window = max(0, int(variant.get('history_window', 3)))
     except (TypeError, ValueError):
@@ -244,19 +258,17 @@ def main(variant=None, config_path=None):
 
         agents_list = []
 
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        episode_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
         
         # Handle save directory for new config system
         if variant.get('use_new_system'):
-            save_dir = f"results/{current_time}_{variant['order']}"
+            save_dir = results_root / f"{run_id}_{order_name}"
         else:
-            stats_dir = variant.get('statistics_save_dir', 'data')
-            order_name = variant.get('order', 'task')
-            save_dir = f"{stats_dir}/{llm_model_name}/{order_name}"
+            stats_dir = Path(variant.get('statistics_save_dir', 'data'))
+            save_dir = stats_dir / llm_model_name / order_name
         
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir, exist_ok=True)
-        filename = f"{save_dir}/experiment_{current_time}_{variant['order']}.json"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        filename = save_dir / f"experiment_{episode_stamp}_{order_name}.json"
 
         if mode == 'develop':
             """
@@ -465,6 +477,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', type=str, default=None, help='dir to save result')
     parser.add_argument('--debug', type=boolean_argument, default=True, help='debug mode')
     parser.add_argument('--order', type=str, default="", help='1 task order name')
+    parser.add_argument('--run_id', type=str, default=None, help='Unique run identifier (optional)')
 
     #
     parser.add_argument('--statistics_save_dir', type=str, default='data', help='save directory of LLM statistics')
