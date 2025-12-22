@@ -255,7 +255,18 @@ class LLMAgents(LLMPair):
             "{recipe}",
             recipe_content if recipe_content != "" else "You do not have the recipe\n",
         )
-        return self.planner.instruction_head_list[0]["content"]
+        final_prompt = self.planner.instruction_head_list[0]["content"]
+        prompt_store = statistics_dict.setdefault("prompt_templates", {})
+        prompt_entry = {
+            "role": self.name,
+            "actor": self.actor,
+            "order": self.order,
+            "prompt": final_prompt,
+        }
+        if recipe_content.strip():
+            prompt_entry["recipe_text"] = recipe_content
+        prompt_store[self.name] = prompt_entry
+        return final_prompt
 
     def reset(self, teammate: LLMPair):
         self.planner.reset()
