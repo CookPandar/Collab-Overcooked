@@ -76,22 +76,35 @@ class QwenLMActorCritic(nn.Module):
         device: torch.device,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        eval_batch_size: int = 4,
     ) -> None:
         super().__init__()
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        model_kwargs: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "torch_dtype": self.dtype,
+        }
+        try:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+        except Exception:
+            model_kwargs.pop("attn_implementation", None)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            trust_remote_code=True,
+            **model_kwargs,
         )
         hidden_size = self.model.config.hidden_size
-        self.value_head = nn.Linear(hidden_size, 1)
+        self.value_head = nn.Linear(hidden_size, 1, device=device, dtype=self.dtype)
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.device = device
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.to(device)
 
     def _prepare_inputs(self, prompt: str) -> Dict[str, torch.Tensor]:
@@ -157,20 +170,37 @@ class QwenLMActorCritic(nn.Module):
         response_tensors: List[torch.Tensor],
     ):
         device = self.device
+        chunk_log_probs = []
+        chunk_entropies = []
+        chunk_values = []
+        for start in range(0, len(prompt_tensors), self.eval_batch_size):
+            end = start + self.eval_batch_size
+            lp, ent, val = self._evaluate_chunk(
+                prompt_tensors[start:end], response_tensors[start:end], device
+            )
+            chunk_log_probs.append(lp)
+            chunk_entropies.append(ent)
+            chunk_values.append(val)
+        return (
+            torch.cat(chunk_log_probs, dim=0),
+            torch.cat(chunk_entropies, dim=0),
+            torch.cat(chunk_values, dim=0),
+        )
+
+    def _evaluate_chunk(
+        self,
+        prompt_tensors: List[torch.Tensor],
+        response_tensors: List[torch.Tensor],
+        device: torch.device,
+    ):
         pad_id = self.tokenizer.pad_token_id
         prompt_lengths = torch.tensor([len(t) for t in prompt_tensors], device=device)
-        response_lengths = torch.tensor(
-            [len(t) for t in response_tensors], device=device
-        )
+        response_lengths = torch.tensor([len(t) for t in response_tensors], device=device)
         combined = [
             torch.cat([p.to(device), r.to(device)], dim=0)
             for p, r in zip(prompt_tensors, response_tensors)
         ]
-        input_ids = pad_sequence(
-            combined,
-            batch_first=True,
-            padding_value=pad_id,
-        )
+        input_ids = pad_sequence(combined, batch_first=True, padding_value=pad_id)
         attention_mask = input_ids.ne(pad_id).long()
         outputs = self.model(
             input_ids,
@@ -179,11 +209,9 @@ class QwenLMActorCritic(nn.Module):
         )
         logits = outputs.logits
         hidden_states = outputs.hidden_states[-1]
-
         log_probs = []
         entropies = []
         values = []
-
         for i in range(input_ids.size(0)):
             p_len = int(prompt_lengths[i].item())
             r_len = int(response_lengths[i].item())
@@ -192,28 +220,19 @@ class QwenLMActorCritic(nn.Module):
                 entropies.append(torch.tensor(0.0, device=device))
                 values.append(self.value_head(hidden_states[i : i + 1, -1, :]).squeeze(0))
                 continue
-
             start = max(p_len - 1, 0)
             end = start + r_len
             token_logits = logits[i, start:end, :]
             token_ids = input_ids[i, p_len : p_len + r_len]
             logprob = torch.log_softmax(token_logits, dim=-1)
-            gathered = logprob.gather(
-                dim=-1, index=token_ids.unsqueeze(-1)
-            ).squeeze(-1)
+            gathered = logprob.gather(dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
             log_probs.append(gathered.sum())
-
             dists = torch.distributions.Categorical(logits=token_logits)
             entropies.append(dists.entropy().mean())
-
             last_index = p_len + r_len - 1
             value_vec = hidden_states[i, last_index, :].unsqueeze(0)
             values.append(self.value_head(value_vec).squeeze(0))
-
-        log_probs = torch.stack(log_probs)
-        entropies = torch.stack(entropies)
-        values = torch.stack(values)
-        return log_probs, entropies, values
+        return torch.stack(log_probs), torch.stack(entropies), torch.stack(values)
 
     def forward(
         self,
@@ -274,6 +293,7 @@ class MAPPOTrainer:
             device=self.device,
             max_new_tokens=trainer_cfg.get("max_new_tokens", 512),
             temperature=trainer_cfg.get("generation_temperature", 0.7),
+            eval_batch_size=trainer_cfg.get("evaluation_batch_size", 4),
         )
         self.optimizer = torch.optim.AdamW(
             self.text_policy.parameters(), lr=trainer_cfg.get("lr", 1e-5)
@@ -339,9 +359,9 @@ class MAPPOTrainer:
         local_target = self.local_steps_per_update
         while step_count < local_target:
             step_result = self.session.step()
-            reward = step_result.reward
-            done = float(step_result.done)
             for record in step_result.policy_records:
+                reward = getattr(record, "reward", step_result.reward)
+                done = float(getattr(record, "done", step_result.done))
                 meta = record.metadata
                 self.buffer.add(
                     prompt_ids=meta["prompt_ids"],

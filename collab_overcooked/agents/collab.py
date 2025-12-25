@@ -871,6 +871,14 @@ class LLMAgents(LLMPair):
                 return token
         return tokens[0] if tokens else ""
 
+    def _set_planner_call_context(self, call_type: str, **metadata):
+        if not hasattr(self, "planner") or self.planner is None:
+            return
+        context = {"call_type": call_type, "agent_index": self.agent_index}
+        if metadata:
+            context.update(metadata)
+        setattr(self.planner, "_rl_call_context", context)
+
     def _queue_reward_event(self, action_text: Optional[str], call_index: Optional[int], call_type: str):
         if not self.reward_tracker or self.agent_index is None:
             self._pending_reward_event = None
@@ -1317,6 +1325,7 @@ class LLMAgents(LLMPair):
             + "\n\nReturn a corrected response that includes a Collab(...) action."
         )
         self.planner.current_user_message = {"role": "user", "content": correction_prompt}
+        self._set_planner_call_context("collab_reply")
         response, correction_tokens = self.planner.query(
             proxy=self.proxy, stop="Scene", trace=True
         )
@@ -1510,6 +1519,7 @@ class LLMAgents(LLMPair):
                 + "\n\n<END>Now please return correct answer with your loss part.",
             }
             # print(self.planner.current_user_message)
+            self._set_planner_call_context("format_correction", missing_part=part_type)
             response, correction_tokens = self.planner.query(
                 proxy=self.proxy, stop="Scene", trace=True
             )
@@ -1561,6 +1571,7 @@ class LLMAgents(LLMPair):
             "role": "user",
             "content": self._append_with_newline(self.state_prompt, message, blank_line=True),
         }
+        self._set_planner_call_context("communication", role=role)
         response, tokens_num = self.planner.query(
             proxy=self.proxy, stop="Scene", trace=True
         )
@@ -1817,6 +1828,7 @@ class LLMAgents(LLMPair):
             "content": combined_prompt,
         }
         print(f"rethink input content: {self.planner.current_user_message['content']}")
+        self._set_planner_call_context("rethink")
         response, correction_tokens = self.planner.query(
             proxy=self.proxy,
             stop="Scene",
@@ -1932,6 +1944,7 @@ class LLMAgents(LLMPair):
 
             print(f"\n\n\n### GPT Planner module\n")
             print("====== GPT Query ======")
+            self._set_planner_call_context("planner_main")
             response, tokens_num = self.planner.query(
                 proxy=self.proxy,
                 stop="Scene",

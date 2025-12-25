@@ -67,6 +67,9 @@ class PolicyCallRecord:
     response: str
     metadata: Dict[str, Any] = field(default_factory=dict)
     context: Dict[str, Any] = field(default_factory=dict)
+    reward: float = 0.0
+    done: bool = False
+    timestep: Optional[int] = None
 
 
 @dataclass
@@ -145,6 +148,10 @@ class RLPlannerProxy:
             "agent_name": getattr(self._planner, "name", None),
             "timestep": getattr(self._planner, "current_timestep", None),
         }
+        call_context = getattr(self._planner, "_rl_call_context", None)
+        if isinstance(call_context, dict):
+            context.update(call_context)
+            setattr(self._planner, "_rl_call_context", None)
 
         response_text, metadata = self.policy_fn(self.agent_index, messages, context)
         token_count = metadata.get("token_count")
@@ -161,6 +168,7 @@ class RLPlannerProxy:
             response=response_text,
             metadata=metadata,
             context=context,
+            timestep=context.get("timestep"),
         )
         self._records.append(record)
         print(
@@ -283,7 +291,14 @@ class CollabMainSession:
 
         records: List[PolicyCallRecord] = []
         for proxy in self.rl_modules:
-            records.extend(proxy.consume_records())
+            agent_records = proxy.consume_records()
+            if not agent_records:
+                continue
+            for record in agent_records:
+                if record.timestep is None:
+                    record.timestep = state.timestep
+            records.extend(agent_records)
+        self._assign_call_rewards(records, process_reward, done)
         print(
             "[CollabMainSession] "
             f"timestep={state.timestep} reward={reward:.3f} done={done} policy_calls={len(records)}"
@@ -343,6 +358,51 @@ class CollabMainSession:
             "counters": counters,
             "pot_states": self.mdp.get_pot_states(state),
         }
+
+    def _assign_call_rewards(
+        self,
+        records: List[PolicyCallRecord],
+        process_reward: Optional[Dict[str, Any]],
+        done_flag: bool,
+    ):
+        if not records:
+            return
+        reward_queues: Dict[int, List[Dict[str, Any]]] = {0: [], 1: []}
+        if process_reward and isinstance(process_reward, dict):
+            per_agent = process_reward.get("per_agent") or []
+            for agent_idx in range(min(len(per_agent), 2)):
+                agent_calls = per_agent[agent_idx].get("calls") if isinstance(per_agent[agent_idx], dict) else None
+                if agent_calls:
+                    reward_queues[agent_idx].extend(agent_calls)
+
+        action_call_types = {"planner_main"}
+        for idx, record in enumerate(records):
+            call_type = (record.context or {}).get("call_type")
+            metadata = dict(record.metadata)
+            if call_type:
+                metadata.setdefault("call_type", call_type)
+            if call_type in action_call_types:
+                queue = reward_queues.get(record.agent_index, [])
+                reward_entry = queue.pop(0) if queue else None
+                if reward_entry:
+                    seq_reward = float(reward_entry.get("sequence_reward", 0.0))
+                    fmt_reward = float(reward_entry.get("format_reward", 0.0))
+                    record.reward = seq_reward + fmt_reward
+                    breakdown = {
+                        "sequence_reward": seq_reward,
+                        "format_reward": fmt_reward,
+                        "call_type": reward_entry.get("call_type"),
+                        "raw": reward_entry,
+                    }
+                    metadata["reward_breakdown"] = breakdown
+                else:
+                    record.reward = 0.0
+                    metadata.setdefault("reward_breakdown", {}).setdefault("missing_reward_entry", True)
+            else:
+                record.reward = 0.0
+                metadata.setdefault("reward_breakdown", {}).setdefault("communication_reward", 0.0)
+            record.metadata = metadata
+            record.done = bool(done_flag) if idx == len(records) - 1 else False
 
     def _format_player(self, player_state) -> Dict[str, Any]:
         held = player_state.held_object
