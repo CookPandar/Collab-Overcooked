@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -62,6 +62,25 @@ def broadcast_object(obj: Any, src: int = 0) -> Any:
     objs = [obj]
     dist.broadcast_object_list(objs, src=src)
     return objs[0]
+
+
+def extract_parallel_sizes(config: Dict[str, Any], world_size: int) -> Tuple[int, int, int]:
+    """Derive tensor / pipeline parallel sizes from DeepSpeed config."""
+    tp_cfg = config.get("tensor_parallel", {}) or {}
+    pp_cfg = config.get("pipeline", {}) or {}
+    tp_size = int(tp_cfg.get("tp_size", 1) or 1)
+    pp_size = int(pp_cfg.get("parallel_size", 1) or 1)
+    total_mp = tp_size * pp_size
+    if world_size and total_mp > world_size:
+        raise ValueError(
+            f"MP (tp={tp_size}, pp={pp_size}) exceeds world_size={world_size}"
+        )
+    if world_size and total_mp > 0 and world_size % total_mp != 0:
+        raise ValueError(
+            f"world_size {world_size} must be divisible by tp*pp={total_mp}"
+        )
+    dp_groups = world_size // total_mp if world_size else 1
+    return tp_size, pp_size, dp_groups
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +142,7 @@ class QwenActorCriticModule(nn.Module):
         self.policy_model = AutoModelForCausalLM.from_pretrained(
             model_path,
             trust_remote_code=True,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         hidden_size = self.policy_model.config.hidden_size
         self.value_head = nn.Linear(hidden_size, 1, dtype=dtype)
@@ -146,6 +165,12 @@ class DeepSpeedQwenActorCritic:
         init_distributed()
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.ds_config = load_deepspeed_config(ds_config)
+        self.tp_size, self.pp_size, self.dp_groups = extract_parallel_sizes(
+            self.ds_config, self.world_size
+        )
+        self.dp_group_size = max(1, self.world_size // max(1, self.tp_size * self.pp_size))
+        self.is_dp_leader = (self.rank % max(1, self.tp_size * self.pp_size)) == 0
 
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -154,7 +179,6 @@ class DeepSpeedQwenActorCritic:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self.ds_config = load_deepspeed_config(ds_config)
         module = QwenActorCriticModule(model_path=model_path, dtype=self.dtype)
         self.engine, _, _, _ = deepspeed.initialize(
             model=module,
@@ -229,15 +253,26 @@ class DeepSpeedQwenActorCritic:
                 output_hidden_states=True,
             )
         hidden = outputs.hidden_states[-1][:, -1, :]
-        value = self.module.value_head(hidden).squeeze(-1).item()
+        value_scalar = self.module.value_head(hidden).squeeze(-1).item()
+
+        # Only data-parallel leader decodes to text; broadcast to keep ranks in sync for TP/PP setups.
+        payload = {
+            "text": response_text if self.is_dp_leader else "",
+            "prompt_ids": inputs["input_ids"].squeeze(0).cpu(),
+            "response_ids": generated.cpu(),
+            "log_prob": total_log_prob,
+            "entropy": avg_entropy,
+            "value": value_scalar,
+        }
+        payload = broadcast_object(payload, src=0)
 
         return LMGenerationResult(
-            response_text,
-            prompt_ids=inputs["input_ids"].squeeze(0).cpu(),
-            response_ids=generated.cpu(),
-            log_prob=total_log_prob,
-            entropy=avg_entropy,
-            value=value,
+            payload["text"],
+            prompt_ids=payload["prompt_ids"],
+            response_ids=payload["response_ids"],
+            log_prob=payload["log_prob"],
+            entropy=payload["entropy"],
+            value=payload["value"],
         )
 
     # ------------------------------------------------------------------
@@ -347,6 +382,10 @@ class DeepSpeedMAPPOTrainer:
         self.ds_config = trainer_cfg.get(
             "deepspeed_config", "configs/deepspeed/mappo_zero3.json"
         )
+        self.collect_only = bool(trainer_cfg.get("collect_only", False))
+        self.train_only = bool(trainer_cfg.get("train_only", False))
+        self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
+        self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", True))
 
         self.gamma = trainer_cfg.get("gamma", 0.99)
         self.gae_lambda = trainer_cfg.get("gae_lambda", 0.95)
@@ -389,7 +428,7 @@ class DeepSpeedMAPPOTrainer:
         variant = convert_yaml_to_variant(full_config)
         variant["yaml_config"] = full_config
         self.session: Optional[CollabMainSession]
-        if self.is_main:
+        if not self.train_only:
             self.session = CollabMainSession(
                 variant=variant,
                 policy_fn=self._policy_call,
@@ -417,6 +456,36 @@ class DeepSpeedMAPPOTrainer:
 
     # ------------------------------------------------------------------
     def train(self):
+        if self.collect_only:
+            self.rollout_dir.mkdir(parents=True, exist_ok=True)
+            for update_idx in range(1, self.total_updates + 1):
+                if self.is_main:
+                    print(f"[Collect] update {update_idx}/{self.total_updates}")
+                self.collect_rollout()
+                self.save_rollout(self.buffer.storage, update_idx)
+                self.buffer.clear()
+            return
+
+        if self.train_only:
+            losses = []
+            for update_idx in range(1, self.total_updates + 1):
+                transitions = self.load_rollouts()
+                if not transitions:
+                    if self.is_main:
+                        print("[TrainOnly] No rollouts found; stopping.")
+                    break
+                loss_dict = self.update_policy(transitions)
+                losses.append(loss_dict)
+                if self.cleanup_rollouts and self.is_main:
+                    self._cleanup_rollout_files()
+                if self.is_main:
+                    print(
+                        f"[TrainOnly] Update {update_idx} "
+                        f"loss={loss_dict['loss']:.4f} policy={loss_dict['policy']:.4f} "
+                        f"value={loss_dict['value']:.4f} entropy={loss_dict['entropy']:.4f}"
+                    )
+            return
+
         for update_idx in range(1, self.total_updates + 1):
             if self.is_main:
                 self.collect_rollout()
@@ -557,6 +626,55 @@ class DeepSpeedMAPPOTrainer:
         }
         meta_path = ckpt_dir / "metadata.json"
         meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    def _transition_to_dict(self, t: TextTransition):
+        def _cpu(x):
+            return x.cpu() if isinstance(x, torch.Tensor) else x
+
+        return {
+            "prompt_ids": _cpu(t.prompt_ids),
+            "response_ids": _cpu(t.response_ids),
+            "log_prob": t.log_prob,
+            "value": t.value,
+            "reward": t.reward,
+            "done": t.done,
+            "agent_index": t.agent_index,
+            "entropy": t.entropy,
+        }
+
+    def _dict_to_transition(self, d: Dict[str, Any]) -> TextTransition:
+        return TextTransition(
+            prompt_ids=d["prompt_ids"],
+            response_ids=d["response_ids"],
+            log_prob=float(d["log_prob"]),
+            value=float(d["value"]),
+            reward=float(d["reward"]),
+            done=float(d["done"]),
+            agent_index=int(d["agent_index"]),
+            entropy=float(d["entropy"]),
+        )
+
+    def save_rollout(self, transitions: List[TextTransition], update_idx: int):
+        if not transitions:
+            return
+        path = self.rollout_dir / f"rollout_rank{self.rank}_u{update_idx:05d}.pt"
+        payload = [self._transition_to_dict(t) for t in transitions]
+        torch.save(payload, path)
+        if self.is_main:
+            print(f"[Collect] Saved {len(payload)} transitions to {path}")
+
+    def load_rollouts(self) -> List[TextTransition]:
+        files = sorted(self.rollout_dir.glob("rollout_rank*_u*.pt"))
+        transitions: List[TextTransition] = []
+        for p in files:
+            data = torch.load(p, map_location="cpu")
+            transitions.extend([self._dict_to_transition(d) for d in data])
+        return transitions
+
+    def _cleanup_rollout_files(self):
+        for p in self.rollout_dir.glob("rollout_rank*_u*.pt"):
+            p.unlink(missing_ok=True)
 
 
 __all__ = ["DeepSpeedMAPPOTrainer"]

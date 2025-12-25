@@ -80,5 +80,11 @@ if __name__ == "__main__":
         required=True,
         help="Path to YAML config.",
     )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=0,
+        help="Process rank for DeepSpeed / torch.distributed launchers.",
+    )
     args = parser.parse_args()
     run(config_path=args.config)
