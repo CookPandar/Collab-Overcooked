@@ -21,6 +21,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     MAPPOTrainer = None  # type: ignore
 
+try:
+    from .training.mappo_deepspeed import DeepSpeedMAPPOTrainer
+except ImportError:  # pragma: no cover - optional dependency
+    DeepSpeedMAPPOTrainer = None  # type: ignore
+
 
 def _maybe_run_trainer(config: Dict[str, Any]) -> bool:
     """Return True if a trainer was executed."""
@@ -29,15 +34,23 @@ def _maybe_run_trainer(config: Dict[str, Any]) -> bool:
         return False
 
     trainer_type = trainer_cfg.get("type", "").lower()
-    if trainer_type != "mappo":
+    trainer_cls = None
+    if trainer_type in {"mappo", "mappo_accelerate"}:
+        trainer_cls = MAPPOTrainer
+    elif trainer_type in {"mappo_deepspeed", "deepspeed_mappo", "ds_mappo"}:
+        trainer_cls = DeepSpeedMAPPOTrainer
+    else:
         raise ValueError(
-            f"Unsupported trainer type '{trainer_type}'. Expected 'mappo'."
+            f"Unsupported trainer type '{trainer_type}'. "
+            "Expected 'mappo' or 'mappo_deepspeed'."
         )
-    if MAPPOTrainer is None:
-        raise ImportError("MAPPOTrainer is unavailable. Ensure dependencies are installed.")
+
+    if trainer_cls is None:
+        missing = "MAPPOTrainer" if trainer_type.startswith("mappo") and "deepspeed" not in trainer_type else "DeepSpeedMAPPOTrainer"
+        raise ImportError(f"{missing} is unavailable. Ensure dependencies are installed.")
 
     env_cfg = config.get("environment", {})
-    trainer = MAPPOTrainer(env_cfg, trainer_cfg, full_config=config)
+    trainer = trainer_cls(env_cfg, trainer_cfg, full_config=config)
     trainer.train()
     return True
 

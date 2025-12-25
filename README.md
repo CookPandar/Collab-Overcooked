@@ -337,14 +337,19 @@ python scripts/train_qwen_sft.py \
 我们提供 `python -m collab_overcooked.main_rl` 作为扩展入口：当配置文件包含 `trainer` 字段时，会自动切换到 MAPPO 训练流程，否则保持原有推理模式。例如：
 
 ```bash
-python -m collab_overcooked.main_rl --config configs/examples/rl_qwen.yaml
+python -m collab_overcooked.main_rl --config configs/examples/rl_qwen_baked_bell_pepper.yaml
 ```
 
 `trainer.model_path` 需要指向本地可用的 Hugging Face 检查点（如 Qwen2.5-7B-Instruct）；脚本会加载该模型作为共享的 actor-critic，对 Collab-Overcooked 奖励进行 RL 微调。
 
 RL 入口默认通过 `training/main_session.py` 复用 `collab_overcooked.main` 的真实 prompt / Think / Recent Goal / Action 流程。所有 planner 请求都会改由本地 HuggingFace 模型（`AutoModelForCausalLM`）生成，并在 PPO 更新时利用完整的 token 级 log-prob 与 value 估计，从而直接微调推理所用的 LLM。可额外指定 `trainer.max_new_tokens`、`trainer.generation_temperature` 等解码参数。
 
-`trainer.output_dir` 用于指定权重与优化器状态的保存位置（默认写入 `results/mappo_<order>/`）；每次训练结束都会把最终 checkpoint 存在 `<output_dir>/final/`，并可通过 `trainer.save_interval`（或 `trainer.checkpoint_interval`）设置按更新步数定期落盘。权重由 `Accelerator.save_state` 生成，可直接用 `accelerate launch ... python -m collab_overcooked.main_rl --config <yaml>` 恢复/继续训练。
+根据 `trainer.type` 可选择不同的实现：
+
+- `mappo`（默认）：依赖 Accelerate/AdamW，在单 GPU 或数据并行模式下训练。
+- `mappo_deepspeed`：启用 DeepSpeed ZeRO +（可选）Tensor Parallel。配置中需提供 `trainer.deepspeed_config`，并使用 `deepspeed --num_gpus N python -m collab_overcooked.main_rl --config <yaml>` 启动。示例参考 `configs/examples/rl_qwen_deepspeed.yaml`。
+
+`trainer.output_dir` 用于指定权重与优化器状态的保存位置（默认写入 `results/mappo_<order>/` 或 `results/dsmappo_<order>/`）；每次训练结束都会把最终 checkpoint 存在 `<output_dir>/final/`，并可通过 `trainer.save_interval`（或 `trainer.checkpoint_interval`）设置按更新步数定期落盘。Accelerate 版本会调用 `Accelerator.save_state` 持久化，DeepSpeed 版本则使用 `engine.save_checkpoint`，可在相同命令下恢复训练。
 
 ### Key Metrics
 
