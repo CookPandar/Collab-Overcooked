@@ -8,9 +8,7 @@ python scripts/summarize_split_metrics.py \
     --log-root assets/data/batch_results/qwen2.5-7B-instruct/json \
     --train-data data/sft/train_level12.jsonl \
     --dev-data data/sft/dev_level12.jsonl \
-    --test-data data/sft/test_level12.jsonl \
-    --per-order-csv assets/data/batch_results/qwen2.5-7B-instruct/per_order_metrics.csv \
-    --split-csv assets/data/batch_results/qwen2.5-7B-instruct/split_metrics.csv
+    --test-data data/sft/test_level12.jsonl
 """
 
 from __future__ import annotations
@@ -29,32 +27,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-root",
         type=Path,
+        required=True,
         help="Directory containing per-order JSON folders (e.g., assets/data/batch_results/<model>/json).",
     )
     parser.add_argument("--train-data", type=Path, help="JSONL file containing SFT training split.")
     parser.add_argument("--dev-data", type=Path, help="JSONL file containing SFT validation split.")
     parser.add_argument("--test-data", type=Path, help="JSONL file containing SFT test split.")
     parser.add_argument(
-        "--per-order-csv",
-        type=Path,
-        help="Optional CSV path for per-order statistics.",
-    )
-    parser.add_argument(
-        "--split-csv",
-        type=Path,
-        help="Optional CSV path for aggregated split statistics.",
-    )
-    parser.add_argument(
         "--plot-per-order-csv",
         nargs="+",
         help="Plot per-order metrics from CSV files (format label=path or plain path).",
     )
-    parser.add_argument(
-        "--plot-output-dir",
-        type=Path,
-        help="Directory to save per-order metric plots when --plot-per-order-csv is used.",
-    )
     return parser.parse_args()
+
+
+def infer_output_paths(log_root: Path) -> Tuple[Path, Path, Path]:
+    base_dir = log_root.resolve().parent
+    per_order_csv = base_dir / "per_order_metrics.csv"
+    split_csv = base_dir / "split_metrics.csv"
+    plot_dir = base_dir / "plots"
+    return per_order_csv, split_csv, plot_dir
 
 
 def default_agent_name(index: int) -> str:
@@ -451,12 +443,12 @@ def parse_plot_sources(entries: List[str]) -> List[Tuple[str, Path]]:
     result: List[Tuple[str, Path]] = []
     for entry in entries:
         if "=" in entry:
-            label, path_str = entry.split("=", 1)
-            label = label.strip() or Path(path_str).stem
+            _, path_str = entry.split("=", 1)
         else:
             path_str = entry
-            label = Path(entry).stem
-        result.append((label, Path(path_str.strip())))
+        csv_path = Path(path_str.strip())
+        label = csv_path.parent.name or csv_path.stem
+        result.append((label, csv_path))
     return result
 
 
@@ -554,9 +546,14 @@ def plot_per_order_metrics(datasets: List[Tuple[str, Dict[str, Dict[str, Optiona
                 )
         plt.xticks(x_idx, order_names, rotation=45, ha="right")
         plt.ylabel(title)
-        plt.title(title)
+        plt.title(title, pad=40)
         plt.grid(True, alpha=0.3)
-        plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
+        plt.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.20),
+            ncol=min(len(datasets), 3),
+            frameon=False,
+        )
         plt.tight_layout()
         plot_path = output_dir / f"{metric_key}.png"
         plt.savefig(plot_path)
@@ -566,10 +563,9 @@ def plot_per_order_metrics(datasets: List[Tuple[str, Dict[str, Dict[str, Optiona
 
 def main() -> None:
     args = parse_args()
+    per_order_csv_path, split_csv_path, plot_output_dir = infer_output_paths(args.log_root)
     ran_plot = False
     if args.plot_per_order_csv:
-        if not args.plot_output_dir:
-            raise ValueError("请通过 --plot-output-dir 指定绘图输出目录。")
         plot_entries = parse_plot_sources(args.plot_per_order_csv)
         datasets = []
         for label, csv_path in plot_entries:
@@ -582,15 +578,10 @@ def main() -> None:
                 continue
             datasets.append((label, data))
         if datasets:
-            plot_per_order_metrics(datasets, args.plot_output_dir)
+            plot_per_order_metrics(datasets, plot_output_dir)
             ran_plot = True
         else:
             print("[plot] No datasets available for plotting.")
-
-    if not args.log_root:
-        if ran_plot:
-            return
-        raise ValueError("--log-root is required unless plotting only CSV inputs.")
 
     order_metrics = aggregate_order_metrics(args.log_root)
     mapping = build_order_split_map(args)
@@ -612,15 +603,15 @@ def main() -> None:
             continue
         row = order_metrics[order_name].agent_metric_row(order_name, split, agent_columns)
         per_order_rows.append(row)
-    if args.per_order_csv:
-        write_csv(per_order_rows, args.per_order_csv)
+    if per_order_rows:
+        write_csv(per_order_rows, per_order_csv_path)
 
     split_rows: List[Dict[str, Optional[float]]] = []
     for split_name in sorted(split_stats.keys()):
         row = split_stats[split_name].to_row(split_name, split_name, agent_columns)
         split_rows.append(row)
-    if args.split_csv:
-        write_csv(split_rows, args.split_csv)
+    if split_rows:
+        write_csv(split_rows, split_csv_path)
 
     if args.plot_per_order_csv and not ran_plot:
         print("[plot] 未能绘制任何图表（数据为空）。")

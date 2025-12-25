@@ -171,48 +171,70 @@ python scripts/run_model_suite.py \
 - 每次调用 `collab_overcooked.main` 都会写入 `results/<run_id>_<order>/experiment_*.json`。`run_id` 可以通过 `--run-id` 或 YAML 中的 `run.run_id` 显式指定；如果缺省，程序会自动生成一个带微秒时间戳与随机后缀的 ID。批量脚本会自动注入唯一 `run_id`，避免并发进程互相覆盖输出。
 - 日志 JSON 顶层新增 `prompt_templates` 字段，内含 Chef/Assistant 的完整 system prompt（含规则与对应食谱）；做 SFT 或重现输入时可直接读取该字段，拼接 observation 即可还原原始提示。
 
-若在无交互机群上运行，可使用一键脚本：
+若在无交互机群上运行，推荐使用下面四个脚本完成“环境准备 + 任务执行”的组合流程：
 
-```bash
-bash scripts/run_cluster_suite.sh \
-  /path/to/qwen2.5-7B-instruct \
-  qwen2.5-7B-instruct \
-  configs/model_configs.json \
-  assets/data/batch_results \
-  8000 \
-  0.9 \
-  --max-workers 8 --repeats 1
-```
+1. **一次性准备 conda 环境（若节点回收会被删，可在作业一开始调用）**
 
-脚本会在本地节点启动 vLLM 服务、等待端口就绪、执行 `run_model_suite.py`，最后自动关闭服务。请确保模型配置中的 `base_url` 指向 `http://127.0.0.1:PORT/v1` 并与脚本端口保持一致。
+    ```bash
+    bash scripts/cluster_env_setup.sh \
+      /mnt/shared/envs/collab_overcooked \
+      /mnt/shared/envs/vllm \
+      3.10
+    ```
 
-如果节点完全裸机（无 conda / vLLM），可以运行：
+    该脚本会检测目标前缀是否已存在 `conda-meta`，若缺失则创建对应的 Python 环境：`collab` 环境安装 `collab_overcooked` 及 SFT/RL 依赖，`vllm` 环境仅安装 vLLM。重复运行将自动复用已存在的路径。
 
-```bash
-bash scripts/install_and_run_suite.sh \
-  /path/to/qwen2.5-7B-instruct \
-  qwen2.5-7B-instruct \
-  configs/model_configs.json \
-  assets/data/batch_results \
-  8000 \
-  0.9 \
-  --max-workers 8 --repeats 1
-```
+2. **运行 SFT 任务（可替换任意 `train_qwen_sft.py` 参 数）**
+
+    ```bash
+    SFT_NUM_PROCS=8 \
+    bash scripts/cluster_run_sft.sh /mnt/shared/envs/collab_overcooked \
+      --config configs/examples/sft_qwen_level12.yaml \
+      --output-dir results/sft_runs
+    ```
+
+    `cluster_run_sft.sh` 会激活 `collab` 环境并通过 `accelerate launch --num_processes ${SFT_NUM_PROCS:-1}` 调用 `scripts/train_qwen_sft.py`，额外的 `accelerate` 参数可以通过 `SFT_ACCELERATE_ARGS` 环境变量传入。
+
+3. **运行 RL 任务**
+
+    ```bash
+    RL_NUM_PROCS=8 \
+    bash scripts/cluster_run_rl.sh /mnt/shared/envs/collab_overcooked \
+      --config configs/examples/rl_qwen_baked_bell_pepper.yaml
+    ```
+
+    逻辑与 SFT 脚本相同，只是入口换成 `python -m collab_overcooked.main_rl`。
+
+4. **批量评测（会先在 vLLM 环境中托管推理服务，再调用 `run_model_suite.py`）**
+
+    ```bash
+    bash scripts/run_cluster_suite.sh \
+      /mnt/shared/envs/vllm \
+      /mnt/shared/envs/collab_overcooked \
+      /path/to/qwen2.5-7B-instruct \
+      qwen2.5-7B-instruct \
+      configs/model_configs.json \
+      assets/data/batch_results \
+      8000 \
+      0.9 \
+      --max-workers 8 --repeats 1
+    ```
+
+    脚本会在本地节点启动 vLLM 服务、等待端口就绪、执行 `run_model_suite.py`，最后自动关闭服务。请确保模型配置中的 `base_url` 指向 `http://127.0.0.1:PORT/v1` 并与脚本端口保持一致。环境准备 + 任务运行均由上述脚本负责，后续切换任务时只需重复执行第 2/3/4 步即可。
 
 ### Utility / Analysis Scripts
 
 | Script | 作用 | 备注 |
 | --- | --- | --- |
-| `scripts/start_vllm.sh` | 启动本地 vLLM OpenAI-API 服务。默认会以 `--gpu-memory-utilization 0.8` 拉起指定模型，你也可以传入 `MODEL PORT HOST GPU_USAGE` 覆盖。批量脚本在裸机环境下会调用它来托管推理服务。 |
-| `scripts/run_evaluation.sh` | 执行旧版三段式评估 (`evaluation.py` → `organize_result.py` → `convert_result.py`) 并把结果放进 `results/`。 |
-| `scripts/run_model_suite.py` | 新版多模型基准驱动，支持并发 worker、重复次数、温度网格等；推荐使用它跑日常评测。 |
-| `scripts/run_cluster_suite.sh` | 一键在有现成 conda/vLLM 环境的节点上启动 `start_vllm.sh` + `run_model_suite.py`。 |
-| `scripts/install_and_run_suite.sh` | 面向完全裸机：先用 conda/venv 装依赖，再调用 `start_vllm.sh` 与 `run_model_suite.py`。 |
-| `scripts/summarize_split_metrics.py` | 汇总 `assets/data/batch_results/<model>/json/` 中的 per-order JSON 日志，输出每个菜品、每个 split 的成功率及 Chef/Assistant 奖励指标。支持 `--per-order-csv` / `--split-csv` 导出 CSV，并可通过 `--plot-per-order-csv label=path ... --plot-output-dir plots/` 对多个模型的 per-order 指标画对比折线图（测试/验证任务自动用淡色虚线标记）。 |
+| `scripts/cluster_env_setup.sh` | 在指定前缀创建/复用两个 conda 环境：`collab`（SFT/RL/批量脚本）与 `vllm`（仅托管推理服务）。 | 第 3 个参数可自定义 Python 版本，脚本会自动 `pip install -e .` 并拉取必要依赖。 |
+| `scripts/cluster_run_sft.sh` | 激活 `collab` 环境，并用 `accelerate launch` 运行 `scripts/train_qwen_sft.py`。 | 通过 `SFT_NUM_PROCS` / `SFT_ACCELERATE_ARGS` 控制 `accelerate` 行为。 |
+| `scripts/cluster_run_rl.sh` | 类似上面，但入口是 `python -m collab_overcooked.main_rl`。 | 支持 `RL_NUM_PROCS` / `RL_ACCELERATE_ARGS`。 |
+| `scripts/run_cluster_suite.sh` | 使用 `vllm` 环境启动 vLLM OpenAI API，再切到 `collab` 环境调用 `scripts/run_model_suite.py`。 | 传入模型路径、端口、`run_model_suite.py` 额外参数即可完成整套批量评测。 |
+| `scripts/run_evaluation.sh` | 执行旧版三段式评估 (`evaluation.py` → `organize_result.py` → `convert_result.py`) 并把结果放进 `results/`。 | 仅在需要兼容早期流程时使用。 |
+| `scripts/run_model_suite.py` | 新版多模型基准驱动，支持并发 worker、重复次数、温度网格等；推荐使用它跑日常评测。 | 既可单独调用，也可由 `run_cluster_suite.sh` 间接触发。 |
+| `scripts/summarize_split_metrics.py` | 汇总 `assets/data/batch_results/<model>/json/` 中的 per-order JSON 日志，输出每个菜品、每个 split 的成功率及 Chef/Assistant 奖励指标。支持 `--per-order-csv` / `--split-csv` 导出 CSV，并可通过 `--plot-per-order-csv label=path ... --plot-output-dir plots/` 对多个模型的 per-order 指标画对比折线图（测试/验证任务自动用淡色虚线标记）。 | 绘图阶段若缺少 matplotlib 会自动跳过。 |
 
-> **提示**：`start_vllm.sh` 只是一个简单的 vLLM 启动器，用于单机器调试或被 `run_cluster_suite.sh` / `install_and_run_suite.sh` 间接调用；如果已经手动拉起了 API 服务，就无需再次运行它。
-
-它会自动创建 Python 虚拟环境、安装 `collab_overcooked` 与 `vllm`，然后复用 `run_cluster_suite.sh` 完成整套流程。
+> **提示**：上述脚本的组合即可覆盖“环境初始化 + SFT + RL + 批量评测”所有常见工作流，通常无需再手动维护临时 vLLM 进程或重复安装依赖。
 
 ### Aggregating Historical Runs
 
@@ -319,6 +341,10 @@ python -m collab_overcooked.main_rl --config configs/examples/rl_qwen.yaml
 ```
 
 `trainer.model_path` 需要指向本地可用的 Hugging Face 检查点（如 Qwen2.5-7B-Instruct）；脚本会加载该模型作为共享的 actor-critic，对 Collab-Overcooked 奖励进行 RL 微调。
+
+RL 入口默认通过 `training/main_session.py` 复用 `collab_overcooked.main` 的真实 prompt / Think / Recent Goal / Action 流程。所有 planner 请求都会改由本地 HuggingFace 模型（`AutoModelForCausalLM`）生成，并在 PPO 更新时利用完整的 token 级 log-prob 与 value 估计，从而直接微调推理所用的 LLM。可额外指定 `trainer.max_new_tokens`、`trainer.generation_temperature` 等解码参数。
+
+`trainer.output_dir` 用于指定权重与优化器状态的保存位置（默认写入 `results/mappo_<order>/`）；每次训练结束都会把最终 checkpoint 存在 `<output_dir>/final/`，并可通过 `trainer.save_interval`（或 `trainer.checkpoint_interval`）设置按更新步数定期落盘。权重由 `Accelerator.save_state` 生成，可直接用 `accelerate launch ... python -m collab_overcooked.main_rl --config <yaml>` 恢复/继续训练。
 
 ### Key Metrics
 

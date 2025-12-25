@@ -209,6 +209,10 @@ class Module:
         """
         Query LLM with simplified model handling
         """
+        if getattr(self, "_rl_block_network", False):
+            raise RuntimeError(
+                "LLM network access is disabled in RL mode - planner queries must be handled by the RL policy."
+            )
         messages = self.query_messages(rethink)
         self.cache_list = self.get_cache()
 

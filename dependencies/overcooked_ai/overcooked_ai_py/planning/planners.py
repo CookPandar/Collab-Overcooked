@@ -859,13 +859,18 @@ class MediumLevelActionManager(object):
     
     def go_to_utensil_actions(self,state:OvercookedState,utensil,player_index):
         player_positions = state.players_pos_and_or
-        obj_locations = self.mdp.utensil_state_dict[utensil]['position']
-        pattern = r'\d+'
-        numbers = re.findall(pattern, utensil)
-        if numbers[0]=='0' or numbers[0] =='1':
-            obj_locations = [obj_locations]
-        else:
-            raise ValueError("Wrong pot number ID")
+        if not utensil:
+            return []
+
+        utensil_state = self.mdp.utensil_state_dict.get(utensil)
+        if not isinstance(utensil_state, dict):
+            return []
+
+        obj_position = utensil_state.get('position')
+        if obj_position is None:
+            return []
+
+        obj_locations = [tuple(obj_position)]
         
         visitable_cur = get_visitable_positions(player_positions[player_index], self.mdp)  
         visitable_oth = get_visitable_positions(player_positions[1 - player_index], self.mdp) 
@@ -1690,4 +1695,3 @@ class MediumLevelPlanner(object):
 #             print(str(env) + "HEURISTIC: {}".format(heuristic_cost))
 
 #         return heuristic_cost
-

@@ -37,7 +37,7 @@ def _maybe_run_trainer(config: Dict[str, Any]) -> bool:
         raise ImportError("MAPPOTrainer is unavailable. Ensure dependencies are installed.")
 
     env_cfg = config.get("environment", {})
-    trainer = MAPPOTrainer(env_cfg, trainer_cfg)
+    trainer = MAPPOTrainer(env_cfg, trainer_cfg, full_config=config)
     trainer.train()
     return True
 

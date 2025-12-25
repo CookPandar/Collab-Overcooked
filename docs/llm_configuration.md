@@ -44,7 +44,7 @@ agents:
 
 **Setup:**
 1. Install vLLM: `pip install vllm`
-2. Start server: `bash scripts/start_vllm.sh`
+2. Start server: `python -m vllm.entrypoints.api_server --model meta-llama/Llama-2-7b-chat-hf --port 8000 --gpu-memory-utilization 0.8`（或在集群上使用 `scripts/run_cluster_suite.sh` 让脚本自动托管服务）
 3. Run: `collab-overcooked --config configs/examples/vllm_config.yaml`
 
 ### 3. Custom API Services (DeepSeek, Claude, etc.)
@@ -191,15 +191,12 @@ agents:
 
 2. **Start vLLM server:**
    ```bash
-   # Using provided script
-   bash scripts/start_vllm.sh meta-llama/Llama-2-7b-chat-hf 8000
-   
-   # Or manually
    python -m vllm.entrypoints.api_server \
      --model meta-llama/Llama-2-7b-chat-hf \
      --port 8000 \
      --gpu-memory-utilization 0.8
    ```
+   在集群或临时节点上，可改用 `scripts/cluster_env_setup.sh` + `scripts/run_cluster_suite.sh` 自动创建 conda 环境并托管 vLLM 服务，然后由脚本内联调用 `scripts/run_model_suite.py`。
 
 3. **Test connection:**
    ```bash
