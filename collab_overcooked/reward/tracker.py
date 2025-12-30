@@ -26,7 +26,7 @@ class ProcessRewardTracker:
         self.sequence_metric = str(self.settings.get("sequence_metric", "tes")).lower()
         self.sequence_weight = float(self.settings.get("sequence_weight", 1.0))
         self.product_reward_value = float(self.settings.get("product_reward", 0.5))
-        self.format_penalty_value = -abs(self.settings.get("format_penalty", 0.2))
+        self.format_penalty_value = -abs(self.settings.get("format_penalty", 1.0))
         self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 0.5))
         self.enable_collab_reward = bool(self.settings.get("collab_reward_enabled", False))
 
@@ -92,6 +92,7 @@ class ProcessRewardTracker:
             seq_reward = self._process_sequence_reward(agent_index, normalized_action)
         penalty_total, penalty_details = self._consume_penalties(agent_index)
         format_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "format")
+        validator_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "validator")
         total = seq_reward + penalty_total
 
         ts = -1 if timestamp is None else int(timestamp)
@@ -105,6 +106,7 @@ class ProcessRewardTracker:
             "sequence_reward": seq_reward,
             "progress_reward": seq_reward,
             "format_reward": format_reward,
+            "validator_reward": validator_reward,
             "penalties": penalty_details,
             "is_collab": is_collab,
             "total": total,

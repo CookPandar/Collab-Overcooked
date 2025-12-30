@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -39,6 +40,9 @@ class TextTransition:
     done: float
     agent_index: int
     entropy: float
+    format_reward: float = 0.0
+    validator_reward: float = 0.0
+    process_reward: float = 0.0
 
 
 class TextRolloutBuffer:
@@ -82,24 +86,35 @@ class QwenLMActorCritic(nn.Module):
         eval_batch_size: int = 4,
         lora_cfg: Optional[Dict[str, Any]] = None,
         lora_path: Optional[str] = None,
+        fix_mistral_regex: Optional[bool] = None,
     ) -> None:
         super().__init__()
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         self.dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True
-        )
+        tokenizer_kwargs: Dict[str, Any] = {
+            "trust_remote_code": True,
+        }
+        # Mistral 系列需要修复分词 regex，否则会错码
+        if fix_mistral_regex is True or (
+            fix_mistral_regex is None and "mistral" in model_path.lower()
+        ):
+            tokenizer_kwargs["fix_mistral_regex"] = True
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
             "dtype": self.dtype,
         }
-        try:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-        except Exception:
-            model_kwargs.pop("attn_implementation", None)
+        # 有 flash-attn2 则启用，否则退回 sdpa，避免缺依赖时报错
+        if torch.cuda.is_available():
+            try:
+                import flash_attn  # type: ignore
+
+                model_kwargs["attn_implementation"] = "flash_attention_2"
+            except Exception:
+                model_kwargs["attn_implementation"] = "sdpa"
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
 
         # LoRA support: either load existing adapters or create new ones.
@@ -181,10 +196,7 @@ class QwenLMActorCritic(nn.Module):
         )
 
         seq = full_seq.unsqueeze(0)
-        outputs = self.model(
-            seq,
-            output_hidden_states=True,
-        )
+        outputs = self.model(seq, use_cache=False, output_hidden_states=True)
         hidden = outputs.hidden_states[-1][:, -1, :]
         value = self.value_head(hidden).squeeze(-1).item()
 
@@ -238,6 +250,7 @@ class QwenLMActorCritic(nn.Module):
         outputs = self.model(
             input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
             output_hidden_states=True,
         )
         logits = outputs.logits
@@ -307,8 +320,6 @@ class MAPPOTrainer:
                 bool(self.trainer_cfg.get("lora_path")) or bool(self.trainer_cfg.get("lora")),
             )
         )
-        if self.latest_model_path_file and self.latest_model_path_file.exists():
-            self._apply_model_override_from_file(self.trainer_cfg)
         self.collect_only = bool(trainer_cfg.get("collect_only", False))
         self.train_only = bool(trainer_cfg.get("train_only", False))
         self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
@@ -320,6 +331,7 @@ class MAPPOTrainer:
         self.local_steps_per_update = max(
             1, math.ceil(self.steps_per_update / self.accelerator.num_processes)
         )
+        self.train_batch_size = int(trainer_cfg.get("train_batch_size", 32))
         self.total_updates = trainer_cfg.get("total_updates", 1000)
         self.clip_coef = trainer_cfg.get("clip_coef", 0.2)
         self.entropy_coef = trainer_cfg.get("entropy_coef", 0.01)
@@ -328,6 +340,9 @@ class MAPPOTrainer:
         self.model_path = trainer_cfg["model_path"]
         self.lora_cfg = trainer_cfg.get("lora", {})
         self.lora_path = trainer_cfg.get("lora_path", None)
+
+        if self.latest_model_path_file and self.latest_model_path_file.exists():
+            self._apply_model_override_from_file(self.trainer_cfg)
 
         self.output_dir = Path(
             trainer_cfg.get(
@@ -354,7 +369,9 @@ class MAPPOTrainer:
             eval_batch_size=trainer_cfg.get("evaluation_batch_size", 4),
             lora_cfg=self.lora_cfg,
             lora_path=self.lora_path,
+            fix_mistral_regex=trainer_cfg.get("fix_mistral_regex", None),
         )
+        self.policy_tokenizer = self.text_policy.tokenizer
         # 仅优化可训练参数（LoRA + value head）
         trainable_params = [p for p in self.text_policy.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(
@@ -412,13 +429,20 @@ class MAPPOTrainer:
         assert self.text_policy is not None
         from ..agents.utils import convert_messages_to_prompt
 
-        prompt = convert_messages_to_prompt(messages)
+        prompt_text = convert_messages_to_prompt(messages)
+        tokenizer = self.policy_tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            chat_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            chat_prompt = prompt_text
         model = self.accelerator.unwrap_model(self.text_policy)
         print(
             "[MAPPOTrainer] policy_call agent="
-            f"{agent_index} prompt_chars={len(prompt)}"
+            f"{agent_index} prompt_chars={len(chat_prompt)}"
         )
-        result = model.act(prompt)
+        result = model.act(chat_prompt)
         print(
             "[MAPPOTrainer] policy_call agent="
             f"{agent_index} generated_tokens={len(result.response_ids)}"
@@ -458,6 +482,7 @@ class MAPPOTrainer:
                     self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
                     break
                 loss_dict = self.update_policy(transitions)
+                self.log_rewards(update_idx, transitions)
                 if self.cleanup_rollouts and self.accelerator.is_main_process:
                     self._cleanup_rollout_files()
                 self.accelerator.print(
@@ -496,6 +521,24 @@ class MAPPOTrainer:
                 reward = getattr(record, "reward", step_result.reward)
                 done = float(getattr(record, "done", step_result.done))
                 meta = record.metadata
+                breakdown = (meta or {}).get("reward_breakdown") or {}
+                raw_entry = breakdown.get("raw") or {}
+                fmt_reward = float(
+                    breakdown.get("format_reward", raw_entry.get("format_reward", 0.0) or 0.0)
+                )
+                validator_reward = float(
+                    breakdown.get("validator_reward", raw_entry.get("validator_reward", 0.0) or 0.0)
+                )
+                seq_reward = float(
+                    breakdown.get("sequence_reward", raw_entry.get("sequence_reward", 0.0) or 0.0)
+                )
+                if "communication_reward" in breakdown:
+                    process_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
+                else:
+                    process_reward = float(
+                        raw_entry.get("total", seq_reward + fmt_reward + validator_reward)
+                        or (seq_reward + fmt_reward + validator_reward)
+                    )
                 self.buffer.add(
                     prompt_ids=meta["prompt_ids"],
                     response_ids=meta["response_ids"],
@@ -505,6 +548,9 @@ class MAPPOTrainer:
                     done=done,
                     agent_index=record.agent_index,
                     entropy=meta.get("entropy", 0.0),
+                    format_reward=fmt_reward,
+                    validator_reward=validator_reward,
+                    process_reward=process_reward,
                 )
                 step_count += 1
             if step_result.done:
@@ -543,59 +589,102 @@ class MAPPOTrainer:
         advantages = advantages.to(self.device)
         returns = returns.to(self.device)
 
-        log_probs, entropies, values = self.text_policy(prompt_tensors, response_tensors)
-        ratios = torch.exp(log_probs - old_log_probs)
-        surr1 = ratios * advantages
-        surr2 = torch.clamp(ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        value_loss = F.mse_loss(values, returns)
-        entropy_loss = -entropies.mean()
-        loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+        batch_size = max(1, self.train_batch_size)
+        num_transitions = len(transitions)
+        num_minibatches = math.ceil(num_transitions / batch_size)
+        total_loss = 0.0
+        total_policy = 0.0
+        total_value = 0.0
+        total_entropy = 0.0
 
         self.optimizer.zero_grad()
-        self.accelerator.backward(loss)
+        for start in range(0, num_transitions, batch_size):
+            end = min(start + batch_size, num_transitions)
+            batch_prompts = prompt_tensors[start:end]
+            batch_responses = response_tensors[start:end]
+            batch_old_log_probs = old_log_probs[start:end]
+            batch_adv = advantages[start:end]
+            batch_returns = returns[start:end]
+
+            log_probs, entropies, values = self.text_policy(batch_prompts, batch_responses)
+            log_probs = log_probs.to(self.device, dtype=torch.float32)
+            entropies = entropies.to(self.device, dtype=torch.float32)
+            values = values.to(self.device, dtype=torch.float32)
+
+            ratios = torch.exp(log_probs - batch_old_log_probs)
+            surr1 = ratios * batch_adv
+            surr2 = torch.clamp(ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef) * batch_adv
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(values, batch_returns)
+            entropy_loss = -entropies.mean()
+            loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+
+            self.accelerator.backward(loss / num_minibatches)
+
+            total_loss += loss.item()
+            total_policy += policy_loss.item()
+            total_value += value_loss.item()
+            total_entropy += entropies.mean().item()
+
         self.accelerator.clip_grad_norm_(self.text_policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
+        avg_loss = total_loss / num_minibatches if num_minibatches > 0 else 0.0
+        avg_policy = total_policy / num_minibatches if num_minibatches > 0 else 0.0
+        avg_value = total_value / num_minibatches if num_minibatches > 0 else 0.0
+        avg_entropy = total_entropy / num_minibatches if num_minibatches > 0 else 0.0
+
         return {
-            "loss": loss.item(),
-            "policy": policy_loss.item(),
-            "value": value_loss.item(),
-            "entropy": entropies.mean().item(),
+            "loss": avg_loss,
+            "policy": avg_policy,
+            "value": avg_value,
+            "entropy": avg_entropy,
         }
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
         if not self.accelerator.is_main_process:
             return
         num = len(transitions)
-        total_reward = float(sum(t.reward for t in transitions)) if num else 0.0
-        avg_reward = total_reward / num if num else 0.0
-        # 按 agent 划分（actor/critic 共享骨干，但这里以 agent_index 区分）
-        reward_by_agent: Dict[int, float] = {0: 0.0, 1: 0.0}
-        count_by_agent: Dict[int, int] = {0: 0, 1: 0}
+        agent_stats: Dict[int, Dict[str, float]] = {}
         for t in transitions:
             idx = int(t.agent_index)
-            if idx not in reward_by_agent:
-                reward_by_agent[idx] = 0.0
-                count_by_agent[idx] = 0
-            reward_by_agent[idx] += float(t.reward)
-            count_by_agent[idx] += 1
-        a0_total = reward_by_agent.get(0, 0.0)
-        a1_total = reward_by_agent.get(1, 0.0)
-        a0_avg = a0_total / count_by_agent.get(0, 1) if count_by_agent.get(0, 0) > 0 else 0.0
-        a1_avg = a1_total / count_by_agent.get(1, 1) if count_by_agent.get(1, 0) > 0 else 0.0
+            stats = agent_stats.setdefault(
+                idx,
+                {"format": 0.0, "validator": 0.0, "process": 0.0},
+            )
+            stats["format"] += float(getattr(t, "format_reward", 0.0))
+            stats["validator"] += float(getattr(t, "validator_reward", 0.0))
+            stats["process"] += float(getattr(t, "process_reward", getattr(t, "reward", 0.0)))
         # 近似步数：以 steps_per_update 为步长
         step_est = (update_idx - 1) * self.steps_per_update + num
         log_path = self.output_dir / "reward_curve.csv"
+        header = (
+            "update_idx,step,num_transitions,"
+            "agent0_format,agent0_validator,agent0_process,"
+            "agent1_format,agent1_validator,agent1_process"
+        )
         if not log_path.exists():
-            log_path.write_text(
-                "update_idx,step,total_reward,avg_reward,num_transitions,agent0_total,agent0_avg,agent1_total,agent1_avg\n",
-                encoding="utf-8",
-            )
+            log_path.write_text(header + "\n", encoding="utf-8")
+        else:
+            try:
+                with log_path.open("r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+            except OSError:
+                first_line = ""
+            if first_line != header:
+                backup_path = log_path.with_suffix(log_path.suffix + ".bak")
+                try:
+                    log_path.replace(backup_path)
+                except OSError:
+                    pass
+                log_path.write_text(header + "\n", encoding="utf-8")
+        a0_stats = agent_stats.get(0, {"format": 0.0, "validator": 0.0, "process": 0.0})
+        a1_stats = agent_stats.get(1, {"format": 0.0, "validator": 0.0, "process": 0.0})
         with log_path.open("a", encoding="utf-8") as f:
             f.write(
-                f"{update_idx},{step_est},{total_reward},{avg_reward},{num},"
-                f"{a0_total},{a0_avg},{a1_total},{a1_avg}\n"
+                f"{update_idx},{step_est},{num},"
+                f"{a0_stats['format']},{a0_stats['validator']},{a0_stats['process']},"
+                f"{a1_stats['format']},{a1_stats['validator']},{a1_stats['process']}\n"
             )
 
     # ------------------------------------------------------------------
@@ -657,12 +746,25 @@ class MAPPOTrainer:
             # 采样端优先用 merge 后的完整模型
             payload["model_path"] = str(merged_dir)
             payload["lora_path"] = None
+            self._cleanup_old_merged_dirs(merged_dir)
         elif not unwrapped.is_lora:
             payload["model_path"] = str(model_dir)
             payload["lora_path"] = None
 
         marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.accelerator.print(f"[Export] latest model info -> {marker_path}")
+
+    # ------------------------------------------------------------------
+    def _cleanup_old_merged_dirs(self, keep_dir: Path):
+        if not self.export_latest_dir:
+            return
+        keep_dir = keep_dir.resolve()
+        for path in self.export_latest_dir.glob("merged_u*"):
+            try:
+                if path.resolve() != keep_dir and path.exists():
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     def _transition_to_dict(self, t: TextTransition):
@@ -678,6 +780,9 @@ class MAPPOTrainer:
             "done": t.done,
             "agent_index": t.agent_index,
             "entropy": t.entropy,
+            "format_reward": t.format_reward,
+            "validator_reward": t.validator_reward,
+            "process_reward": t.process_reward,
         }
 
     def _dict_to_transition(self, d: Dict[str, Any]) -> TextTransition:
@@ -690,6 +795,9 @@ class MAPPOTrainer:
             done=float(d["done"]),
             agent_index=int(d["agent_index"]),
             entropy=float(d["entropy"]),
+            format_reward=float(d.get("format_reward", 0.0)),
+            validator_reward=float(d.get("validator_reward", 0.0)),
+            process_reward=float(d.get("process_reward", d.get("reward", 0.0))),
         )
 
     def save_rollout(self, transitions: List[TextTransition], update_idx: int):

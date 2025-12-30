@@ -60,6 +60,7 @@ if [[ ! -x "$COLLAB_ENV/bin/python" ]]; then
 fi
 
 HOST="127.0.0.1"
+VLLM_API_KEY="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM"
 API_KEY="${VLLM_API_KEY:-token-abc123}"
 VLLM_PY="$VLLM_ENV/bin/python"
 COLLAB_PY="$COLLAB_ENV/bin/python"

@@ -16,7 +16,10 @@ are converted to primitive actions, and process rewards are aggregated.
 from __future__ import annotations
 
 import copy
+import json
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from overcooked_ai_py.agents.agent import AgentGroup
@@ -186,6 +189,20 @@ class RLPlannerProxy:
         self._records.clear()
         return records
 
+    def relabel_last_record(self, call_type: str, extra_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Override the recorded call_type/metadata for the most recent query."""
+        if not self._records:
+            return False
+        record = self._records[-1]
+        context = dict(record.context or {})
+        context["call_type"] = call_type
+        record.context = context
+        if extra_metadata:
+            metadata = dict(record.metadata or {})
+            metadata.update(extra_metadata)
+            record.metadata = metadata
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Main-style RL Session
@@ -219,7 +236,7 @@ class CollabMainSession:
         self.history_window = (
             int(history_window)
             if history_window is not None
-            else int(self.variant.get("history_window", 3) or 0)
+            else int(self.variant.get("history_window", 0) or 0)
         )
 
         layout = self.variant.get("layout", "cramped_room")
@@ -247,6 +264,7 @@ class CollabMainSession:
 
         self.agents = self._build_agents()
         self.team = AgentGroup(*self.agents)
+        self._init_policy_record_logging(len(self.agents))
         self.rl_modules: List[RLPlannerProxy] = []
         for idx, agent in enumerate(self.team.agents):
             if isinstance(agent, LLMAgents):
@@ -299,6 +317,8 @@ class CollabMainSession:
                     record.timestep = state.timestep
             records.extend(agent_records)
         self._assign_call_rewards(records, process_reward, done)
+        self._persist_policy_records(records)
+        self._shrink_policy_records(records)
         print(
             "[CollabMainSession] "
             f"timestep={state.timestep} reward={reward:.3f} done={done} policy_calls={len(records)}"
@@ -342,6 +362,21 @@ class CollabMainSession:
                 f"Expected exactly two agents in config, got {len(agents)}."
             )
         return agents
+
+    def _init_policy_record_logging(self, agent_count: int) -> None:
+        raw_dir = (
+            self.variant.get("record_log_dir")
+            or self.variant.get("log_dir")
+            or self.variant.get("trainer", {}).get("record_log_dir")
+        )
+        base_dir = Path(raw_dir) if raw_dir else Path("runs") / "rl_policy_records"
+        session_dir = base_dir / f"session_{int(time.time())}_{abs(id(self))}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._policy_record_paths: List[Path] = []
+        for idx in range(agent_count):
+            path = session_dir / f"agent_{idx}.jsonl"
+            path.touch(exist_ok=True)
+            self._policy_record_paths.append(path)
 
     def _build_observation(self, state: OvercookedState) -> Dict[str, Any]:
         counters = self.mdp.get_counter_objects_dict(
@@ -387,10 +422,12 @@ class CollabMainSession:
                 if reward_entry:
                     seq_reward = float(reward_entry.get("sequence_reward", 0.0))
                     fmt_reward = float(reward_entry.get("format_reward", 0.0))
+                    validator_reward = float(reward_entry.get("validator_reward", 0.0))
                     record.reward = seq_reward + fmt_reward
                     breakdown = {
                         "sequence_reward": seq_reward,
                         "format_reward": fmt_reward,
+                        "validator_reward": validator_reward,
                         "call_type": reward_entry.get("call_type"),
                         "raw": reward_entry,
                     }
@@ -403,6 +440,70 @@ class CollabMainSession:
                 metadata.setdefault("reward_breakdown", {}).setdefault("communication_reward", 0.0)
             record.metadata = metadata
             record.done = bool(done_flag) if idx == len(records) - 1 else False
+
+    def _metadata_snapshot(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        for key, value in metadata.items():
+            if key in {"prompt_ids", "response_ids"}:
+                length = 0
+                if hasattr(value, "numel"):
+                    try:
+                        length = int(value.numel())
+                    except Exception:
+                        length = 0
+                elif hasattr(value, "__len__"):
+                    try:
+                        length = len(value)  # type: ignore[arg-type]
+                    except Exception:
+                        length = 0
+                snapshot[f"{key}_length"] = length
+                continue
+            if isinstance(value, (int, float, str, bool)):
+                snapshot[key] = value
+            elif isinstance(value, dict):
+                child = {
+                    c_key: c_val
+                    for c_key, c_val in value.items()
+                    if isinstance(c_val, (int, float, str, bool))
+                }
+                if child:
+                    snapshot[key] = child
+        return snapshot
+
+    def _persist_policy_records(self, records: List[PolicyCallRecord]) -> None:
+        if not records or not getattr(self, "_policy_record_paths", None):
+            return
+        for record in records:
+            agent_idx = getattr(record, "agent_index", None)
+            if agent_idx is None:
+                continue
+            try:
+                log_path = self._policy_record_paths[agent_idx]
+            except (IndexError, TypeError):
+                continue
+            payload = {
+                "timestep": record.timestep,
+                "agent_index": agent_idx,
+                "call_type": (record.context or {}).get("call_type"),
+                "reward": record.reward,
+                "done": record.done,
+                "prompt": record.prompt,
+                "response": record.response,
+                "messages": record.messages,
+                "metadata": self._metadata_snapshot(record.metadata),
+            }
+            try:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except OSError:
+                continue
+
+    @staticmethod
+    def _shrink_policy_records(records: List[PolicyCallRecord]) -> None:
+        for record in records:
+            record.messages = []
+            record.prompt = ""
+            record.response = ""
 
     def _format_player(self, player_state) -> Dict[str, Any]:
         held = player_state.held_object

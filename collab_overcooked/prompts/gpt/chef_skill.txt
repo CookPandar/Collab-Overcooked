@@ -41,10 +41,8 @@ def wait(num):
         return
 **'Cooperative action'**:  
 Use `Collab(...)` to express cooperation within a timestep. Collaboration does not consume extra timesteps: once you emit a `Collab`, treat it as if the teammate instantly replied. A `Collab` can only contain **one** primitive type; only `request` may appear multiple times separated by semicolons. Examples:
-- `Collab(request(Chef,pickup(bell_pepper, ingredient_dispenser));request(Chef,place_obj_on_counter()))`
-- `Collab(seek(Chef, "What should I do？"))`
-- `Collab(deny(Chef, "I cannot reach the oven"))`
-- `Collab(ack(Chef))`
+- `Collab(request(Assistant,pickup(bell_pepper, ingredient_dispenser));request(Assistant,place_obj_on_counter()))`
+- `Collab(ack(Assistant))`
 
 Available cooperative primitives:
 ```

@@ -13,7 +13,6 @@ from collections import deque
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1" 
 work_dir = os.getcwd()
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -61,7 +60,7 @@ try:
     from .utils import make_agent, get_example_embedding, combine_statistic_dict
     
     # Define make_agent_from_config for new system
-    def make_agent_from_config(agent_config, mdp, layout, history_window=3, reward_tracker=None):
+    def make_agent_from_config(agent_config, mdp, layout, history_window=0, reward_tracker=None):
         """Create agent from YAML configuration using existing LLMAgents"""
         from .agents.collab import LLMAgents
         from overcooked_ai_py.planning.planners import MediumLevelPlanner
@@ -167,7 +166,7 @@ def convert_yaml_to_variant(config):
             ),
         ),
         'reward': config.get('reward', run_config.get('reward', {})),
-        'history_window': config.get('history_window', run_config.get('history_window', 3)),
+        'history_window': config.get('history_window', run_config.get('history_window', 0)),
         'agent_configs': agents_config,
         'use_new_system': True,
         'run_id': run_config.get('run_id', config.get('run_id')),
@@ -213,7 +212,7 @@ def main(variant=None, config_path=None):
 
     results_root = Path(variant.get('results_root', variant.get('statistics_save_dir', 'results')))
     try:
-        history_window = max(0, int(variant.get('history_window', 3)))
+        history_window = max(0, int(variant.get('history_window', 0)))
     except (TypeError, ValueError):
         history_window = 0
     
@@ -466,7 +465,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--retrival_method', type=str, default="recent_k", choices=['recent_k', 'bert_topk'], help='Use similarity-based(BERT, CLIP) retrieval or retrieve recent K history in dialog.')
     parser.add_argument('--K', type=int, default=0, help="The number of dialogues you want to retrieve.")
-    parser.add_argument('--history_window', type=int, default=3, help='Number of past decision snippets to include (0 disables history)')
+    parser.add_argument('--history_window', type=int, default=0, help='Number of past decision snippets to include (0 disables history)')
 
     # 
     parser.add_argument('--model_dirname', type=str, default='.', help='absolute path of open-source model')      

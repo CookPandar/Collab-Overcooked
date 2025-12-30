@@ -442,8 +442,15 @@ class DeepSpeedMAPPOTrainer:
     def _policy_call(self, agent_index: int, messages, context):
         from ..agents.utils import convert_messages_to_prompt
 
-        prompt = convert_messages_to_prompt(messages)
-        result = self.text_policy.act(prompt)
+        prompt_text = convert_messages_to_prompt(messages)
+        tokenizer = self.text_policy.tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            chat_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            chat_prompt = prompt_text
+        result = self.text_policy.act(chat_prompt)
         metadata = {
             "prompt_ids": result.prompt_ids,
             "response_ids": result.response_ids,

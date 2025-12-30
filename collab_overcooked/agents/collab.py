@@ -1,6 +1,6 @@
 import itertools, os, json, re
 from collections import defaultdict
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Dict, Any
 import numpy as np
 import pkg_resources
 from collections import deque
@@ -81,7 +81,7 @@ class LLMAgents(LLMPair):
         debug_mode="N",
         agent_index=None,
         outdir=None,
-        history_window=3,
+        history_window=0,
         reward_tracker=None,
     ):
         super().__init__(
@@ -133,6 +133,12 @@ class LLMAgents(LLMPair):
         self.pending_llm_logs = []
         self.reward_tracker = reward_tracker
         self._pending_reward_event = None
+        self._last_reward_entry = None
+        self._forced_action_override = None
+        self.communication_turn_limit = 3
+        self._communication_turn_counter = 0
+        self._communication_turn_timestamp = None
+        self._collab_ack_consumed = False
         if history_window is None:
             window_value = 0
         else:
@@ -282,6 +288,7 @@ class LLMAgents(LLMPair):
 
         self.teammate = teammate
         self._pending_reward_event = None
+        self._last_reward_entry = None
 
     def set_agent_index(self, agent_index):
         self.agent_index = agent_index
@@ -613,6 +620,8 @@ class LLMAgents(LLMPair):
         # and we here check this information and store it
         self.current_timestep = state.timestep
         self.planner.current_timestep = state.timestep
+        self._reset_comm_turn_counter()
+        self._collab_ack_consumed = False
         self.teammate.order = state.current_k_order[0]
         self.order = state.current_k_order[0]
         self.change_communication_role("ask", "answer")
@@ -651,6 +660,7 @@ class LLMAgents(LLMPair):
         count = 0
         if self.current_ml_action_steps == 0:
             self.failed_message = self.validate_current_ml_action(state)
+            self._ensure_penalty_reward_entry(self.current_ml_action)
             self._handle_validator_failure(self.failed_message)
             self._flush_reward_event()
             if "success" in self.failed_message and self.test_mode:
@@ -683,6 +693,8 @@ class LLMAgents(LLMPair):
                     self.current_ml_action = self.generate_ml_action(state)
                     count += 1
                 self.failed_message = self.validate_current_ml_action(state)
+                self._ensure_penalty_reward_entry(self.current_ml_action)
+                self._ensure_penalty_reward_entry(self.current_ml_action)
                 self._handle_validator_failure(self.failed_message)
                 self._flush_reward_event()
         # generate rethink if the problem is solved and not just 'wait(1)'
@@ -860,7 +872,11 @@ class LLMAgents(LLMPair):
         normalized = self._strip_action_prefix(action_text)
         if not normalized:
             return False
-        return normalized.lower().startswith("collab(")
+        lowered = normalized.lower()
+        if lowered.startswith("collab("):
+            return True
+        collab_primitives = ("request(", "seek(", "ack(", "deny(")
+        return any(lowered.startswith(prefix) for prefix in collab_primitives)
 
     def _preview_primary_action(self, action_block: Optional[str]) -> str:
         body = self._strip_action_prefix(action_block or "")
@@ -870,6 +886,22 @@ class LLMAgents(LLMPair):
             if not self._is_collab_action(token):
                 return token
         return tokens[0] if tokens else ""
+
+    def _strip_code_fences(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+        content = stripped[3:]
+        if "\n" in content:
+            _, remainder = content.split("\n", 1)
+        else:
+            remainder = ""
+        closing = remainder.rfind("```")
+        if closing != -1:
+            remainder = remainder[:closing]
+        return remainder.strip()
 
     def _set_planner_call_context(self, call_type: str, **metadata):
         if not hasattr(self, "planner") or self.planner is None:
@@ -882,9 +914,11 @@ class LLMAgents(LLMPair):
     def _queue_reward_event(self, action_text: Optional[str], call_index: Optional[int], call_type: str):
         if not self.reward_tracker or self.agent_index is None:
             self._pending_reward_event = None
+            self._last_reward_entry = None
             return
         timestamp = getattr(self, "current_timestep", None)
         normalized = (action_text or "").strip()
+        self._last_reward_entry = None
         self._pending_reward_event = {
             "action": normalized,
             "call_index": call_index,
@@ -892,12 +926,87 @@ class LLMAgents(LLMPair):
             "timestamp": timestamp,
         }
 
+    def _apply_penalty_to_last_entry(self, penalty_type: str, detail: str) -> bool:
+        if not self.reward_tracker or self.agent_index is None:
+            return False
+        entry = getattr(self, "_last_reward_entry", None)
+        if not entry:
+            return False
+        if penalty_type == "format":
+            value = self.reward_tracker.format_penalty_value
+            reward_key = "format_reward"
+        elif penalty_type == "validator":
+            value = self.reward_tracker.validator_penalty_value
+            reward_key = "validator_reward"
+        else:
+            return False
+        penalties = entry.get("penalties")
+        if penalties is None:
+            penalties = []
+            entry["penalties"] = penalties
+        penalties.append({"type": penalty_type, "detail": detail, "value": value})
+        entry[reward_key] = entry.get(reward_key, 0.0) + value
+        entry["total"] = entry.get("total", 0.0) + value
+        return True
+
+    def _ensure_penalty_reward_entry(self, action_text: Optional[str], call_type: str = "planner_main"):
+        if self._pending_reward_event is not None or self._last_reward_entry is not None:
+            return
+        if not self.reward_tracker or self.agent_index is None:
+            return
+        if not self.pending_llm_logs:
+            return
+        entry = self.pending_llm_logs[-1]
+        call_index = entry.get("call_index")
+        if call_index is None:
+            return
+        call_type_entry = entry.get("call_type") or call_type
+        normalized = self._strip_action_prefix(action_text or "").strip()
+        if not normalized:
+            normalized = "[EMPTY]"
+        self._queue_reward_event(normalized, call_index, call_type_entry)
+
+    def _register_penalty(self, penalty_type: str, detail: str):
+        if not self.reward_tracker or self.agent_index is None:
+            return
+        if self._pending_reward_event is None:
+            if self._apply_penalty_to_last_entry(penalty_type, detail):
+                return
+        if penalty_type == "format":
+            self.reward_tracker.register_format_error(self.agent_index, detail)
+        else:
+            self.reward_tracker.register_validator_error(self.agent_index, detail)
+
+    def _record_communication_penalty(
+        self, action_block: Optional[str], detail: str, penalty_type: str = "validator"
+    ):
+        if not self.reward_tracker or self.agent_index is None:
+            return
+        if not self.pending_llm_logs:
+            return
+        call_index = self.pending_llm_logs[-1].get("call_index")
+        if call_index is None:
+            return
+        normalized = self._strip_action_prefix(action_block or "").strip()
+        if not normalized:
+            normalized = "[EMPTY]"
+        print(f"[Validator] {self.name} {detail}.")
+        self._queue_reward_event(normalized, call_index, "communication")
+        self._register_penalty(penalty_type, detail)
+        self._annotate_last_log_metadata(
+            has_failure_context=True, validator_feedbacks=[detail]
+        )
+        self._flush_reward_event()
+
     def _flush_reward_event(self):
-        if not self._pending_reward_event or not self.reward_tracker or self.agent_index is None:
+        if not self._pending_reward_event:
+            return
+        if not self.reward_tracker or self.agent_index is None:
             self._pending_reward_event = None
+            self._last_reward_entry = None
             return
         event = self._pending_reward_event
-        self.reward_tracker.register_llm_action(
+        entry = self.reward_tracker.register_llm_action(
             agent_index=self.agent_index,
             timestamp=event.get("timestamp", self.current_timestep),
             action_text=event.get("action"),
@@ -905,7 +1014,61 @@ class LLMAgents(LLMPair):
             call_index=event.get("call_index"),
             call_type=event.get("call_type"),
         )
+        self._last_reward_entry = entry
         self._pending_reward_event = None
+
+    def _relabel_last_llm_call(self, call_type: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
+        if not self.pending_llm_logs:
+            return None
+        entry = self.pending_llm_logs[-1]
+        entry["call_type"] = call_type
+        merged_meta = entry.get("metadata") or {}
+        if metadata:
+            merged_meta.update(metadata)
+            entry["metadata"] = merged_meta
+        elif merged_meta:
+            entry["metadata"] = merged_meta
+        if hasattr(self.planner, "relabel_last_record"):
+            try:
+                self.planner.relabel_last_record(call_type, metadata or None)
+            except Exception:
+                pass
+        return entry.get("call_index")
+
+    def _mark_last_call_as_action(self, forced_action: str, reason: str) -> Optional[int]:
+        """Reclassify the latest LLM call as an action-producing query."""
+        metadata = {
+            "forced_action": forced_action,
+            "forced_action_reason": reason,
+        }
+        call_index = self._relabel_last_llm_call("planner_main", metadata)
+        if self.reward_tracker and self.agent_index is not None:
+            self.reward_tracker.register_format_error(self.agent_index, reason)
+        return call_index
+
+    def _reset_comm_turn_counter(self):
+        if self._communication_turn_timestamp != self.current_timestep:
+            self._communication_turn_counter = 0
+            self._communication_turn_timestamp = self.current_timestep
+
+    def _register_comm_turn(self) -> int:
+        self._reset_comm_turn_counter()
+        self._communication_turn_counter += 1
+        return self._communication_turn_counter
+
+    def _set_action_override_from_plan(self, plan_tokens: List[str]):
+        primary = ""
+        for token in plan_tokens:
+            if token and not self._is_collab_action(token):
+                primary = token
+                break
+        if not primary:
+            return
+        call_index = len(self.pending_llm_logs) - 1
+        if call_index < 0:
+            return
+        self._relabel_last_llm_call("planner_main")
+        self._forced_action_override = {"call_index": call_index, "action": primary}
 
     def _gather_pending_actions(self, primary_action: Optional[str], queued_actions):
         pending = []
@@ -955,10 +1118,16 @@ class LLMAgents(LLMPair):
             teammate = getattr(self, "teammate", None)
             if speaker == self.name:
                 self.pending_collab_reply = False
+                if "collab(" in lower_text:
+                    self._collab_ack_consumed = True
                 if teammate is not None:
-                    teammate.pending_collab_reply = self._collab_requires_reply(lower_text)
+                    needs_reply = self._collab_requires_reply(lower_text)
+                    teammate.pending_collab_reply = (
+                        needs_reply and not getattr(teammate, "_collab_ack_consumed", False)
+                    )
             elif teammate is not None and speaker == teammate.name:
-                self.pending_collab_reply = self._collab_requires_reply(lower_text)
+                needs_reply = self._collab_requires_reply(lower_text)
+                self.pending_collab_reply = needs_reply and not self._collab_ack_consumed
                 teammate.pending_collab_reply = False
         if propagate and getattr(self, "teammate", None) is not None:
             teammate_history = getattr(self.teammate, "conversation_history", None)
@@ -1033,8 +1202,11 @@ class LLMAgents(LLMPair):
         self._annotate_last_log_metadata(
             has_failure_context=True, validator_feedbacks=[normalized]
         )
-        if self.reward_tracker and self.agent_index is not None:
-            self.reward_tracker.register_validator_error(self.agent_index, normalized)
+        self._register_penalty("validator", normalized)
+
+    def _report_action_format_error(self, detail: str, action_text: Optional[str] = None, call_type: str = "planner_main"):
+        self._ensure_penalty_reward_entry(action_text, call_type)
+        self._register_penalty("format", detail)
     
     def _format_food_description(self, food_state):
         if isinstance(food_state, str):
@@ -1157,77 +1329,97 @@ class LLMAgents(LLMPair):
         # parse function like return false,meaning the return action list is invalid.
         if self.parse_action == "":
             print(action_string)
-            print(
-                "Please check the Action field; it does not follow the required function-call format."
-            )
+            detail = "Please ensure the Action field lists semicolon-separated function calls without extra narration."
+            print(detail)
+            self._report_action_format_error(detail, action_string)
             return (
                 False,
-                f"Please ensure the Action field lists semicolon-separated function calls without extra narration.",
+                detail,
             )
         if "place_obj_on_counter()" in action_string:
             ml_action = f"place_obj_on_counter()"
         elif "pickup(" in action_string:
             if len(params) != 2:
+                detail = "Wrong pickup() params. It should have 2 params: obj and distination."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params. It should have 2 params: obj and distination.",
+                    detail,
                 )
             # check pickup from dispenser, and pickup from utensil, pick up from counter
             # check whether the item is in the recipe list
             if params[0] not in self.mdp.all_ingredients + ["dish"]:
+                detail = f"Wrong pickup() params {params[0]}. It does not belong to any recipe ingredients or dish."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params {params[0]}. It does not belong to any recipe ingredients or dish.",
+                    detail,
                 )
             if (
                 (params[1] not in self.mdp.utensil_list)
                 and ("counter" not in params[1])
                 and ("dispenser" not in params[1])
             ):
+                detail = f"Wrong pickup() params {params[1]}. It does not belong to any utensils, dispenser or counter."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params {params[1]}. It does not belong to any utensils, dispenser or counter.",
+                    detail,
                 )
             if ("dispenser" in params[1]) and (
                 params[0] not in self.mdp.default_ingredients + ["dish"]
             ):
+                detail = f"Wrong pickup() params {params[0]},{params[1]}. You can only get raw ingredients and dish from dispenser."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params {params[0]},{params[1]}. You can only get raw ingredients and dish from dispenser.",
+                    detail,
                 )
             # in case of pickup(dish,ingredient_dispenser) , pickup(ingredient,dish_dispenser)
             if ("dish" in params[0]) and ("ingredient_dispenser" in params[1]):
+                detail = f"Wrong pickup() params {params[0]},{params[1]}. You can only get dish from dish_dispenser."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params {params[0]},{params[1]}. You can only get dish from dish_dispenser.",
+                    detail,
                 )
             if "dish" not in params[0] and "dish_dispenser" in params[1]:
+                detail = f"Wrong pickup() params {params[0]},{params[1]}. You can only get ingredient from ingredient_dispenser."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong pickup() params {params[0]},{params[1]}. You can only get ingredient from ingredient_dispenser.",
+                    detail,
                 )
             ml_action = f"pickup({params[0]},{params[1]})"
         elif "put_obj_in_utensil(" in action_string:
             if len(params) != 1:
+                detail = "Wrong put_obj_in_utensil() params. It should have 1 params: utensil."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong put_obj_in_utensil() params. It should have 1 params: utensil.",
+                    detail,
                 )
             # check if LLM generate put_obj_in_utensil(obj,utensil),then only use the utensil params
             if params[0] in self.mdp.utensil_list:
                 ml_action = f"put_obj_in_utensil({params[0]})"
             else:
-                return False, f"Wrong put_obj_in_utensil() parmas:{params[0]}"
+                detail = f"Wrong put_obj_in_utensil() parmas:{params[0]}"
+                self._report_action_format_error(detail, action_string)
+                return False, detail
         elif "fill_dish_with_food(" in action_string:
             if len(params) != 1:
+                detail = "Wrong fill_dish_with_food() params. It should have 1 params: utensil."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    f"Wrong fill_dish_with_food() params. It should have 1 params: utensil.",
+                    detail,
                 )
             if params[0] in self.mdp.utensil_list:
                 ml_action = f"fill_dish_with_food({params[0]})"
             else:
-                return False, f"Wrong fill_dish_with_food() parmas:{params[0]}"
+                detail = f"Wrong fill_dish_with_food() parmas:{params[0]}"
+                self._report_action_format_error(detail, action_string)
+                return False, detail
         elif "deliver_soup()" in action_string:
             ml_action = "deliver_soup()"
         elif "check_recipe()" in action_string:
@@ -1235,31 +1427,37 @@ class LLMAgents(LLMPair):
         # 	check all the action need to interact with utensils
         elif any(item in action_string for item in self.mdp.interact_actions.keys()):
             if len(params) != 1:
+                detail = "Please ensure the Action field is a semicolon-separated list of function calls without narration."
+                self._report_action_format_error(detail, action_string)
                 return (
                     False,
-                    "Please ensure the Action field is a semicolon-separated list of function calls without narration.",
+                    detail,
                 )
             for interact_action, utensils in self.mdp.interact_actions.items():
                 if interact_action in action_string:
                     if params[0] in utensils:
                         ml_action = f"{interact_action}({params[0]})"
                     else:
-                        return False, f"Wrong {interact_action}() parmas:{params[0]}"
+                        detail = f"Wrong {interact_action}() parmas:{params[0]}"
+                        self._report_action_format_error(detail, action_string)
+                        return False, detail
         elif "wait" in action_string:
             time_to_wait = self.parse_wait_string(action_string)
             if time_to_wait > 5:
-                return False, f"Too long wait time. It should be less than 5."
+                detail = "Too long wait time. It should be less than 5."
+                self._report_action_format_error(detail, action_string)
+                return False, detail
             else:
                 self.time_to_wait = time_to_wait
                 ml_action = action_string
         else:
             print(action_string)
-            print(
-                "Please check the Action field; it does not follow the required function-call format."
-            )
+            detail = "Please ensure the Action field is a semicolon-separated list of function calls without narration."
+            print(detail)
+            self._report_action_format_error(detail, action_string)
             return (
                 False,
-                "Please ensure the Action field is a semicolon-separated list of function calls without narration.",
+                detail,
             )
 
         return True, ml_action
@@ -1325,7 +1523,7 @@ class LLMAgents(LLMPair):
             + "\n\nReturn a corrected response that includes a Collab(...) action."
         )
         self.planner.current_user_message = {"role": "user", "content": correction_prompt}
-        self._set_planner_call_context("collab_reply")
+        self._set_planner_call_context("format_correct", role="collab_reply")
         response, correction_tokens = self.planner.query(
             proxy=self.proxy, stop="Scene", trace=True
         )
@@ -1414,6 +1612,7 @@ class LLMAgents(LLMPair):
     def communication(self, message, state):
         # [observation,Analysis \n Player 0:talk]
         self.end_talk = False
+        self._forced_action_override = None
         you_response = message
         team_response = ""
         communication_turn = 0
@@ -1427,8 +1626,21 @@ class LLMAgents(LLMPair):
                 print(
                     f"[Warning] Communication exceeded {max_communication_turns} exchanges. Forcing termination."
                 )
+                forced_action = "wait(1)"
+                forced_index = self._mark_last_call_as_action(
+                    forced_action, "communication_turn_limit"
+                )
+                if self.reward_tracker and self.agent_index is not None:
+                    self.reward_tracker.register_format_error(
+                        self.agent_index, "communication_turn_limit"
+                    )
+                if forced_index is not None:
+                    self._forced_action_override = {
+                        "call_index": forced_index,
+                        "action": forced_action,
+                    }
                 self.end_talk = True
-                you_response = "Action: wait(1)"
+                you_response = f"Action: {forced_action}"
                 break
             print(f"Input for {self.teammate.name}" + ":\n")
             format_you_response = self.teammate.message_formate_control(
@@ -1576,9 +1788,12 @@ class LLMAgents(LLMPair):
             proxy=self.proxy, stop="Scene", trace=True
         )
         extra_tokens = 0
+        collab_violation_response = None
+        collab_violation_logged = False
         if role == "team" and self.pending_collab_reply:
             preview_talk, _ = self.parse_response(response, "talk")
             if "collab(" not in (preview_talk or "").lower():
+                collab_violation_response = response
                 response, correction_tokens = self.enforce_collab_reply(response)
                 extra_tokens += correction_tokens
         self._log_llm_call(
@@ -1588,6 +1803,12 @@ class LLMAgents(LLMPair):
             tokens_num + extra_tokens,
             {"role": role},
         )
+        if collab_violation_response is not None:
+            violation_action = self.parse_response(collab_violation_response, "action")
+            self._record_communication_penalty(
+                violation_action, "missing_initial_collab_reply"
+            )
+            collab_violation_logged = True
         format_issues: List[str] = []
         think_text = self.parse_response(response, "think")
         if think_text == "":
@@ -1609,13 +1830,22 @@ class LLMAgents(LLMPair):
             format_issues.append("missing_recent_goal")
         self.update_recent_goal_text(recent_goal_text)
         recent_goal_entry = recent_goal_text or self.current_recent_goal_text
-        if (
+        collab_reply_missing = (
             role == "team"
             and self.pending_collab_reply
             and "collab(" not in (parse_talk or "").lower()
-        ):
+        )
+        if collab_reply_missing:
+            if not collab_violation_logged:
+                self._record_communication_penalty(
+                    action_text, "missing_initial_collab_reply"
+                )
+                collab_violation_logged = True
             parse_talk = f"Collab(ack({self.teammate.name}))"
             end_talk = False
+        if role == "team" and "collab(" in (parse_talk or "").lower():
+            self._collab_ack_consumed = True
+            self.pending_collab_reply = False
         self.planner.dialog_history_list.append({"role": "think", "content": think_text})
         total_tokens = tokens_num + extra_tokens
         self._handle_format_issues(format_issues)
@@ -1676,6 +1906,8 @@ class LLMAgents(LLMPair):
             return end_talk, response
 
         new_plan = self.parse_ml_action_top(new_plan, False)
+        if new_plan:
+            self._set_action_override_from_plan(new_plan)
         # When correct, new action should also replace the old action list.
         if not self.trace:
             while not self.action_wait_parse.empty():
@@ -1712,7 +1944,7 @@ class LLMAgents(LLMPair):
     # mode:think,<TALK>
     def parse_response(self, response, mode, need_correct=False):
         role = "Chef" if self.agent_index == 0 else "Assistant"
-        text = response or ""
+        text = self._strip_code_fences(response or "")
 
         section_pattern = re.compile(
             r"^\s*(Think|Recent Goal|Action)\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
@@ -1751,8 +1983,7 @@ class LLMAgents(LLMPair):
             if action_block:
                 stripped = self._strip_action_prefix(action_block)
                 stripped = self._sanitize_action_text(stripped)
-                lowered = stripped.lower()
-                if lowered.startswith("collab("):
+                if self._is_collab_action(stripped):
                     return stripped, False
                 if "[NOTHING]" in stripped.upper():
                     return "[NOTHING]", True
@@ -2033,21 +2264,41 @@ class LLMAgents(LLMPair):
             elif ("[NOTHING]" not in communicate_response) and (
                 "[EMPTY]" not in communicate_response
             ):
-                self.planner.add_msg_to_dialog_history(
-                    {"role": "talk", "content": communicate_response}
-                )
-                self.append_conversation_line(self.name, communicate_response)
-                # statistic
-                self.turn_statistics_dict["statistical_data"]["communication"][
-                    self.agent_index
-                ]["turn"].append(communicate_response)
-                self.turn_statistics_dict["statistical_data"]["communication"][
-                    self.agent_index
-                ]["token"].append(tokens_num)
-                self.turn_statistics_dict["statistical_data"]["communication"][
-                    self.agent_index
-                ]["call"] += 1
-                response = self.communication(communicate_response, state)
+                turn_count = self._register_comm_turn()
+                if turn_count >= self.communication_turn_limit:
+                    forced_action = "wait(1)"
+                    forced_idx = self._mark_last_call_as_action(
+                        forced_action, "communication_turn_limit"
+                    )
+                    if self.reward_tracker and self.agent_index is not None:
+                        self.reward_tracker.register_format_error(
+                            self.agent_index, "communication_turn_limit"
+                        )
+                    if forced_idx is not None:
+                        self._forced_action_override = {
+                            "call_index": forced_idx,
+                            "action": forced_action,
+                        }
+                        planner_call_index = forced_idx
+                    ml_action = forced_action
+                else:
+                    self._relabel_last_llm_call("communication")
+                    planner_call_index = None
+                    self.planner.add_msg_to_dialog_history(
+                        {"role": "talk", "content": communicate_response}
+                    )
+                    self.append_conversation_line(self.name, communicate_response)
+                    # statistic
+                    self.turn_statistics_dict["statistical_data"]["communication"][
+                        self.agent_index
+                    ]["turn"].append(communicate_response)
+                    self.turn_statistics_dict["statistical_data"]["communication"][
+                        self.agent_index
+                    ]["token"].append(tokens_num)
+                    self.turn_statistics_dict["statistical_data"]["communication"][
+                        self.agent_index
+                    ]["call"] += 1
+                    response = self.communication(communicate_response, state)
             elif ("[NOTHING]" not in action_text_block) and (action_text_block != ""):
                 ml_action = self.parse_ml_action_top(action_text_block, True)
             else:
@@ -2088,15 +2339,24 @@ class LLMAgents(LLMPair):
                 cleaned_failure = ""
         else:
             cleaned_failure = ""
-
         self.record_history_entry(
                 think_output, self.current_recent_goal_text, ml_action, cleaned_failure
         )
-        if planner_call_index is not None:
-            reward_action = ml_action or self._preview_primary_action(action_text_block)
+        override = getattr(self, "_forced_action_override", None)
+        reward_call_index = planner_call_index
+        reward_action = ml_action or self._preview_primary_action(action_text_block)
+        if override and isinstance(override, dict):
+            forced_idx = override.get("call_index")
+            if forced_idx is not None:
+                reward_call_index = forced_idx
+            forced_action = override.get("action")
+            if not reward_action and forced_action:
+                reward_action = forced_action
+        if reward_call_index is not None:
             if not reward_action:
                 reward_action = "[EMPTY]"
-            self._queue_reward_event(reward_action, planner_call_index, "planner_main")
+            self._queue_reward_event(reward_action, reward_call_index, "planner_main")
+        self._forced_action_override = None
         return ml_action
 
     # parse ml_action from  response and self correct

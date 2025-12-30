@@ -197,6 +197,39 @@ python scripts/run_model_suite.py \
 
 3. **运行 RL 任务**
 
+## 🧮 Reward Design
+
+Collab-Overcooked 的全过程奖励由 `ProcessRewardTracker` 统一管理，主要由以下几部分构成：
+
+- **序列奖励（Sequence Reward）**：记录每次 LLM 生成的物理动作序列，并与参考示例（TES 或 LCS，可在 YAML 中配置）比较；只有当新动作提高了历史最佳相似度时才累计奖励。权重默认 `sequence_weight = 1.0`。
+- **中间产物奖励（Product Reward）**：当环境内首次出现新的菜品中间状态（例如食材成功放入烹饪器具或烘烤完成）时，按 `product_reward = 0.5` 加分，并由两名智能体平分。
+- **协作奖励（可选）**：若在配置中开启 `reward.collab_reward_enabled = true`，合法的 `Collab(...)` 交流也会被纳入序列奖励，用于鼓励高质量沟通。
+
+惩罚项同样由 tracker 触发并写入每次 LLM 调用的奖励记录：
+
+- **格式惩罚（Format Penalty, 默认 `-1.0`）**：当 `Think/Recent Goal/Action` 缺失、Action 字段不是函数形式、或通信阶段没有在首次回复中使用 `Collab(...)` 时触发。即便动作来自队列或被系统强制覆盖，也会将惩罚绑定到同一条 planner/communication 调用。
+- **校验惩罚（Validator Penalty, 默认 `-0.5`）**：`validate_current_ml_action` 检查失败（例如尝试从错误位置 `pickup`、多次沟通超限后被强制 `wait(1)` 等）时会记入该罚分，同时在 `policy_records` 中附带 `validator_feedbacks` 以便事后分析。
+
+奖励的记录方式如下：
+
+1. 每一次 LLM 调用（planner 主调用、format 修正、沟通往返等）都会通过 `register_llm_action` 写入一条事件，包含 `call_type`、动作文本、`sequence_reward`、`format_reward`、`validator_reward` 等信息。
+2. 环境每执行一个 timestep，`ProcessRewardTracker.after_step` 会汇总该时间步的所有调用，叠加中间产物奖励后生成 `process_reward`，Trainer 则将其分配给相应的 `PolicyCallRecord`（见 `runs/rl_policy_records/session_*/agent_*.jsonl`）。
+3. 惩罚不会直接抵消序列奖励之外的部分，换言之 `total = sequence_reward + penalty_total`，方便区分“做得对”与“做错了”这两类信号。
+
+想自定义奖励可在 YAML 中的 `reward` 节点覆写以下字段：
+
+```yaml
+reward:
+  sequence_metric: "tes"       # 或 "lcs"
+  sequence_weight: 1.0
+  product_reward: 0.5
+  format_penalty: 1.0
+  validator_penalty: 0.5
+  collab_reward_enabled: false
+```
+
+这样既能保持与当前默认设置一致，也可以针对自研模型做更细粒度的训练和评估。
+
     ```bash
     RL_NUM_PROCS=8 \
     bash scripts/cluster_run_rl.sh /mnt/shared/envs/collab_overcooked \

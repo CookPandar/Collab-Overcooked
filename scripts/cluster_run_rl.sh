@@ -27,7 +27,7 @@ if [[ ! -x "$COLLAB_ENV/bin/python" ]]; then
     exit 1
 fi
 
-ACCELERATE_BIN=/mnt/volumes/ss-sai-bd-ga/zhangshuwen/collab-overcooked/bin/accelerate
+ACCELERATE_BIN=~/collab-overcooked/bin/accelerate
 NUM_PROCS="${RL_NUM_PROCS:-1}"
 ACCEL_BIN="${ACCELERATE_BIN:-accelerate}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"

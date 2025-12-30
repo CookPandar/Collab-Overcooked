@@ -182,6 +182,7 @@ wandb/
 experiments/ 
 history/
 results/
+runs/
 
 # Data files (large datasets)
 data/large_datasets/
