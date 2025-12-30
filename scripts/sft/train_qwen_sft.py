@@ -12,7 +12,11 @@ Example:
         --gradient-accumulation-steps 16 \
         --learning-rate 5e-5 \
         --max-length 2048 \
-        --use-lora
+        --use-lora \
+        --agents Chef Assistant
+
+The script will train one LoRA head per agent and store results under
+`<output-dir>/<timestamp>/<AgentName>/`.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import datasets
 import inspect
@@ -99,6 +103,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save per-step loss curves + CSV to <output-dir>/training_metrics.{png,csv}.",
     )
+    parser.add_argument(
+        "--agents",
+        nargs="*",
+        default=["Chef", "Assistant"],
+        choices=["Chef", "Assistant"],
+        help="Agent roles to train (each receives its own LoRA head).",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +160,25 @@ def maybe_split_dataset(ds: datasets.Dataset, ratio: float, seed: int) -> Dict[s
         return {"train": ds}
     split = ds.train_test_split(test_size=ratio, seed=seed)
     return {"train": split["train"], "eval": split["test"]}
+
+
+def extract_agent_from_meta(meta) -> Optional[str]:
+    if isinstance(meta, dict):
+        return meta.get("agent")
+    if isinstance(meta, str):
+        try:
+            parsed = json.loads(meta)
+        except Exception:
+            return None
+        if isinstance(parsed, dict):
+            return parsed.get("agent")
+    return None
+
+
+def filter_dataset_by_agent(ds: Optional[datasets.Dataset], agent: str) -> Optional[datasets.Dataset]:
+    if ds is None:
+        return None
+    return ds.filter(lambda example: extract_agent_from_meta(example.get("meta")) == agent)
 
 
 def _should_enable_device_map_auto() -> bool:
@@ -275,6 +305,14 @@ def save_metric_plots(log_history: List[Dict], run_dir: Path) -> None:
 def main() -> None:
     args = parse_args()
     dataset_dict = load_datasets(args)
+    if "train" not in dataset_dict:
+        raise ValueError("Training dataset is required.")
+    if "eval" not in dataset_dict:
+        split = maybe_split_dataset(dataset_dict["train"], args.eval_ratio, args.seed)
+        dataset_dict["train"] = split["train"]
+        if "eval" in split:
+            dataset_dict["eval"] = split["eval"]
+
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = Path(args.output_dir) / run_stamp
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -287,26 +325,15 @@ def main() -> None:
     def preprocess(batch: Dict) -> Dict:
         return format_example(batch, tokenizer, args.max_length)
 
-    if "eval" not in dataset_dict:
-        dataset_dict = maybe_split_dataset(dataset_dict["train"], args.eval_ratio, args.seed)
-    train_dataset = dataset_dict["train"].map(
-        preprocess,
-        remove_columns=dataset_dict["train"].column_names,
-        desc="Tokenizing train set",
-    )
-    eval_dataset = None
-    if "eval" in dataset_dict and dataset_dict["eval"] is not None:
-        eval_dataset = dataset_dict["eval"].map(
-            preprocess,
-            remove_columns=dataset_dict["eval"].column_names,
-            desc="Tokenizing eval set",
-        )
+    base_train_dataset = dataset_dict["train"]
+    base_eval_dataset = dataset_dict.get("eval")
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    model = build_model(args)
+    target_agents = args.agents or []
+    if not target_agents:
+        target_agents = ["Chef", "Assistant"]
 
-    training_kwargs = dict(
-        output_dir=str(run_dir),
+    base_training_kwargs = dict(
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -323,34 +350,76 @@ def main() -> None:
 
     sig_params = set(inspect.signature(TrainingArguments.__init__).parameters)
     if "save_strategy" in sig_params:
-        training_kwargs["save_strategy"] = "epoch"
-    if eval_dataset is not None:
-        if "evaluation_strategy" in sig_params:
-            training_kwargs["evaluation_strategy"] = "epoch"
-        elif "evaluation_strategy" not in sig_params and "do_eval" in sig_params:
-            training_kwargs["do_eval"] = True
-    else:
-        if "evaluation_strategy" in sig_params:
-            training_kwargs["evaluation_strategy"] = "no"
-        elif "do_eval" in sig_params:
-            training_kwargs["do_eval"] = False
+        base_training_kwargs["save_strategy"] = "epoch"
 
-    training_args = TrainingArguments(**training_kwargs)
+    trained_agents: List[str] = []
+    for agent in target_agents:
+        agent_train = filter_dataset_by_agent(base_train_dataset, agent)
+        if agent_train is None or len(agent_train) == 0:
+            print(f"[train] Skip agent {agent}: no training samples found.")
+            continue
+        agent_eval = filter_dataset_by_agent(base_eval_dataset, agent)
+        if agent_eval is not None and len(agent_eval) == 0:
+            agent_eval = None
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-    )
-    if args.save_every_epoch:
-        trainer.add_callback(EpochSaveCallback(run_dir, tokenizer))
-    trainer.train()
-    trainer.save_model(str(run_dir))
-    tokenizer.save_pretrained(str(run_dir))
-    if args.plot_metrics:
-        save_metric_plots(trainer.state.log_history, run_dir)
+        tokenized_train = agent_train.map(
+            preprocess,
+            remove_columns=agent_train.column_names,
+            desc=f"Tokenizing train set ({agent})",
+        )
+        tokenized_eval = None
+        if agent_eval is not None:
+            tokenized_eval = agent_eval.map(
+                preprocess,
+                remove_columns=agent_eval.column_names,
+                desc=f"Tokenizing eval set ({agent})",
+            )
+
+        agent_run_dir = run_dir / agent.replace(" ", "_")
+        agent_run_dir.mkdir(parents=True, exist_ok=True)
+
+        training_kwargs = dict(base_training_kwargs)
+        training_kwargs["output_dir"] = str(agent_run_dir)
+        if tokenized_eval is not None:
+            if "evaluation_strategy" in sig_params:
+                training_kwargs["evaluation_strategy"] = "epoch"
+            elif "do_eval" in sig_params:
+                training_kwargs["do_eval"] = True
+        else:
+            if "evaluation_strategy" in sig_params:
+                training_kwargs["evaluation_strategy"] = "no"
+            elif "do_eval" in sig_params:
+                training_kwargs["do_eval"] = False
+
+        model = build_model(args)
+        training_args = TrainingArguments(**training_kwargs)
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_eval,
+            data_collator=data_collator,
+        )
+        if args.save_every_epoch:
+            trainer.add_callback(EpochSaveCallback(agent_run_dir, tokenizer))
+        trainer.train()
+        trainer.save_model(str(agent_run_dir))
+        tokenizer.save_pretrained(str(agent_run_dir))
+        if args.plot_metrics:
+            save_metric_plots(trainer.state.log_history, agent_run_dir)
+        trained_agents.append(agent)
+        del trainer
+        del model
+        try:
+            import torch  # type: ignore
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    if not trained_agents:
+        raise RuntimeError("No agents were trained; please verify datasets and --agents selection.")
+    print(f"[train] Finished SFT for agents: {', '.join(trained_agents)}. Results saved under {run_dir}.")
 
 
 if __name__ == "__main__":

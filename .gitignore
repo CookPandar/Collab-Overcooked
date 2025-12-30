@@ -159,7 +159,9 @@ logs/
 .DS_Store
 .vscode/
 .idea/
-data/
+data/*
+!data/sft/
+!data/sft/**
 
 # Temporary files
 *.tmp

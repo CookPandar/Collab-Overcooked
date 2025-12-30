@@ -311,6 +311,7 @@ python scripts/export_sft_dataset.py \
 ```
 
 可通过 `--levels` / `--temperature` / `--agents` 控制样本筛选，`--max-samples` 则限制导出数量。
+脚本会按照智能体角色拆分输出：例如上述命令会生成 `data/sft/gpt4o_level12_Chef.jsonl` 与 `data/sft/gpt4o_level12_Assistant.jsonl`，方便为 Chef / Assistant 单独执行 SFT。
 
 若希望按“任务级”划分训练/验证/测试（例如 Level1&2 菜谱按 7:1:2 划分，保证验证/测试订单在训练中从未出现），可运行：
 
@@ -338,9 +339,11 @@ python scripts/export_sft_dataset.py \
 pip install transformers datasets accelerate peft
 
 python scripts/train_qwen_sft.py \
-  --data-path data/sft/gpt4o_level12.jsonl \
+  --train-data data/sft/train_level12_Chef.jsonl \
+  --eval-data data/sft/dev_level12_Chef.jsonl \
   --model-name Qwen/Qwen2.5-7B-Instruct \
-  --output-dir runs/qwen2.5-sft-level12 \
+  --output-dir runs/qwen2.5-sft-level12/chef \
+  --agents Chef \
   --epochs 1 \
   --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 16 \
@@ -351,17 +354,9 @@ python scripts/train_qwen_sft.py \
 ```
 
 脚本依赖 HuggingFace Transformers + PEFT：若开启 `--use-lora`，默认在 `q_proj/k_proj/v_proj/o_proj` 上注入 LoRA；也可通过 `--lora-r/--lora-alpha/--lora-dropout` 调整。训练完成后，`--output-dir` 下会保存可直接推理的模型与 tokenizer。
+当 `--agents` 包含多个角色时，会顺序为每名智能体训练一个 LoRA 头，并分别存放在 `runs/qwen2.5-sft-level12/<timestamp>/<Agent>/` 目录下（例如 `/Chef`、`/Assistant`），彼此互不覆盖，便于在推理阶段为不同角色加载对应的适配器。
 
-如果已经通过 `export_sft_dataset.py` 生成了拆分好的 `train/dev/test` JSONL，可以直接传入：
-
-```bash
-python scripts/train_qwen_sft.py \
-  --train-data data/sft/train_level12.jsonl \
-  --eval-data data/sft/dev_level12.jsonl \
-  --model-name Qwen/Qwen2.5-7B-Instruct \
-  --output-dir runs/qwen2.5-sft-level12 \
-  ...
-```
+如果已生成 `train/dev/test` 的拆分文件，可为每个角色单独运行一遍（如上先训练 Chef，再把 `--train-data` / `--eval-data` 换成 `*_Assistant.jsonl`、`--agents Assistant`、`--output-dir runs/qwen2.5-sft-level12/assistant` 即可）。
 
 `--eval-data` 不提供时，可以继续使用 `--eval-ratio` 从训练集划分验证集；`--test-data` 可留作离线评估（训练过程中不会使用）。
 

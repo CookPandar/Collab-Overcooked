@@ -10,6 +10,9 @@ Example:
         --temperature 0.7 \
         --agents Chef Assistant \
         --output data/sft/gpt4o_level12.jsonl
+
+Outputs are now split per agent role (e.g., `*_Chef.jsonl` / `*_Assistant.jsonl`
+when requesting both agents).
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import json
 import math
 from pathlib import Path
 import random
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TextIO
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,6 +203,18 @@ def build_sample(
     }
 
 
+def derive_agent_path(base: Path, agent: str) -> Path:
+    """
+    Derive an agent-specific output path. If `base` already looks like a file
+    (has suffix), append `_<agent>` before the suffix. Otherwise, treat it as a
+    directory and place `<agent>.jsonl` inside.
+    """
+    agent = agent.replace(" ", "_")
+    if base.suffix:
+        return base.with_name(f"{base.stem}_{agent}{base.suffix}")
+    return base / f"{agent}.jsonl"
+
+
 def gather_candidate_orders(
     args: argparse.Namespace,
     order_levels: Dict[str, int],
@@ -278,6 +293,9 @@ def export_samples(args: argparse.Namespace) -> int:
     order_levels = load_order_levels(args.recipe_dir)
     target_levels = set(args.levels or [])
     target_agents = set(args.agents or [])
+    if not target_agents:
+        target_agents = {"Chef", "Assistant"}
+    agent_list = sorted(target_agents)
 
     split_configs = [
         ("train", args.train_output, args.train_ratio),
@@ -292,13 +310,18 @@ def export_samples(args: argparse.Namespace) -> int:
         order_split_map = assign_order_splits(candidate_orders, ratios, args.split_seed)
         for name, path, _ in active_split_configs:
             path.parent.mkdir(parents=True, exist_ok=True)
-    writers: Dict[str, Tuple[Path, any]] = {}
+    writers: Dict[Tuple[str, str], Tuple[Path, TextIO]] = {}
     try:
         if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            writers["all"] = (args.output, args.output.open("w", encoding="utf-8"))
+            for agent in agent_list:
+                agent_path = derive_agent_path(args.output, agent)
+                agent_path.parent.mkdir(parents=True, exist_ok=True)
+                writers[("all", agent)] = (agent_path, agent_path.open("w", encoding="utf-8"))
         for name, path, _ in active_split_configs:
-            writers[name] = (path, path.open("w", encoding="utf-8"))
+            for agent in agent_list:
+                agent_path = derive_agent_path(path, agent)
+                agent_path.parent.mkdir(parents=True, exist_ok=True)
+                writers[(name, agent)] = (agent_path, agent_path.open("w", encoding="utf-8"))
 
         total_written = 0
         for model_name in args.models:
@@ -353,10 +376,13 @@ def export_samples(args: argparse.Namespace) -> int:
                                 },
                             )
                             line = json.dumps(sample, ensure_ascii=False) + "\n"
-                            if "all" in writers:
-                                writers["all"][1].write(line)
-                            if split_name and split_name in writers:
-                                writers[split_name][1].write(line)
+                            writer_all = writers.get(("all", agent_name))
+                            if writer_all:
+                                writer_all[1].write(line)
+                            if split_name:
+                                writer_split = writers.get((split_name, agent_name))
+                                if writer_split:
+                                    writer_split[1].write(line)
                             total_written += 1
                             if args.max_samples and total_written >= args.max_samples:
                                 return total_written
@@ -369,7 +395,7 @@ def export_samples(args: argparse.Namespace) -> int:
 def main() -> None:
     args = parse_args()
     total = export_samples(args)
-    print(f"[export] Wrote {total} samples to {args.output}")
+    print(f"[export] Wrote {total} samples.")
 
 
 if __name__ == "__main__":
