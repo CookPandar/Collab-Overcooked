@@ -11,7 +11,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [main_rl args...]" >&2
+    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [--collect-config cfg] [--train-config cfg] [--loop-rounds N] [-- main_rl args...]" >&2
     exit 1
 fi
 
@@ -34,6 +34,44 @@ IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
 COLLECT_CFG="${RL_COLLECT_CONFIG:-}"
 TRAIN_CFG="${RL_TRAIN_CONFIG:-}"
 LOOP_ROUNDS="${RL_LOOP_ROUNDS:-1}"
+RUN_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --collect-config)
+            if [[ $# -lt 2 ]]; then
+                echo "[cluster-rl] --collect-config requires a path" >&2
+                exit 1
+            fi
+            COLLECT_CFG="$2"
+            shift 2
+            ;;
+        --train-config)
+            if [[ $# -lt 2 ]]; then
+                echo "[cluster-rl] --train-config requires a path" >&2
+                exit 1
+            fi
+            TRAIN_CFG="$2"
+            shift 2
+            ;;
+        --loop-rounds)
+            if [[ $# -lt 2 ]]; then
+                echo "[cluster-rl] --loop-rounds requires a value" >&2
+                exit 1
+            fi
+            LOOP_ROUNDS="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            RUN_ARGS+=("$@")
+            break
+            ;;
+        *)
+            RUN_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
 CONDA_BASE="$(conda info --base)"
 # shellcheck source=/dev/null
@@ -55,7 +93,7 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" ]]; then
     for ((i=1; i<=LOOP_ROUNDS; i++)); do
         echo "[cluster-rl] Round $i collect -> $COLLECT_CFG"
         set +e
-        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl --config "$COLLECT_CFG"
+        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl --config "$COLLECT_CFG" "${RUN_ARGS[@]}"
         STATUS=$?
         set -e
         if [[ $STATUS -ne 0 ]]; then
@@ -65,7 +103,7 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" ]]; then
 
         echo "[cluster-rl] Round $i train -> $TRAIN_CFG"
         set +e
-        "$COLLAB_ENV/bin/python" -m collab_overcooked.main_rl --config "$TRAIN_CFG"
+        "$COLLAB_ENV/bin/python" -m collab_overcooked.main_rl --config "$TRAIN_CFG" "${RUN_ARGS[@]}"
         STATUS=$?
         set -e
         if [[ $STATUS -ne 0 ]]; then
@@ -75,7 +113,7 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" ]]; then
     done
 else
     set +e
-    "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl "$@"
+    "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl "${RUN_ARGS[@]}"
     STATUS=$?
     set -e
 fi

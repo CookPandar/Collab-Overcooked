@@ -28,6 +28,8 @@ from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld, OvercookedS
 
 from ..reward import ProcessRewardTracker
 from ..agents.collab import LLMAgents
+from .snapshots import build_session_snapshot as _build_session_snapshot
+from .snapshots import load_session_snapshot as _load_session_snapshot
 from ..agents.utils import convert_messages_to_prompt
 from ..main import (
     check_recipe_parse,
@@ -293,6 +295,15 @@ class CollabMainSession:
         self.team.reset()
         for proxy in self.rl_modules:
             proxy.consume_records()
+        return self._build_observation(self.env.state)
+
+    def capture_snapshot(self) -> Dict[str, Any]:
+        """Capture a serializable snapshot of the current session state."""
+        return _build_session_snapshot(self)
+
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore session state from :meth:`capture_snapshot` output."""
+        _load_session_snapshot(self, snapshot)
         return self._build_observation(self.env.state)
 
     def step(self) -> SessionStep:

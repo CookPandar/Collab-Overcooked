@@ -2,5 +2,5 @@
   "azure-gpt-4o": "configs/azure-gpt-4o.yaml",
   "qwen2.5-7B-instruct": "configs/qwen2.5-7B-instruct.yaml",
   "qwen2.5-sft-level1-sft-epoch-02":"configs/qwen2.5-sft-level1-sft-epoch-02.yaml",
-  "qwen2.5-sft-level1-sft-epoch-06":"configs/qwen2.5-sft-level1-sft-epoch-06.yaml"
+  "qwen2.5-7B-sft-level12-epoch-06":"configs/qwen2.5-sft-level1-sft-epoch-06.yaml"
 }

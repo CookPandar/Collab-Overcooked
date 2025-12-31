@@ -71,7 +71,7 @@ def parse_args():
         "--models",
         nargs="+",
         required=True,
-        help="List of LLM model identifiers. Both Chef and Assistant will use the same model.",
+        help="List of LLM model identifiers (team labels). Use --agent-overrides to customize Chef/Assistant models.",
     )
     parser.add_argument(
         "--base-config",
@@ -104,12 +104,6 @@ def parse_args():
         help="Optional list of temperatures. Overrides --temperature when supplied.",
     )
     parser.add_argument(
-        "--episodes",
-        type=int,
-        default=1,
-        help="How many episodes to run per order (default: 1).",
-    )
-    parser.add_argument(
         "--repeats",
         type=int,
         default=1,
@@ -126,6 +120,12 @@ def parse_args():
         type=Path,
         help="Optional JSON/YAML mapping from model name to config path. "
         "If provided, overrides --base-config per model.",
+    )
+    parser.add_argument(
+        "--agent-overrides",
+        type=Path,
+        help="Optional JSON/YAML mapping from agent role (e.g., Chef/Assistant) "
+        "to override fields such as model/base_url/temperature for that agent.",
     )
     return parser.parse_args()
 
@@ -163,7 +163,20 @@ def load_orders(recipe_dir: Path):
     return orders
 
 
-def update_config(base_cfg, order, model_name, temperature, episodes, run_id=None):
+def load_agent_overrides(path: Optional[Path]) -> Dict[str, Dict]:
+    if not path:
+        return {}
+    data = json.loads(path.read_text()) if path.suffix == ".json" else yaml.safe_load(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("Agent overrides must be a mapping from role to override dictionary.")
+    clean = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            clean[str(key)] = value
+    return clean
+
+
+def update_config(base_cfg, order, model_name, temperature, run_id=None, agent_overrides=None):
     cfg = json.loads(json.dumps(base_cfg))
     cfg.setdefault("environment", {})
     cfg["environment"]["order"] = order
@@ -171,14 +184,22 @@ def update_config(base_cfg, order, model_name, temperature, episodes, run_id=Non
     cfg["environment"]["horizon"] = int(base_time * 1.5)
 
     cfg.setdefault("run", {})
-    cfg["run"]["episode"] = episodes
     if run_id:
         cfg["run"]["run_id"] = run_id
 
-    for key, value in cfg.get("agents", {}).items():
-        if key.startswith("agent_") and isinstance(value, dict):
-            value["model"] = model_name
-            value["temperature"] = temperature
+    overrides = agent_overrides or {}
+    if overrides:
+        for key, value in cfg.get("agents", {}).items():
+            if not (key.startswith("agent_") and isinstance(value, dict)):
+                continue
+            role = value.get("role")
+            override = None
+            if role and role in overrides:
+                override = overrides[role]
+            elif key in overrides:
+                override = overrides[key]
+            if override:
+                value.update(dict(override))
 
     return cfg
 
@@ -245,16 +266,23 @@ def run_single_task(
     order_entry,
     model,
     temperature,
-    episodes,
     base_cfg,
     logs_dir: Path,
     json_dir: Path,
     worker_id: str,
+    agent_overrides: Optional[Dict[str, Dict]] = None,
 ):
     order = order_entry["order"]
     run_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     run_id = f"{worker_id}-{run_ts}-{uuid.uuid4().hex[:6]}"
-    cfg = update_config(base_cfg, order, model, temperature, episodes, run_id=run_id)
+    cfg = update_config(
+        base_cfg,
+        order,
+        model,
+        temperature,
+        run_id=run_id,
+        agent_overrides=agent_overrides,
+    )
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp:
         yaml.safe_dump(cfg, tmp)
         tmp_path = Path(tmp.name)
@@ -317,10 +345,10 @@ def run_order_job(job):
     repeat_idx = job["repeat"]
     entry = job["order_entry"]
     base_cfg = job["base_cfg"]
-    episodes = job["episodes"]
     logs_dir = job["logs_dir"]
     json_dir = job["json_dir"]
     worker_id = job["worker_id"]
+    agent_overrides = job.get("agent_overrides")
     logs_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,11 +359,11 @@ def run_order_job(job):
         entry,
         model,
         temperature,
-        episodes,
         base_cfg,
         logs_dir,
         json_dir,
         worker_id,
+        agent_overrides,
     )
     result["repeat"] = repeat_idx
     return result
@@ -390,10 +418,10 @@ def run_suite(
     recipe_dir,
     output_dir,
     temperatures,
-    episodes,
     repeats,
     max_workers,
     model_config_map,
+    agent_overrides,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     orders = load_orders(recipe_dir)
@@ -419,10 +447,10 @@ def run_suite(
                             "repeat": repeat_idx,
                             "order_entry": order_entry,
                             "base_cfg": base_cfg,
-                            "episodes": episodes,
                             "logs_dir": logs_dir,
                             "json_dir": json_dir,
                             "worker_id": worker_id,
+                            "agent_overrides": agent_overrides,
                         }
                     )
 
@@ -470,16 +498,17 @@ def main():
     args = parse_args()
     temperatures = args.temperatures if args.temperatures else [args.temperature]
     model_config_map = load_model_config_map(args.model_configs)
+    agent_overrides = load_agent_overrides(args.agent_overrides)
     run_suite(
         models=args.models,
         base_config_path=args.base_config,
         recipe_dir=args.recipe_dir,
         output_dir=args.output_dir,
         temperatures=temperatures,
-        episodes=args.episodes,
         repeats=max(1, args.repeats),
         max_workers=max(1, args.max_workers),
         model_config_map=model_config_map,
+        agent_overrides=agent_overrides,
     )
 
 

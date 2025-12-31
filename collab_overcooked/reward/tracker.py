@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
@@ -66,6 +67,48 @@ class ProcessRewardTracker:
         self.step_call_records.clear()
         for queue in self.penalty_queue:
             queue.clear()
+
+    def export_state(self) -> Dict[str, Any]:
+        """Serialize tracker progress for snapshot replay."""
+        return {
+            "sequence_histories": copy.deepcopy(self.sequence_histories),
+            "sequence_scores": list(self.sequence_scores),
+            "collab_sequence_scores": list(self.collab_sequence_scores),
+            "observed_targets": list(self.observed_targets),
+            "penalty_queue": copy.deepcopy(self.penalty_queue),
+        }
+
+    def import_state(self, data: Optional[Dict[str, Any]]):
+        """Restore tracker progress from :meth:`export_state` output."""
+        if not data:
+            self.reset()
+            return
+        self.sequence_histories = copy.deepcopy(
+            data.get("sequence_histories", [[], []])
+        )
+        if len(self.sequence_histories) < 2:
+            self.sequence_histories = [[], []]
+        self.sequence_scores = list(data.get("sequence_scores", [0.0, 0.0]))
+        if len(self.sequence_scores) < 2:
+            self.sequence_scores = [0.0, 0.0]
+        self.collab_sequence_scores = list(
+            data.get("collab_sequence_scores", [0.0, 0.0])
+        )
+        if len(self.collab_sequence_scores) < 2:
+            self.collab_sequence_scores = [0.0, 0.0]
+        observed = data.get("observed_targets", [])
+        self.observed_targets = set(observed) if observed else set()
+        penalty_state = data.get("penalty_queue")
+        if isinstance(penalty_state, list) and len(penalty_state) == len(self.penalty_queue):
+            self.penalty_queue = [
+                list(queue) if isinstance(queue, list) else []
+                for queue in penalty_state
+            ]
+        else:
+            for queue in self.penalty_queue:
+                queue.clear()
+        self.call_events.clear()
+        self.step_call_records.clear()
 
     def register_llm_action(
         self,

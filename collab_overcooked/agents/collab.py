@@ -151,6 +151,70 @@ class LLMAgents(LLMPair):
         self.turn_statistics_dict = turn_statistics_dict_cp
         # self.generate_layout_prompt()
 
+    def export_runtime_state(self) -> Dict[str, Any]:
+        """Serialize conversation + history context for snapshot replay."""
+        return {
+            "current_recent_goal_text": self.current_recent_goal_text,
+            "history_records": copy.deepcopy(self.history_records),
+            "conversation_history": list(self.conversation_history),
+            "current_turn_conversation": list(self.current_turn_conversation),
+            "conversation_history_timestamp": self.conversation_history_timestamp,
+            "teammate_ml_actions": copy.deepcopy(self.teammate_ml_actions),
+            "pending_collab_reply": self.pending_collab_reply,
+            "communication_turn_counter": self._communication_turn_counter,
+            "communication_turn_timestamp": self._communication_turn_timestamp,
+            "collab_ack_consumed": self._collab_ack_consumed,
+            "current_ml_action": self.current_ml_action,
+            "current_ml_action_steps": self.current_ml_action_steps,
+            "time_to_wait": self.time_to_wait,
+            "action_wait_queue": list(self.action_wait_parse.queue),
+            "failed_history": copy.deepcopy(self.failed_history),
+        }
+
+    def import_runtime_state(self, data: Optional[Dict[str, Any]]):
+        """Restore runtime fields from :meth:`export_runtime_state` output."""
+        if not isinstance(data, dict):
+            return
+        self.current_recent_goal_text = data.get(
+            "current_recent_goal_text", self.current_recent_goal_text
+        )
+        history_records = data.get("history_records")
+        if isinstance(history_records, list):
+            self.history_records = copy.deepcopy(history_records)
+        conversation_history = data.get("conversation_history")
+        if isinstance(conversation_history, list):
+            self.conversation_history = list(conversation_history)
+        turn_conversation = data.get("current_turn_conversation")
+        if isinstance(turn_conversation, list):
+            self.current_turn_conversation = list(turn_conversation)
+        self.conversation_history_timestamp = data.get(
+            "conversation_history_timestamp", self.conversation_history_timestamp
+        )
+        teammate_actions = data.get("teammate_ml_actions")
+        if isinstance(teammate_actions, list):
+            self.teammate_ml_actions = copy.deepcopy(teammate_actions)
+        self.pending_collab_reply = bool(data.get("pending_collab_reply", False))
+        self._communication_turn_counter = int(
+            data.get("communication_turn_counter", 0) or 0
+        )
+        timestamp_val = data.get("communication_turn_timestamp")
+        self._communication_turn_timestamp = (
+            int(timestamp_val) if isinstance(timestamp_val, (int, float)) else None
+        )
+        self._collab_ack_consumed = bool(data.get("collab_ack_consumed", False))
+        self.current_ml_action = data.get("current_ml_action")
+        self.current_ml_action_steps = int(data.get("current_ml_action_steps", 0) or 0)
+        self.time_to_wait = int(data.get("time_to_wait", 0) or 0)
+        queue_items = data.get("action_wait_queue")
+        if isinstance(queue_items, list):
+            while not self.action_wait_parse.empty():
+                self.action_wait_parse.get()
+            for item in queue_items:
+                self.action_wait_parse.put(item)
+        failed_history = data.get("failed_history")
+        if isinstance(failed_history, list):
+            self.failed_history = copy.deepcopy(failed_history)
+
     def set_mdp(self, mdp: OvercookedGridworld):
         self.mdp = mdp
 

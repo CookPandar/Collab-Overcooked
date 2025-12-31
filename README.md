@@ -240,20 +240,33 @@ reward:
 
 4. **批量评测（会先在 vLLM 环境中托管推理服务，再调用 `run_model_suite.py`）**
 
-    ```bash
-    bash scripts/run_cluster_suite.sh \
-      /mnt/shared/envs/vllm \
-      /mnt/shared/envs/collab_overcooked \
-      /path/to/qwen2.5-7B-instruct \
-      qwen2.5-7B-instruct \
-      configs/model_configs.json \
-      assets/data/batch_results \
-      8000 \
-      0.9 \
-      --max-workers 8 --repeats 1
-    ```
+```bash
+bash scripts/run_cluster_suite.sh \
+  /mnt/shared/envs/vllm \
+  /mnt/shared/envs/collab_overcooked \
+  qwen2.5-sft-level12 \
+  configs/model_configs.json \
+  assets/data/batch_results \
+  0.9 \
+  -- --temperatures 0.7 --repeats 2
+```
 
-    脚本会在本地节点启动 vLLM 服务、等待端口就绪、执行 `run_model_suite.py`，最后自动关闭服务。请确保模型配置中的 `base_url` 指向 `http://127.0.0.1:PORT/v1` 并与脚本端口保持一致。环境准备 + 任务运行均由上述脚本负责，后续切换任务时只需重复执行第 2/3/4 步即可。
+脚本会在本地节点启动所有需要的 vLLM 服务、等待端口就绪、执行 `run_model_suite.py`，最后自动关闭服务。  
+- `team_model_name` 必须在 `model_configs.json` 中给出路径；脚本会解析对应 YAML，读取 `agents.agent_*` 的 `local_model_path` 与 `base_url`，并按其中的端口启动 vLLM。例如：
+  ```yaml
+  agents:
+    agent_0:
+      model: chef-merged
+      local_model_path: /mnt/models/chef_merged
+      base_url: http://127.0.0.1:8000/v1
+      role: "Chef"
+    agent_1:
+      model: assistant-merged
+      local_model_path: /mnt/models/assistant_merged
+      base_url: http://127.0.0.1:8001/v1
+      role: "Assistant"
+  ```
+  上述配置会让 `run_cluster_suite.sh` 自动在 8000/8001 端口分别托管两个 LoRA 合并模型，无需再在命令行传入额外路径或 served name。`run_model_suite.py` 也不会覆盖 YAML 中的 `model` / `temperature`，因此可以按角色灵活指定模型。
 
 ### Utility / Analysis Scripts
 
