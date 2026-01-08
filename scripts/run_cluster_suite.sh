@@ -11,8 +11,11 @@
 #
 # 说明：
 #   - `team_model_name` 必须在 `model_configs.json` 中有条目，映射到相应 YAML。
-#   - YAML 的 `agents.agent_*` 需为本地 vLLM 服务提供字段：`local_model_path`（合并后的模型目录）和 `base_url`（含端口）。
-#   - 脚本会读取 YAML，为每个唯一的 (local_model_path, model, port) 启动 vLLM。
+#   - YAML 的 `agents.agent_*` 需为本地 vLLM 服务提供字段：
+#       - `base_url`（含端口）
+#       - `local_model_path` / `model_dirname` / `model_path`（可被 vLLM 直接加载的 HF 模型目录，需包含 config.json/params.json）
+#   - 可选：为每个 agent 配置 `cuda_visible_devices`（如 "0,1,2,3" 或 [0,1,2,3]），脚本会为该 vLLM 实例设置 CUDA_VISIBLE_DEVICES。
+#   - 可选：`tensor_parallel_size`/`tp`；不配置时会自动取为 cuda_visible_devices 的 GPU 数量（即 vLLM 的张量并行大小）。
 
 set -euo pipefail
 
@@ -63,53 +66,29 @@ export TORCH_COMPILE_DISABLE=1
 export TORCHDYNAMO_DISABLE=1
 export TORCHINDUCTOR_DISABLE=1
 
-CONFIG_PATH="$("$COLLAB_PY" - <<PY "$MODEL_CONFIG" "$TEAM_MODEL"
-import json, sys, os
+CONFIG_PATH="$("$COLLAB_PY" -c '
+import json, os, sys
+
 mapping = json.load(open(sys.argv[1]))
 team = sys.argv[2]
 path = mapping.get(team)
 if not path:
-    raise SystemExit(f"Model '{team}' not found in {sys.argv[1]}")
+    raise SystemExit(f"Model {team!r} not found in {sys.argv[1]}")
 print(os.path.abspath(path))
-PY
-)"
+' "$MODEL_CONFIG" "$TEAM_MODEL")"
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
     echo "[cluster-suite] 模型配置不存在: $CONFIG_PATH" >&2
     exit 1
 fi
 
-SERVER_INFO="$("$COLLAB_PY" - <<'PY' "$CONFIG_PATH"
-import sys, json, yaml, os
-from urllib.parse import urlparse
-cfg = yaml.safe_load(open(sys.argv[1]))
-servers = {}
-for key, agent in (cfg.get("agents") or {}).items():
-    if not isinstance(agent, dict):
-        continue
-    local_path = agent.get("local_model_path") or agent.get("model_dirname")
-    model = agent.get("model")
-    base_url = agent.get("base_url")
-    if not (local_path and model and base_url):
-        continue
-    parsed = urlparse(base_url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    key = (os.path.abspath(local_path), model, host, port)
-    servers[key] = {
-        "path": os.path.abspath(local_path),
-        "model": model,
-        "host": host,
-        "port": port,
-    }
-if not servers:
-    raise SystemExit("No local_model_path + base_url entries found in config; nothing to serve.")
-for srv in servers.values():
-    print(f"{srv['model']}|{srv['path']}|{srv['host']}|{srv['port']}")
-PY
-)"
+SERVER_INFO="$("$COLLAB_PY" scripts/resolve_vllm_servers.py "$CONFIG_PATH")"
 
-IFS=$'\n' read -r -d '' -a SERVER_LIST <<<"${SERVER_INFO}"$'\0'
+SERVER_LIST=()
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    SERVER_LIST+=("$line")
+done <<<"$SERVER_INFO"
 
 declare -a VLLM_PIDS=()
 declare -a SERVER_LOGS=()
@@ -126,30 +105,67 @@ cleanup() {
 trap cleanup EXIT
 
 start_vllm() {
-    local model="$1" path="$2" host="$3" port="$4"
+    local model="$1" path="$2" host="$3" port="$4" cuda="$5" tp="$6"
     local log_file
     log_file="$(mktemp -t vllm_log.XXXXXX)"
-    echo "[cluster-suite] 启动 vLLM: $model (path=$path host=$host port=$port, log=$log_file)"
-    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
-        --model "$path" \
-        --host "$host" \
-        --port "$port" \
-        --gpu-memory-utilization "$GPU_MEM" \
-        --served-model-name "$model" \
-        --max-model-len 4096 \
-        --dtype auto \
-        --api-key "token-abc123" \
-        --enforce-eager \
-        >"$log_file" 2>&1 &
+    if [[ ! -d "$path" ]]; then
+        echo "[cluster-suite] 模型目录不存在: $path (model=$model host=$host port=$port)" >&2
+        exit 1
+    fi
+    if [[ ! -f "$path/config.json" && ! -f "$path/params.json" ]]; then
+        echo "[cluster-suite] 模型目录缺少 config.json/params.json，vLLM 无法加载: $path" >&2
+        echo "[cluster-suite] 这通常表示你传的是 LoRA adapter 或训练输出目录；请先 merge 成 HF 目录再 serve。" >&2
+        exit 1
+    fi
+    local cuda_note=""
+    if [[ -n "$cuda" ]]; then
+        cuda_note=" CUDA_VISIBLE_DEVICES=$cuda tp=$tp"
+    else
+        cuda_note=" tp=$tp"
+    fi
+    echo "[cluster-suite] 启动 vLLM: $model (path=$path host=$host port=$port, log=$log_file)$cuda_note"
+    if [[ -n "$cuda" ]]; then
+        CUDA_VISIBLE_DEVICES="$cuda" \
+        "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+            --model "$path" \
+            --host "$host" \
+            --port "$port" \
+            --gpu-memory-utilization "$GPU_MEM" \
+            --served-model-name "$model" \
+            --data-parallel-size "${tp:-1}" \
+            --max-model-len 8192 \
+            --dtype auto \
+            --api-key "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM" \
+            --enforce-eager \
+            >"$log_file" 2>&1 &
+    else
+        "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+            --model "$path" \
+            --host "$host" \
+            --port "$port" \
+            --gpu-memory-utilization "$GPU_MEM" \
+            --served-model-name "$model" \
+            --data-parallel-size "${tp:-1}" \
+            --max-model-len 8192 \
+            --dtype auto \
+            --api-key "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM" \
+            --enforce-eager \
+            >"$log_file" 2>&1 &
+    fi
     VLLM_PIDS+=($!)
     SERVER_LOGS+=("$log_file")
 }
 
 wait_for() {
-    local host="$1" port="$2" log="$3"
+    local host="$1" port="$2" log="$3" pid="$4"
     echo "[cluster-suite] 等待 vLLM 在 $host:$port 启动..."
     local ready=0
     for _ in $(seq 1 120); do
+        if ! ps -p "$pid" >/dev/null 2>&1; then
+            echo "[cluster-suite] vLLM 进程已退出 (PID $pid)，启动失败；日志: $log" >&2
+            tail -n 120 "$log" >&2 || true
+            exit 1
+        fi
         if python - <<PY
 import socket, sys
 s = socket.socket()
@@ -168,6 +184,7 @@ PY
     done
     if [[ $ready -ne 1 ]]; then
         echo "[cluster-suite] vLLM 未能在 120 秒内启动 (port $port)，详见 $log"
+        tail -n 120 "$log" >&2 || true
         exit 1
     fi
 }
@@ -175,16 +192,16 @@ PY
 SERVERS_STARTED=0
 for entry in "${SERVER_LIST[@]}"; do
     [[ -z "$entry" ]] && continue
-    IFS='|' read -r model path host port <<<"$entry"
-    start_vllm "$model" "$path" "$host" "$port"
+    IFS="|" read -r model path host port cuda tp <<<"$entry"
+    start_vllm "$model" "$path" "$host" "$port" "${cuda:-}" "${tp:-1}"
     SERVERS_STARTED=$((SERVERS_STARTED + 1))
 done
 
 for idx in "${!SERVER_LOGS[@]}"; do
     log="${SERVER_LOGS[$idx]}"
     info="${SERVER_LIST[$idx]}"
-    IFS='|' read -r model path host port <<<"$info"
-    wait_for "$host" "$port" "$log"
+    IFS="|" read -r model path host port cuda tp <<<"$info"
+    wait_for "$host" "$port" "$log" "${VLLM_PIDS[$idx]}"
 done
 
 if [[ $SERVERS_STARTED -gt 0 ]]; then

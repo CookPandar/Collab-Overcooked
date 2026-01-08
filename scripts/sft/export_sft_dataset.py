@@ -3,13 +3,15 @@
 Convert successful Collab-Overcooked runs into SFT-ready JSONL examples.
 
 Example:
-    python scripts/export_sft_dataset.py \
+    python scripts/sft/export_sft_dataset.py \
         --source-dir assets/data/batch_results \
-        --models azure-gpt-4o \
+        --models azure-gpt-5_2 \
         --levels 1 2 \
-        --temperature 0.7 \
+        --temperature 0.0 \
         --agents Chef Assistant \
-        --output data/sft/gpt4o_level12.jsonl
+        --train-output  data/sft/gpt5_2/train_level12_gpt5_2.jsonl \
+        --test-output  data/sft/gpt5_2/test_level12_gpt5_2.jsonl \
+        --val-output  data/sft/gpt5_2/dev_level12_gpt5_2.jsonl
 
 Outputs are now split per agent role (e.g., `*_Chef.jsonl` / `*_Assistant.jsonl`
 when requesting both agents).

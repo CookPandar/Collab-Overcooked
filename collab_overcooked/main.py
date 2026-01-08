@@ -105,6 +105,7 @@ try:
             model=agent_config.get("model", "gpt-3.5-turbo"),
             model_dirname=agent_config.get("model_dirname", "~/"),
             local_server_api=local_server_api,
+            timeout=agent_config.get("timeout"),
             retrival_method=retrival_method,
             K=history_k,
             actor=actor,
@@ -114,6 +115,7 @@ try:
             outdir=agent_config.get("outdir"),
             history_window=agent_history_window,
             reward_tracker=reward_tracker,
+            response_language=agent_config.get("response_language", agent_config.get("language")),
         )
 
         if agent_config.get("api_key"):

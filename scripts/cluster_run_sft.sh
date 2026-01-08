@@ -38,7 +38,7 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$COLLAB_ENV"
 
 set +e
-"$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" scripts/train_qwen_sft.py "$@"
+"$ACCEL_BIN" launch --num_processes "$NUM_PROCS" --mixed_precision bf16 "${EXTRA_ACCEL[@]}" scripts/sft/train_qwen_sft.py "$@"
 STATUS=$?
 set -e
 conda deactivate

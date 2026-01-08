@@ -46,22 +46,22 @@ ORDER_TIME_HINT = {
     "baked_carrot_soup": 35,
     "baked_mushroom_soup": 35,
     "baked_potato_soup": 35,
-    "baked_pumpkin_soup": 35,
-    "sliced_bell_pepper_and_corn_stew": 32,
-    "sliced_bell_pepper_and_lentil_stew": 32,
-    "sliced_eggplant_and_chickpea_stew": 32,
-    "sliced_pumpkin_and_chickpea_stew": 32,
-    "sliced_zucchini_and_chickpea_stew": 32,
-    "mashed_broccoli_and_bean_patty": 55,
-    "mashed_carrot_and_chickpea_patty": 55,
-    "mashed_cauliflower_and_lentil_patty": 55,
-    "mashed_potato_and_pea_patty": 55,
-    "mashed_sweet_potato_and_bean_patty": 55,
-    "potato_carrot_and_onion_patty": 64,
-    "romaine_lettuce_pea_and_tomato_patty": 64,
-    "sweet_potato_spinach_and_mushroom_patty": 64,
-    "taro_bean_and_bell_pepper_patty": 64,
-    "zucchini_green_pea_and_onion_patty": 64,
+    "baked_pumpkin_soup": 35 #,
+    # "sliced_bell_pepper_and_corn_stew": 32,
+    # "sliced_bell_pepper_and_lentil_stew": 32,
+    # "sliced_eggplant_and_chickpea_stew": 32,
+    # "sliced_pumpkin_and_chickpea_stew": 32,
+    # "sliced_zucchini_and_chickpea_stew": 32,
+    # "mashed_broccoli_and_bean_patty": 55,
+    # "mashed_carrot_and_chickpea_patty": 55,
+    # "mashed_cauliflower_and_lentil_patty": 55,
+    # "mashed_potato_and_pea_patty": 55,
+    # "mashed_sweet_potato_and_bean_patty": 55,
+    # "potato_carrot_and_onion_patty": 64,
+    # "romaine_lettuce_pea_and_tomato_patty": 64,
+    # "sweet_potato_spinach_and_mushroom_patty": 64,
+    # "taro_bean_and_bell_pepper_patty": 64,
+    # "zucchini_green_pea_and_onion_patty": 64,
 }
 
 
@@ -157,8 +157,8 @@ def load_orders(recipe_dir: Path):
             missing.append(name)
             continue
         orders.append({"order": name, "level": level})
-    if missing:
-        raise ValueError(f"Missing ORDER_TIME_HINT entries for: {missing}")
+    # if missing:
+    #     raise ValueError(f"Missing ORDER_TIME_HINT entries for: {missing}")
     orders.sort(key=lambda item: (item["level"], item["order"]))
     return orders
 

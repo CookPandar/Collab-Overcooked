@@ -11,6 +11,7 @@ Due to the numerous settings that differ from the original Overcooked game, you 
   3. Your team may need to repeat Step 2 using several utensils according to the chef's recipe. After cooking, you need to pick up the cooked ingredients and decide whether to move somewhere else.
   4. Check if you need a dish to hold the cooked food. If so, the chef must pick up a dish first and then fill it with food from the utensil. Otherwise, the chef can directly pick up the cooked food from the utensil.
   5. Deliver the food to the serving location immediately.
+- Please reply in English.
 
 *Tips*
 

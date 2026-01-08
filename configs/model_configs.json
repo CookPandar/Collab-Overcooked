@@ -2,5 +2,11 @@
   "azure-gpt-4o": "configs/azure-gpt-4o.yaml",
   "qwen2.5-7B-instruct": "configs/qwen2.5-7B-instruct.yaml",
   "qwen2.5-sft-level1-sft-epoch-02":"configs/qwen2.5-sft-level1-sft-epoch-02.yaml",
-  "qwen2.5-7B-sft-level12-epoch-06":"configs/qwen2.5-sft-level1-sft-epoch-06.yaml"
+  "qwen2.5-7B-sft-level12-epoch-06":"configs/qwen2.5-sft-level1-sft-epoch-06.yaml",
+  "azure-gpt-5_2":"configs/azure-gpt-5_2.yaml",
+  "bailian-deepseek-v3":"configs/bailian-deepseek-v3.yaml",
+  "bailian-deepseek-r1":"configs/bailian-deepseek-r1.yaml",
+  "deepseek-ai__DeepSeek-R1-Distill-Qwen-7B-main":"configs/deepseek-ai__DeepSeek-R1-Distill-Qwen-7B-main.yaml",
+  "gemini-3-pro-preview":"configs/gemini-3-pro-preview.yaml",
+  "qwen2.5-sft-level1-sft-gpt4o-gpt5_2-epoch-06":"configs/qwen2.5-sft-level1-sft-gpt4o-gpt5_2-epoch-06.yaml"
 }

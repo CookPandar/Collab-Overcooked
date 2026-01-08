@@ -109,6 +109,7 @@ class Module:
         base_url=None,
         model_dirname="~/",
         local_server_api="http://localhost:8000/v1",
+        timeout: Optional[float] = None,
         retrival_method="recent_k",
         K=3,
     ):
@@ -117,6 +118,7 @@ class Module:
         self.base_url = base_url or self._get_default_base_url()
         self.model_dirname = model_dirname
         self.local_server_api = local_server_api
+        self.timeout = timeout
         self.retrival_method = retrival_method
         self.K = K
 
@@ -141,10 +143,10 @@ class Module:
         if not self.api_key:
             raise ValueError("API key is required but not provided")
         
-        return OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        kwargs = {"api_key": self.api_key, "base_url": self.base_url}
+        if self.timeout is not None:
+            kwargs["timeout"] = float(self.timeout)
+        return OpenAI(**kwargs)
 
     def load_embedding(self):
         """Load embeddings for similarity matching"""
@@ -305,10 +307,11 @@ class Module:
     def _handle_chat_model(self, messages, temperature):
         """Handle all chat models (GPT, DeepSeek, vLLM, etc.)"""
         client = self._get_client()
-        # For vLLM and local models, use full model path
+        # For OpenAI-compatible APIs (including local vLLM), the request `model`
+        # must match the server-side served model name.
+        # `model_dirname` is reserved for local filesystem usage (e.g., tokenizer),
+        # and should NOT be concatenated into the API request model id.
         model_name = self.model
-        if not ("gpt" in self.model or "deepseek" in self.model.lower()):
-            model_name = self.model_dirname + self.model
         
         response = client.chat.completions.create(
             model=model_name,

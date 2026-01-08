@@ -152,7 +152,6 @@ configs/*_personal.yaml
 configs/*_private.yaml
 configs/*_key.txt
 configs/*_keys.txt
-configs/*.yaml
 !configs/default.yaml
 logs/
 *.log
@@ -185,6 +184,8 @@ experiments/
 history/
 results/
 runs/
+assets/
+configs/*.yaml
 
 # Data files (large datasets)
 data/large_datasets/

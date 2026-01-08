@@ -11,7 +11,7 @@ Example:
         --per-device-train-batch-size 1 \
         --gradient-accumulation-steps 16 \
         --learning-rate 5e-5 \
-        --max-length 2048 \
+        --max-length 4096 \
         --use-lora \
         --agents Chef Assistant
 
@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
         choices=["Chef", "Assistant"],
         help="Agent roles to train (each receives its own LoRA head).",
     )
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args()
 
 
@@ -203,6 +204,12 @@ def build_model(args: argparse.Namespace) -> AutoModelForCausalLM:
         trust_remote_code=True,
         device_map=device_map,
     )
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.config.use_cache = False
+        # 可选：有些模型/Trainer需要这个来省显存
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
     if args.use_lora:
         if LoraConfig is None or get_peft_model is None:
             raise ImportError("peft is required for LoRA fine-tuning. Install with `pip install peft`.")

@@ -73,6 +73,7 @@ class LLMAgents(LLMPair):
         model="gpt-3.5-turbo-0301",
         model_dirname="~/",
         local_server_api="http://localhost:8000/v1",
+        timeout: Optional[float] = None,
         retrival_method="recent_k",
         K=1,
         actor="",
@@ -83,6 +84,7 @@ class LLMAgents(LLMPair):
         outdir=None,
         history_window=0,
         reward_tracker=None,
+        response_language=None,
     ):
         super().__init__(
             model=model, model_dirname=model_dirname, local_server_api=local_server_api
@@ -103,6 +105,7 @@ class LLMAgents(LLMPair):
 
         self.retrival_method = retrival_method
         self.K = K
+        self.timeout = timeout
 
         self.prev_state = None
         self.auto_unstuck = auto_unstuck
@@ -121,6 +124,7 @@ class LLMAgents(LLMPair):
         self.order = ""
         self.failed_history = []
         self.state = None
+        self.response_language = response_language
         # dict to record if the error in T timestamp  was corrected, or just 'wait(1)'
         self.error_correct = {}
         self.history_records = []
@@ -246,6 +250,7 @@ class LLMAgents(LLMPair):
             base_url=self.local_server_api,
             model_dirname=self.model_dirname,
             local_server_api=self.local_server_api,
+            timeout=self.timeout,
             retrival_method=retrival_method,
             K=K,
         )
@@ -283,10 +288,18 @@ class LLMAgents(LLMPair):
         with open(self.prompt_dir + f"/{self.actor}_skill.txt", "r") as g:
             skill = g.read()
             prompt = prompt.replace("{skill}", skill)
+
+        if self.response_language:
+            prompt += (
+                "\n\nLanguage\n--------\n"
+                f"- Respond only in {self.response_language}.\n"
+                "- Do not switch languages based on teammate messages.\n"
+            )
+
         chef_workflow = """- The usual workflow for the chef is:
-  1. Read the cooking process from your recipe. All of your decisions must be strictly guided by the recipe and should not lead to unfounded behavior.
-  2. Ask the assistant to pick up ingredients from the ingredient dispenser and use the correct utensil to handle them according to the recipe. Since you do not have access to all the objects, you need to assign some tasks to the assistant while you perform other tasks in parallel.
-  3. Work in parallel with the assistant to finish the order in the shortest time possible, unless there is nothing you can do in the current situation. If you have nothing to do, you can wait.
+	  1. Read the cooking process from your recipe. All of your decisions must be strictly guided by the recipe and should not lead to unfounded behavior.
+	  2. Ask the assistant to pick up ingredients from the ingredient dispenser and use the correct utensil to handle them according to the recipe. Since you do not have access to all the objects, you need to assign some tasks to the assistant while you perform other tasks in parallel.
+	  3. Work in parallel with the assistant to finish the order in the shortest time possible, unless there is nothing you can do in the current situation. If you have nothing to do, you can wait.
   4. Serve the dish (optional). If the recipe specifies that the dish needs to be served on a plate, you must use `fill_dish_with_food(utensil_name)` to serve the dish from the utensil first; otherwise, just pick up the food from the utensil.
   5. Use `deliver_soup()."""
         assistant_workflow = """The usual workflow for the Assistant is:  
