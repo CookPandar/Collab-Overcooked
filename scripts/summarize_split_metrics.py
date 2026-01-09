@@ -57,6 +57,96 @@ def default_agent_name(index: int) -> str:
     return f"agent_{index}"
 
 
+REFERENCE_DIR = (Path(__file__).resolve().parents[1] / "collab_overcooked" / "prompts" / "reference").resolve()
+
+
+def load_reference_actions(order: str) -> Dict[int, List[List[str]]]:
+    """
+    Load reference demonstrations for a given order.
+    Returns {agent_index: [reference_action_list, ...]}.
+    """
+    pattern = f"*_{order}_ref.txt"
+    candidates = sorted(REFERENCE_DIR.glob(pattern))
+    if not candidates:
+        raise FileNotFoundError(f"No reference file found for order '{order}' under {REFERENCE_DIR}")
+    refs_by_agent: Dict[int, List[List[str]]] = {0: [], 1: []}
+    for path in candidates:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            continue
+        for _, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            agent0 = entry.get("agent_0")
+            agent1 = entry.get("agent_1")
+            if isinstance(agent0, list) and agent0:
+                refs_by_agent[0].append([str(x).strip() for x in agent0 if str(x).strip()])
+            if isinstance(agent1, list) and agent1:
+                refs_by_agent[1].append([str(x).strip() for x in agent1 if str(x).strip()])
+    return refs_by_agent
+
+
+def normalize_action(action: str) -> str:
+    return (action or "").strip().replace(" ", "")
+
+
+def extract_executed_actions(data: Dict, agent_index: int) -> List[str]:
+    total = data.get("total_action_list") or []
+    if not isinstance(total, list) or agent_index >= len(total):
+        return []
+    actions = total[agent_index]
+    if not isinstance(actions, list):
+        return []
+    items = []
+    for item in actions:
+        if isinstance(item, dict):
+            items.append((int(item.get("timestamp", 0)), normalize_action(str(item.get("action") or ""))))
+        elif isinstance(item, str):
+            items.append((0, normalize_action(item)))
+    items = [(t, a) for (t, a) in items if a]
+    items.sort(key=lambda x: x[0])
+    return [a for _, a in items]
+
+
+def reference_progress(agent_actions: List[str], ref_actions: List[str]) -> int:
+    """
+    Return how many prefix steps of ref_actions are completed as an ordered subsequence
+    within agent_actions (allows detours, but preserves order).
+    """
+    if not ref_actions or not agent_actions:
+        return 0
+    idx = 0
+    for act in agent_actions:
+        if idx >= len(ref_actions):
+            break
+        if act == ref_actions[idx]:
+            idx += 1
+    return idx
+
+
+def best_reference_progress(order: str, agent_index: int, agent_actions: List[str]) -> Tuple[int, int, float]:
+    """
+    Return (matched_steps, ref_len, ratio) for the best reference demonstration.
+    """
+    refs = load_reference_actions(order).get(agent_index, [])
+    best_steps = 0
+    best_len = 0
+    best_ratio = 0.0
+    for ref in refs:
+        ref_norm = [normalize_action(x) for x in ref]
+        ref_norm = [x for x in ref_norm if x]
+        if not ref_norm:
+            continue
+        steps = reference_progress(agent_actions, ref_norm)
+        ratio = steps / len(ref_norm)
+        # Prefer the reference that reaches the furthest step; use ratio as tie-breaker.
+        if steps > best_steps or (steps == best_steps and ratio > best_ratio):
+            best_ratio = ratio
+            best_steps = steps
+            best_len = len(ref_norm)
+    return best_steps, best_len, best_ratio
+
+
 class OrderStats:
     def __init__(self) -> None:
         self.episodes = 0
@@ -66,6 +156,9 @@ class OrderStats:
         self.agent_totals: Dict[int, List[float]] = defaultdict(list)
         self.agent_sequence_rewards: Dict[int, List[float]] = defaultdict(list)
         self.agent_format_penalties: Dict[int, List[float]] = defaultdict(list)
+        self.agent_ref_progress: Dict[int, List[float]] = defaultdict(list)
+        self.agent_ref_steps: Dict[int, List[float]] = defaultdict(list)
+        self.agent_ref_lens: Dict[int, List[float]] = defaultdict(list)
         self.agent_names: Dict[int, str] = {}
 
     def add_episode(
@@ -77,6 +170,7 @@ class OrderStats:
         agent_names: Dict[int, str],
         team_total: Optional[float],
         agent_format_penalties: Dict[int, float],
+        agent_ref_progress: Dict[int, Tuple[int, int, float]],
     ) -> None:
         self.episodes += 1
         if success:
@@ -90,6 +184,11 @@ class OrderStats:
             self.agent_sequence_rewards[idx].append(seq_val)
         for idx, penalty in agent_format_penalties.items():
             self.agent_format_penalties[idx].append(penalty)
+        for idx, triple in agent_ref_progress.items():
+            steps, ref_len, ratio = triple
+            self.agent_ref_progress[idx].append(float(ratio))
+            self.agent_ref_steps[idx].append(float(steps))
+            self.agent_ref_lens[idx].append(float(ref_len))
         for idx, name in agent_names.items():
             if idx not in self.agent_names:
                 self.agent_names[idx] = name or default_agent_name(idx)
@@ -105,6 +204,12 @@ class OrderStats:
             self.agent_sequence_rewards[idx].extend(values)
         for idx, values in other.agent_format_penalties.items():
             self.agent_format_penalties[idx].extend(values)
+        for idx, values in other.agent_ref_progress.items():
+            self.agent_ref_progress[idx].extend(values)
+        for idx, values in other.agent_ref_steps.items():
+            self.agent_ref_steps[idx].extend(values)
+        for idx, values in other.agent_ref_lens.items():
+            self.agent_ref_lens[idx].extend(values)
         for idx, name in other.agent_names.items():
             self.agent_names.setdefault(idx, name)
 
@@ -137,6 +242,16 @@ class OrderStats:
             name = self.agent_names.get(idx, default_agent_name(idx))
             agent_penalty_summary[name] = self._summarize_list(values)
 
+        agent_progress_summary: Dict[str, Dict[str, Optional[float]]] = {}
+        for idx, values in self.agent_ref_progress.items():
+            name = self.agent_names.get(idx, default_agent_name(idx))
+            agent_progress_summary[name] = self._summarize_list(values)
+
+        agent_progress_steps_summary: Dict[str, Dict[str, Optional[float]]] = {}
+        for idx, values in self.agent_ref_steps.items():
+            name = self.agent_names.get(idx, default_agent_name(idx))
+            agent_progress_steps_summary[name] = self._summarize_list(values)
+
         summary = {
             "episodes": self.episodes,
             "successes": self.successes,
@@ -146,6 +261,8 @@ class OrderStats:
             "agent_rewards": agent_reward_summary,
             "agent_sequence_rewards": agent_sequence_summary,
             "agent_format_penalties": agent_penalty_summary,
+            "agent_ref_progress": agent_progress_summary,
+            "agent_ref_steps": agent_progress_steps_summary,
         }
         return summary
 
@@ -172,16 +289,24 @@ class OrderStats:
         reward_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_rewards"]  # type: ignore[assignment]
         sequence_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_sequence_rewards"]  # type: ignore[assignment]
         penalty_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_format_penalties"]  # type: ignore[assignment]
+        progress_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_progress"]  # type: ignore[assignment]
+        progress_steps_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_steps"]  # type: ignore[assignment]
         for idx, col_prefix in agent_columns:
             agent_name = self.agent_names.get(idx, default_agent_name(idx))
             reward_metrics = reward_summary.get(agent_name)
             seq_metrics = sequence_summary.get(agent_name)
             penalty_metrics = penalty_summary.get(agent_name)
+            prog_metrics = progress_summary.get(agent_name)
+            prog_steps_metrics = progress_steps_summary.get(agent_name)
             values = self.agent_totals.get(idx, [])
             row[f"{col_prefix}_avg_reward"] = reward_metrics["avg"] if reward_metrics else None
             row[f"{col_prefix}_total_reward"] = sum(values) if values else 0.0
             row[f"{col_prefix}_avg_sequence_reward"] = seq_metrics["avg"] if seq_metrics else None
             row[f"{col_prefix}_avg_format_reward"] = penalty_metrics["avg"] if penalty_metrics else None
+            row[f"{col_prefix}_avg_ref_progress"] = prog_metrics["avg"] if prog_metrics else None
+            row[f"{col_prefix}_avg_ref_steps"] = prog_steps_metrics["avg"] if prog_steps_metrics else None
+            row[f"{col_prefix}_max_ref_progress"] = prog_metrics["max"] if prog_metrics else None
+            row[f"{col_prefix}_max_ref_steps"] = prog_steps_metrics["max"] if prog_steps_metrics else None
         return row
 
     def agent_metric_row(
@@ -194,6 +319,8 @@ class OrderStats:
         reward_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_rewards"]  # type: ignore[assignment]
         sequence_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_sequence_rewards"]  # type: ignore[assignment]
         penalty_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_format_penalties"]  # type: ignore[assignment]
+        progress_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_progress"]  # type: ignore[assignment]
+        progress_steps_summary: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_steps"]  # type: ignore[assignment]
         row: Dict[str, Optional[float]] = {
             "name": name,
             "split": split,
@@ -205,11 +332,17 @@ class OrderStats:
             reward_metrics = reward_summary.get(agent_name)
             seq_metrics = sequence_summary.get(agent_name)
             penalty_metrics = penalty_summary.get(agent_name)
+            prog_metrics = progress_summary.get(agent_name)
+            prog_steps_metrics = progress_steps_summary.get(agent_name)
             values = self.agent_totals.get(idx, [])
             row[f"{col_prefix}_avg_reward"] = reward_metrics["avg"] if reward_metrics else None
             row[f"{col_prefix}_total_reward"] = sum(values) if values else 0.0
             row[f"{col_prefix}_avg_sequence_reward"] = seq_metrics["avg"] if seq_metrics else None
             row[f"{col_prefix}_avg_format_reward"] = penalty_metrics["avg"] if penalty_metrics else None
+            row[f"{col_prefix}_avg_ref_progress"] = prog_metrics["avg"] if prog_metrics else None
+            row[f"{col_prefix}_avg_ref_steps"] = prog_steps_metrics["avg"] if prog_steps_metrics else None
+            row[f"{col_prefix}_max_ref_progress"] = prog_metrics["max"] if prog_metrics else None
+            row[f"{col_prefix}_max_ref_steps"] = prog_steps_metrics["max"] if prog_steps_metrics else None
         return row
 
 
@@ -295,6 +428,18 @@ def extract_episode_totals(
     return agent_totals, agent_names, team_total, agent_format_penalties, agent_sequences
 
 
+def extract_reference_progress(data: Dict, order_name: str) -> Dict[int, Tuple[int, int, float]]:
+    progress: Dict[int, Tuple[int, int, float]] = {}
+    for idx in (0, 1):
+        actions = extract_executed_actions(data, idx)
+        try:
+            steps, ref_len, ratio = best_reference_progress(order_name, idx, actions)
+        except FileNotFoundError:
+            continue
+        progress[idx] = (steps, ref_len, ratio)
+    return progress
+
+
 def aggregate_order_metrics(log_root: Path) -> Dict[str, OrderStats]:
     if not log_root.exists():
         raise FileNotFoundError(f"Log root not found: {log_root}")
@@ -317,6 +462,7 @@ def aggregate_order_metrics(log_root: Path) -> Dict[str, OrderStats]:
                 agent_format_penalties,
                 agent_sequences,
             ) = extract_episode_totals(process_rewards)
+        agent_ref_progress = extract_reference_progress(data, order_name)
         order_metrics[order_name].add_episode(
             success,
             score,
@@ -325,6 +471,7 @@ def aggregate_order_metrics(log_root: Path) -> Dict[str, OrderStats]:
             agent_names,
             team_total,
             agent_format_penalties,
+            agent_ref_progress,
         )
     if not order_metrics:
         raise RuntimeError(f"No JSON logs were discovered under {log_root}")
@@ -393,16 +540,24 @@ def print_split_summary(split_stats: Dict[str, OrderStats]) -> None:
         agent_rewards: Dict[str, Dict[str, Optional[float]]] = summary["agent_rewards"]  # type: ignore[assignment]
         agent_sequences: Dict[str, Dict[str, Optional[float]]] = summary["agent_sequence_rewards"]  # type: ignore[assignment]
         agent_penalties: Dict[str, Dict[str, Optional[float]]] = summary["agent_format_penalties"]  # type: ignore[assignment]
+        agent_progress: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_progress"]  # type: ignore[assignment]
+        agent_progress_steps: Dict[str, Dict[str, Optional[float]]] = summary["agent_ref_steps"]  # type: ignore[assignment]
         agent_names = sorted(set(agent_rewards.keys()) | set(agent_sequences.keys()) | set(agent_penalties.keys()))
         for agent_name in agent_names:
             reward_metrics = agent_rewards.get(agent_name)
             seq_metrics = agent_sequences.get(agent_name)
             penalty_metrics = agent_penalties.get(agent_name)
+            prog_metrics = agent_progress.get(agent_name)
+            prog_steps_metrics = agent_progress_steps.get(agent_name)
             agent_idx = next((i for i, n in stats.agent_names.items() if n == agent_name), None)
             total_val = sum(stats.agent_totals.get(agent_idx, [])) if agent_idx is not None else None
             print(
                 f"- {agent_name:<10} avg_seq={_fmt(seq_metrics['avg'] if seq_metrics else None)} "
                 f"avg_format={_fmt(penalty_metrics['avg'] if penalty_metrics else None)} "
+                f"avg_ref_progress={_fmt(prog_metrics['avg'] if prog_metrics else None)} "
+                f"max_ref_progress={_fmt(prog_metrics['max'] if prog_metrics else None)} "
+                f"avg_ref_steps={_fmt(prog_steps_metrics['avg'] if prog_steps_metrics else None)} "
+                f"max_ref_steps={_fmt(prog_steps_metrics['max'] if prog_steps_metrics else None)} "
                 f"avg_reward={_fmt(reward_metrics['avg'] if reward_metrics else None)} "
                 f"total_reward={_fmt(total_val)}"
             )
@@ -421,6 +576,10 @@ def print_order_metrics(
                 f"{col_prefix}_total_reward",
                 f"{col_prefix}_avg_sequence_reward",
                 f"{col_prefix}_avg_format_reward",
+                f"{col_prefix}_avg_ref_progress",
+                f"{col_prefix}_avg_ref_steps",
+                f"{col_prefix}_max_ref_progress",
+                f"{col_prefix}_max_ref_steps",
             ]
         )
     print("\n=== PER-ORDER METRICS ===")
@@ -436,6 +595,10 @@ def print_order_metrics(
             values.append(_fmt(row.get(f"{col_prefix}_total_reward")))
             values.append(_fmt(row.get(f"{col_prefix}_avg_sequence_reward")))
             values.append(_fmt(row.get(f"{col_prefix}_avg_format_reward")))
+            values.append(_fmt(row.get(f"{col_prefix}_avg_ref_progress")))
+            values.append(_fmt(row.get(f"{col_prefix}_avg_ref_steps")))
+            values.append(_fmt(row.get(f"{col_prefix}_max_ref_progress")))
+            values.append(_fmt(row.get(f"{col_prefix}_max_ref_steps")))
         print("\t".join(values))
 
 
@@ -475,9 +638,17 @@ def load_per_order_csv(path: Path) -> Dict[str, Dict[str, Optional[float]]]:
                 "assistant_avg_reward": _to_float(row.get("assistant_avg_reward")),
                 "assistant_avg_format_reward": _to_float(row.get("assistant_avg_format_reward")),
                 "assistant_avg_sequence_reward": _to_float(row.get("assistant_avg_sequence_reward")),
+                "assistant_avg_ref_progress": _to_float(row.get("assistant_avg_ref_progress")),
+                "assistant_avg_ref_steps": _to_float(row.get("assistant_avg_ref_steps")),
+                "assistant_max_ref_progress": _to_float(row.get("assistant_max_ref_progress")),
+                "assistant_max_ref_steps": _to_float(row.get("assistant_max_ref_steps")),
                 "chef_avg_reward": _to_float(row.get("chef_avg_reward")),
                 "chef_avg_format_reward": _to_float(row.get("chef_avg_format_reward")),
                 "chef_avg_sequence_reward": _to_float(row.get("chef_avg_sequence_reward")),
+                "chef_avg_ref_progress": _to_float(row.get("chef_avg_ref_progress")),
+                "chef_avg_ref_steps": _to_float(row.get("chef_avg_ref_steps")),
+                "chef_max_ref_progress": _to_float(row.get("chef_max_ref_progress")),
+                "chef_max_ref_steps": _to_float(row.get("chef_max_ref_steps")),
                 "success_rate": _to_float(row.get("success_rate")),
             }
             rows[order] = entry
@@ -501,49 +672,73 @@ def plot_per_order_metrics(datasets: List[Tuple[str, Dict[str, Dict[str, Optiona
         ("assistant_avg_reward", "Assistant Avg Reward"),
         ("assistant_avg_format_reward", "Assistant Avg Format Reward"),
         ("assistant_avg_sequence_reward", "Assistant Avg Process Reward"),
+        ("assistant_max_ref_progress", "Assistant Max Reference Progress"),
+        ("assistant_max_ref_steps", "Assistant Max Matched Reference Steps"),
         ("chef_avg_reward", "Chef Avg Reward"),
         ("chef_avg_format_reward", "Chef Avg Format Reward"),
         ("chef_avg_sequence_reward", "Chef Avg Process Reward"),
+        ("chef_max_ref_progress", "Chef Max Reference Progress"),
+        ("chef_max_ref_steps", "Chef Max Matched Reference Steps"),
         ("success_rate", "Success Rate"),
     ]
 
     x_idx = list(range(len(order_names)))
+    n_series = max(1, len(datasets))
+    jitter_span = 0.24
+    step = jitter_span / max(1, n_series - 1) if n_series > 1 else 0.0
+    offsets = [(-jitter_span / 2.0) + i * step for i in range(n_series)]
+    markers = ["o", "s", "D", "^", "v", "P", "X", "*", "<", ">", "h", "H"]
+    linestyles = ["-", "--", "-.", ":"]
+
+    def _union_split(split_name: str) -> List[int]:
+        indices: List[int] = []
+        for idx, order in enumerate(order_names):
+            for _, data in datasets:
+                if data.get(order, {}).get("split") == split_name:
+                    indices.append(idx)
+                    break
+        return indices
+
+    highlight_indices = sorted(set(_union_split("test") + _union_split("dev")))
+
     for metric_key, title in metric_specs:
         plt.figure(figsize=(max(10, len(order_names) * 0.4), 5))
-        for label, data in datasets:
+        for series_idx, (label, data) in enumerate(datasets):
+            x_positions = [x + offsets[series_idx] for x in x_idx]
             y_values = []
             for order in order_names:
                 val = data.get(order, {}).get(metric_key)
                 y_values.append(float(val) if val is not None else float("nan"))
-            line, = plt.plot(x_idx, y_values, label=label)
+            line, = plt.plot(
+                x_positions,
+                y_values,
+                label=label,
+                alpha=0.85,
+                linewidth=1.6,
+                linestyle=linestyles[series_idx % len(linestyles)],
+                marker=markers[series_idx % len(markers)],
+                markersize=4.5,
+            )
             color = line.get_color()
-            non_test_indices = [
-                idx for idx, order in enumerate(order_names) if data.get(order, {}).get("split") != "test"
-            ]
-            if non_test_indices:
-                non_test_values = [y_values[idx] for idx in non_test_indices]
-                plt.scatter(
-                    [x_idx[idx] for idx in non_test_indices],
-                    non_test_values,
-                    marker="o",
-                    color=color,
-                    label=None,
-                    zorder=4,
-                )
-            special_indices = [
-                idx
-                for idx, order in enumerate(order_names)
-                if data.get(order, {}).get("split") in {"test", "dev"}
-            ]
-            for idx in special_indices:
-                plt.axvline(
-                    x_idx[idx],
-                    color=color,
-                    linestyle="--",
-                    linewidth=1.0,
-                    alpha=0.3,
-                    zorder=3,
-                )
+            plt.scatter(
+                x_positions,
+                y_values,
+                color=color,
+                s=18,
+                alpha=0.85,
+                zorder=4,
+                edgecolors="white",
+                linewidths=0.4,
+            )
+        for idx in highlight_indices:
+            plt.axvline(
+                x_idx[idx],
+                color="gray",
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.25,
+                zorder=2,
+            )
         plt.xticks(x_idx, order_names, rotation=45, ha="right")
         plt.ylabel(title)
         plt.title(title, pad=40)
