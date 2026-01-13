@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dev-data", type=Path, help="JSONL file containing SFT validation split.")
     parser.add_argument("--test-data", type=Path, help="JSONL file containing SFT test split.")
     parser.add_argument(
+        "--include-unmapped-orders",
+        action="store_true",
+        help="Include orders that are not present in the provided train/dev/test JSONL split files (marked as split=unknown).",
+    )
+    parser.add_argument(
         "--plot-per-order-csv",
         nargs="+",
         help="Plot per-order metrics from CSV files (format label=path or plain path).",
@@ -567,6 +572,7 @@ def print_order_metrics(
     order_metrics: Dict[str, OrderStats],
     mapping: Dict[str, str],
     agent_columns: List[Tuple[int, str]],
+    include_unmapped: bool,
 ) -> None:
     header_parts = ["order", "split", "success_rate"]
     for _, col_prefix in agent_columns:
@@ -586,8 +592,9 @@ def print_order_metrics(
     print("\t".join(header_parts))
     for order_name in sorted(order_metrics.keys()):
         split = mapping.get(order_name)
-        if split is None:
+        if split is None and not include_unmapped:
             continue
+        split = split or "unknown"
         row = order_metrics[order_name].agent_metric_row(order_name, split, agent_columns)
         values = [order_name, split, _fmt(row.get("success_rate"))]
         for _, col_prefix in agent_columns:
@@ -606,11 +613,13 @@ def parse_plot_sources(entries: List[str]) -> List[Tuple[str, Path]]:
     result: List[Tuple[str, Path]] = []
     for entry in entries:
         if "=" in entry:
-            _, path_str = entry.split("=", 1)
+            label_str, path_str = entry.split("=", 1)
+            label_str = label_str.strip()
         else:
             path_str = entry
+            label_str = ""
         csv_path = Path(path_str.strip())
-        label = csv_path.parent.name or csv_path.stem
+        label = label_str or (csv_path.parent.name or csv_path.stem)
         result.append((label, csv_path))
     return result
 
@@ -631,7 +640,7 @@ def load_per_order_csv(path: Path) -> Dict[str, Dict[str, Optional[float]]]:
         for row in reader:
             order = row.get("name") or row.get("order")
             split = (row.get("split") or "").strip().lower()
-            if not order or split == "unknown":
+            if not order:
                 continue
             entry = {
                 "split": split,
@@ -783,19 +792,21 @@ def main() -> None:
     missing_orders = sorted(o for o in order_metrics.keys() if o not in mapping)
     if missing_orders:
         preview = ", ".join(missing_orders[:10])
+        action_hint = "将被标记为 unknown 并纳入统计" if args.include_unmapped_orders else "将被跳过"
         print(
-            "[split-map] Warning: 以下任务未在 train/dev/test 数据集中找到标签，将被跳过: "
+            f"[split-map] Warning: 以下任务未在 train/dev/test 数据集中找到标签，{action_hint}: "
             f"{preview}{' ...' if len(missing_orders) > 10 else ''}"
         )
     split_stats = build_split_stats(order_metrics, mapping)
     agent_columns = make_agent_columns(order_metrics)
-    print_order_metrics(order_metrics, mapping, agent_columns)
+    print_order_metrics(order_metrics, mapping, agent_columns, args.include_unmapped_orders)
     print_split_summary(split_stats)
     per_order_rows: List[Dict[str, Optional[float]]] = []
     for order_name in sorted(order_metrics.keys()):
         split = mapping.get(order_name)
-        if split is None:
+        if split is None and not args.include_unmapped_orders:
             continue
+        split = split or "unknown"
         row = order_metrics[order_name].agent_metric_row(order_name, split, agent_columns)
         per_order_rows.append(row)
     if per_order_rows:

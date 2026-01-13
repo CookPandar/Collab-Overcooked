@@ -48,7 +48,7 @@ python scripts/summarize_split_metrics.py \
 
 python scripts/summarize_split_metrics.py \
   --log-root assets/data/batch_results/qwen2.5-sft-level1-sft-gpt4o-gpt5_2-epoch-06/json \
-  --plot-per-order-csv qwen2.5-sft-level1-sft-stage2=assets/data/batch_results/qwen2.5-sft-level1-sft-gpt4o-gpt5_2-epoch-06/per_order_metrics.csv \
+  --plot-per-order-csv qwen2.5-sft-4kdata-4096len=assets/data/batch_results/qwen2.5-sft-level1-sft-gpt4o-gpt5_2-epoch-06/per_order_metrics.csv \
    gpt-4o=assets/data/batch_results/azure-gpt-4o/per_order_metrics.csv qwen2.5-7B=assets/data/batch_results/qwen2.5-7B-instruct/per_order_metrics.csv \
-   qwen2.5-7B-sft-stage1=assets/data/batch_results/qwen2.5-7B-sft-level12-epoch-06/per_order_metrics.csv  azure-gpt-5_2=assets/data/batch_results/azure-gpt-5_2/per_order_metrics.csv \
-   qwen2.5-sft-level1-sft-gpt4o-epoch-06=assets/data/batch_results/qwen2.5-sft-level1-sft-gpt4o-epoch-06/per_order_metrics.csv
+   qwen2.5-7B-sft-2kdata-512len=assets/data/batch_results/qwen2.5-7B-sft-level12-epoch-06/per_order_metrics.csv  azure-gpt-5_2=assets/data/batch_results/azure-gpt-5_2/per_order_metrics.csv \
+   qwen2.5-7B-sft-2kdata-4096len=assets/data/batch_results/qwen2.5-sft-level1-sft-gpt4o-epoch-06/per_order_metrics.csv
