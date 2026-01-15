@@ -101,6 +101,7 @@ class ObjectState(object):
     def to_dict(self):
         return {
             "name": self.name,
+            "catagory": self.catagory,
             "position": self.position,
             "state": self.state
         }
@@ -108,6 +109,17 @@ class ObjectState(object):
     @staticmethod
     def from_dict(obj_dict):
         obj_dict = copy.deepcopy(obj_dict)
+        # Backward compatibility: older snapshots/logs may miss the "catagory" field.
+        # We fall back to a reasonable default so that snapshot replay can proceed.
+        if "catagory" not in obj_dict:
+            name = obj_dict.get("name")
+            if name == "dish":
+                obj_dict["catagory"] = "dish"
+            elif name == "soup":
+                # Soup objects are created as semi-finished and may later be marked with_dish.
+                obj_dict["catagory"] = "semi-finished"
+            else:
+                obj_dict["catagory"] = "ingredient"
         return ObjectState(**obj_dict)
     
 

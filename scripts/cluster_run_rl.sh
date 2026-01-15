@@ -27,7 +27,7 @@ if [[ ! -x "$COLLAB_ENV/bin/python" ]]; then
     exit 1
 fi
 
-ACCELERATE_BIN=~/collab-overcooked/bin/accelerate
+ACCELERATE_BIN=../collab-overcooked/bin/accelerate
 NUM_PROCS="${RL_NUM_PROCS:-1}"
 ACCEL_BIN="${ACCELERATE_BIN:-accelerate}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
@@ -91,15 +91,15 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" ]]; then
     fi
     STATUS=0
     for ((i=1; i<=LOOP_ROUNDS; i++)); do
-        echo "[cluster-rl] Round $i collect -> $COLLECT_CFG"
-        set +e
-        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl --config "$COLLECT_CFG" "${RUN_ARGS[@]}"
-        STATUS=$?
-        set -e
-        if [[ $STATUS -ne 0 ]]; then
-            echo "[cluster-rl] Collect failed (round $i), abort." >&2
-            break
-        fi
+        # echo "[cluster-rl] Round $i collect -> $COLLECT_CFG"
+        # set +e
+        # "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl --config "$COLLECT_CFG" "${RUN_ARGS[@]}"
+        # STATUS=$?
+        # set -e
+        # if [[ $STATUS -ne 0 ]]; then
+        #     echo "[cluster-rl] Collect failed (round $i), abort." >&2
+        #     break
+        # fi
 
         echo "[cluster-rl] Round $i train -> $TRAIN_CFG"
         set +e

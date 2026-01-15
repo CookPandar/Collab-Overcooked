@@ -1,0 +1,68 @@
+# Default configuration for Collab-Overcooked
+# Note: This file contains a working API key configuration
+# For personal testing, copy this to configs/test_personal.yaml and modify as needed
+
+# Environment settings
+environment:
+  horizon: 50
+  order: "boiled_egg"  # Available: boiled_egg, soup, salad
+  layout: "cramped_room"  # Available: cramped_room, coordination_ring, etc.
+  max_steps: 400
+
+# Runtime / control loop settings
+run:
+  episode: 1
+  mode: "exp"
+  test_mode: "fix_task"
+  p0: "LLMPair"
+  p1: "LLMPair"
+  collab_mode: "llm"
+  llm_model: "azure-gpt-4o"
+  history_window: 0
+  
+# Agent settings
+agents:
+  num_agents: 2
+  agent_0:
+    type: "openai"  # openai, vllm, custom_api
+    model: "azure-gpt-4o"
+    api_key: "eeyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJoRmkwcDJtaXFaTFVnYzZSWW4yRmRQTFYyREpHQXFaViJ9.HRikaLqHR6975C6K1m5CWxcAShQ-8G0unxQZZm3cTD0"  # Required for OpenAI/custom API
+    base_url: "https://zhangshuwen-api.dev.fc.chj.cloud/agentops"  # Optional for OpenAI, required for custom_api
+    temperature: 0.7
+    max_tokens: 512
+    timeout: 30
+    max_retries: 3
+    role: "Chef"
+  agent_1:
+    type: "openai"
+    model: "azure-gpt-4o"
+    api_key: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJoRmkwcDJtaXFaTFVnYzZSWW4yRmRQTFYyREpHQXFaViJ9.HRikaLqHR6975C6K1m5CWxcAShQ-8G0unxQZZm3cTD0"  # Required for OpenAI/custom API
+    base_url: "https://zhangshuwen-api.dev.fc.chj.cloud/agentops"
+    temperature: 0.7
+    max_tokens: 512
+    timeout: 30
+    max_retries: 3
+    role: "Assistant"
+
+# Evaluation settings
+evaluation:
+  metrics:
+    - "f1_score"
+    - "similarity"
+    - "redundancy"
+    - "collaboration_initiate"
+    - "collaboration_respond"
+  output_dir: "./results"
+  save_trajectories: true
+  
+# Logging settings
+logging:
+  level: "INFO"
+  save_logs: true
+  log_dir: "./logs"
+  
+# Paths
+paths:
+  prompts_dir: "./collab_overcooked/prompts"
+  layouts_dir: "./dependencies/overcooked_ai/overcooked_ai_py/data/layouts"
+  results_dir: "./results"

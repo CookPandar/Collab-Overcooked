@@ -1,0 +1,80 @@
+environment:
+  layout: "cramped_room"
+  order: "baked_bell_pepper"
+  horizon: 24
+
+trainer:
+  type: "mappo"
+  # 只训练：从 rollouts 读数据，不再采样
+  train_only: true
+  collect_only: false
+  fix_mistral_regex: true
+  max_records_per_step: 10
+
+  # 模型路径：基座 + 初始 LoRA（不要填 merged 模型）
+  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b    # 替换成你的基座模型目录
+  lora_path: null
+  lora: {}
+  actor_adapters:
+    agent_0:
+      adapter_name: Chef
+      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/chef/20260107-222040/Chef
+    agent_1:
+      adapter_name: Assistant
+      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/assistant/20260107-221956/Assistant
+  critic_adapter: null
+
+  # 训练输出 & rollouts 读取
+  rollout_dir: "./rollouts"
+  output_dir: "runs/rl/train"
+  save_interval: 10
+  checkpoint_interval: 0
+
+  # 导出与最新模型标记（采样端会读 latest_model.json）
+  export_latest_dir: "runs/rl/export_latest"
+  latest_model_path_file: "runs/rl/latest_model.json"
+  export_interval: 1
+  merge_lora_after_train: true
+
+  # 生成相关
+  max_new_tokens: 4096
+  generation_temperature: 0.0
+  evaluation_batch_size: 1
+
+  # PPO/MAPPO 超参
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr: 1.0e-5
+  steps_per_update: 24
+  train_batch_size: 1
+  total_updates: 15
+  clip_coef: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  cleanup_rollouts: true
+
+agents:
+  num_agents: 2
+  agent_0:
+    type: "openai"
+    model: "qwen2.5-7b"
+    api_key: "YOUR_API_KEY"
+    base_url: "http://127.0.0.1:8000/v1"
+    model_dirname: ""
+    temperature: 0
+    max_tokens: 4096
+    timeout: 30
+    max_retries: 3
+    role: "Chef"
+  agent_1:
+    type: "openai"
+    model: "qwen2.5-7b"
+    api_key: "YOUR_API_KEY"
+    base_url: "http://127.0.0.1:8001/v1"
+    model_dirname: ""
+    temperature: 0
+    max_tokens: 4096
+    timeout: 30
+    max_retries: 3
+    role: "Assistant"

@@ -185,13 +185,13 @@ history/
 results/
 runs/
 assets/
-configs/*.yaml
 
 # Data files (large datasets)
 data/large_datasets/
 
 # Cache files
 src/embedding_cache.json
+rollouts/
 
 # Misc
 roadmap.md

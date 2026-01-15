@@ -1,0 +1,72 @@
+# Default configuration for Collab-Overcooked
+# Note: This file contains a working API key configuration
+# For personal testing, copy this to configs/test_personal.yaml and modify as needed
+
+# Environment settings
+environment:
+  horizon: 50
+  order: "boiled_egg"  # Available: boiled_egg, soup, salad
+  layout: "cramped_room"  # Available: cramped_room, coordination_ring, etc.
+  max_steps: 400
+
+# Runtime / control loop settings
+run:
+  episode: 1
+  mode: "exp"
+  test_mode: "fix_task"
+  p0: "LLMPair"
+  p1: "LLMPair"
+  collab_mode: "llm"
+  llm_model: "deepseek-r1"
+  history_window: 0
+  
+# Agent settings
+agents:
+  num_agents: 2
+  agent_0:
+    type: "openai"  # openai, vllm, custom_api
+    model: "qwen2.5-7B-instruct"
+    api_key: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM"  # Required for OpenAI/custom API
+    base_url: "http://127.0.0.1:8000/v1"  # Optional for OpenAI, required for custom_api
+    cuda_visible_devices: "0,1,2,3"
+    model_dirname: "/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-sft-level12-gpt4o/chef_merged"  # Use served model name directly when calling local OpenAI API
+    temperature: 0
+    max_tokens: 4096
+    timeout: 30
+    max_retries: 3
+    role: "Chef"
+  agent_1:
+    type: "openai"
+    model: "qwen2.5-7B-instruct"
+    api_key: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM"  # Required for OpenAI/custom API
+    base_url: "http://127.0.0.1:8001/v1"
+    cuda_visible_devices: "4,5,6,7"
+    model_dirname: "/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-sft-level12-gpt4o/assistant_merged"
+    temperature: 0
+    max_tokens: 4096
+    timeout: 30
+    max_retries: 3
+    role: "Assistant"
+
+# Evaluation settings
+evaluation:
+  metrics:
+    - "f1_score"
+    - "similarity"
+    - "redundancy"
+    - "collaboration_initiate"
+    - "collaboration_respond"
+  output_dir: "./results"
+  save_trajectories: true
+  
+# Logging settings
+logging:
+  level: "INFO"
+  save_logs: true
+  log_dir: "./logs"
+  
+# Paths
+paths:
+  prompts_dir: "./collab_overcooked/prompts"
+  layouts_dir: "./dependencies/overcooked_ai/overcooked_ai_py/data/layouts"
+  results_dir: "./results"
