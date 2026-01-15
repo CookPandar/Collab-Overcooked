@@ -34,7 +34,6 @@ trainer:
   export_latest_dir: "runs/rl/export_latest"
   latest_model_path_file: "runs/rl/latest_model.json"
   export_interval: 1
-  merge_lora_after_train: true
 
   # 生成相关
   max_new_tokens: 4096

@@ -478,12 +478,6 @@ class MAPPOTrainer:
         self.latest_model_path_file: Optional[Path] = Path(latest_file) if latest_file else None
         self.export_latest_dir: Optional[Path] = None
         self.export_interval = max(1, int(self.trainer_cfg.get("export_interval", 1)))
-        self.merge_lora_after_train = bool(
-            self.trainer_cfg.get(
-                "merge_lora_after_train",
-                bool(self.trainer_cfg.get("lora_path")) or bool(self.trainer_cfg.get("lora")),
-            )
-        )
         self.collect_only = bool(trainer_cfg.get("collect_only", False))
         self.train_only = bool(trainer_cfg.get("train_only", False))
         self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
@@ -536,7 +530,7 @@ class MAPPOTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self.trainer_cfg.get("export_latest_dir"):
             self.export_latest_dir = Path(self.trainer_cfg["export_latest_dir"])
-        elif self.export_latest_dir is None and (latest_file or self.merge_lora_after_train):
+        elif self.export_latest_dir is None and latest_file:
             # 默认导出到输出目录下的 export_latest，方便采样端重载
             self.export_latest_dir = self.output_dir / "export_latest"
         interval = trainer_cfg.get(
@@ -770,7 +764,18 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------------
     def _apply_model_override_from_file(self, cfg: Dict[str, Any]) -> None:
-        """Allow dynamic model_path / lora_path override via marker file."""
+        """Allow dynamic model_path / lora_path override via marker file.
+
+        The marker file may contain either a legacy single-model payload:
+          {"model_path": "...", "lora_path": "..."}
+
+        Or a multi-adapter payload (for 2-agent setups) such as:
+          {
+            "model_path": "...",
+            "actor_adapters": {"0": {"adapter_name": "Chef", "lora_path": "..."}, ...},
+            "critic_adapter": {"adapter_name": "critic", "lora_path": "..."}
+          }
+        """
         if not self.latest_model_path_file:
             return
         try:
@@ -787,15 +792,38 @@ class MAPPOTrainer:
         except Exception:
             override = None
         if override:
-            merged_path = override.get("merged_model_path")
-            if self.collect_only and merged_path:
-                cfg["model_path"] = merged_path
-                cfg["lora_path"] = None
-            else:
-                if override.get("model_path"):
-                    cfg["model_path"] = override["model_path"]
-                if "lora_path" in override:
-                    cfg["lora_path"] = override["lora_path"]
+            if override.get("model_path"):
+                cfg["model_path"] = override["model_path"]
+            if "lora_path" in override:
+                cfg["lora_path"] = override["lora_path"]
+
+            # Multi-adapter override: patch per-agent adapter paths when present.
+            actor_override = override.get("actor_adapters")
+            if isinstance(actor_override, dict) and isinstance(cfg.get("actor_adapters"), dict):
+                for key, value in actor_override.items():
+                    if not isinstance(value, dict):
+                        continue
+                    idx = self._resolve_agent_index(key)
+                    if idx is None:
+                        # Also accept pure numeric-string keys ("0", "1", ...)
+                        try:
+                            idx = int(str(key))
+                        except (TypeError, ValueError):
+                            idx = None
+                    if idx is None:
+                        continue
+                    agent_key = f"agent_{idx}"
+                    if agent_key not in cfg["actor_adapters"]:
+                        continue
+                    lora_path = value.get("lora_path")
+                    if lora_path:
+                        cfg["actor_adapters"][agent_key]["lora_path"] = lora_path
+
+            critic_override = override.get("critic_adapter")
+            if isinstance(critic_override, dict) and isinstance(cfg.get("critic_adapter"), dict):
+                lora_path = critic_override.get("lora_path")
+                if lora_path:
+                    cfg["critic_adapter"]["lora_path"] = lora_path
             return
         # fallback：纯字符串表示 model_path
         cfg["model_path"] = content
@@ -1159,65 +1187,94 @@ class MAPPOTrainer:
             if self.latest_model_path_file
             else self.export_latest_dir / "latest_model.json"
         )
-        model_dir = self.export_latest_dir / (
-            "adapter_u" + f"{update_idx:05d}"
-            if self.lora_path or self.lora_cfg
-            else "model_u" + f"{update_idx:05d}"
-        )
-        merged_dir = self.export_latest_dir / f"merged_u{update_idx:05d}"
-
         unwrapped: QwenLMActorCritic = self.accelerator.unwrap_model(self.text_policy)
         hf_model = unwrapped.model
         tokenizer = unwrapped.tokenizer
 
-        self.accelerator.print(f"[Export] Saving adapter/model to {model_dir}")
-        hf_model.save_pretrained(model_dir)
-        tokenizer.save_pretrained(model_dir)
+        def _safe_name(raw: str) -> str:
+            raw = (raw or "").strip() or "adapter"
+            cleaned = re.sub(r"[^0-9a-zA-Z_.-]+", "_", raw)
+            return cleaned.strip("_") or "adapter"
+
+        def _save_adapter_snapshot(adapter_name: str, out_dir: Path) -> None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if isinstance(hf_model, PeftModel):
+                # Prefer saving only the selected adapter when supported (multi-adapter safe).
+                try:
+                    hf_model.save_pretrained(out_dir, selected_adapters=[adapter_name])
+                except TypeError:
+                    # Older PEFT: fallback to switching adapter then saving.
+                    prev = getattr(hf_model, "active_adapter", None)
+                    try:
+                        hf_model.set_adapter(adapter_name)
+                        hf_model.save_pretrained(out_dir)
+                    finally:
+                        if prev:
+                            try:
+                                hf_model.set_adapter(prev)
+                            except Exception:
+                                pass
+            else:
+                # Unexpected: is_lora=True but model is not a PeftModel.
+                hf_model.save_pretrained(out_dir)
+            tokenizer.save_pretrained(out_dir)
 
         payload: Dict[str, Any] = {
             "model_path": str(self.model_path),
-            "lora_path": str(model_dir) if unwrapped.is_lora else None,
-            "merged_model_path": None,
+            "lora_path": None,
             "update_idx": update_idx,
         }
 
-        if self.merge_lora_after_train and unwrapped.is_lora:
-            self.accelerator.print(f"[Export] Merging LoRA into base -> {merged_dir}")
-            merge_dtype = unwrapped.dtype if torch.cuda.is_available() else None
-            device_map = "auto" if torch.cuda.is_available() else None
-            base_model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                torch_dtype=merge_dtype,
-                device_map=device_map,
-            )
-            merged = PeftModel.from_pretrained(base_model, model_dir)
-            merged = merged.merge_and_unload()
-            merged.save_pretrained(merged_dir)
-            tokenizer.save_pretrained(merged_dir)
-            payload["merged_model_path"] = str(merged_dir)
-            # 采样端优先用 merge 后的完整模型
-            payload["model_path"] = str(merged_dir)
-            payload["lora_path"] = None
-            self._cleanup_old_merged_dirs(merged_dir)
-        elif not unwrapped.is_lora:
+        if unwrapped.is_lora:
+            # Export per-agent adapters so the sampler can load different models for each agent.
+            exported_actor: Dict[str, Dict[str, Any]] = {}
+            for idx, spec in sorted(self.actor_adapters.items()):
+                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}_u{update_idx:05d}"
+                self.accelerator.print(
+                    f"[Export] Saving adapter[{idx}:{spec.name}] -> {adapter_dir}"
+                )
+                _save_adapter_snapshot(spec.name, adapter_dir)
+                exported_actor[str(idx)] = {
+                    "adapter_name": spec.name,
+                    "lora_path": str(adapter_dir),
+                }
+            if exported_actor:
+                payload["actor_adapters"] = exported_actor
+
+            if self.critic_adapter is not None:
+                spec = self.critic_adapter
+                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}_u{update_idx:05d}"
+                self.accelerator.print(
+                    f"[Export] Saving adapter[critic:{spec.name}] -> {adapter_dir}"
+                )
+                _save_adapter_snapshot(spec.name, adapter_dir)
+                payload["critic_adapter"] = {
+                    "adapter_name": spec.name,
+                    "lora_path": str(adapter_dir),
+                }
+
+            # Backward-compat: if this is a single-adapter run, keep legacy lora_path field.
+            if not self.actor_adapters and self.critic_adapter is None:
+                adapter_dir = self.export_latest_dir / f"adapter_u{update_idx:05d}"
+                self.accelerator.print(f"[Export] Saving adapter -> {adapter_dir}")
+                active = getattr(hf_model, "active_adapter", "default")
+                if isinstance(active, (list, tuple)):
+                    active_name = str(active[0]) if active else "default"
+                else:
+                    active_name = str(active) if active else "default"
+                _save_adapter_snapshot(active_name, adapter_dir)
+                payload["lora_path"] = str(adapter_dir)
+        else:
+            model_dir = self.export_latest_dir / f"model_u{update_idx:05d}"
+            self.accelerator.print(f"[Export] Saving full model -> {model_dir}")
+            model_dir.mkdir(parents=True, exist_ok=True)
+            hf_model.save_pretrained(model_dir)
+            tokenizer.save_pretrained(model_dir)
             payload["model_path"] = str(model_dir)
             payload["lora_path"] = None
 
         marker_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.accelerator.print(f"[Export] latest model info -> {marker_path}")
-
-    # ------------------------------------------------------------------
-    def _cleanup_old_merged_dirs(self, keep_dir: Path):
-        if not self.export_latest_dir:
-            return
-        keep_dir = keep_dir.resolve()
-        for path in self.export_latest_dir.glob("merged_u*"):
-            try:
-                if path.resolve() != keep_dir and path.exists():
-                    shutil.rmtree(path, ignore_errors=True)
-            except OSError:
-                pass
 
     # ------------------------------------------------------------------
     def _transition_to_dict(self, t: TextTransition):
