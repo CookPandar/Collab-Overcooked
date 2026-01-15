@@ -877,9 +877,11 @@ class LLMAgents(LLMPair):
         # print(f'ml_action = {self.current_ml_action}')
         # print(f'P{self.agent_index} : {Action.to_char(chosen_action)}')
         # Use version 0.0.1 logic (from dependencies/overcooked_ai)
-        if "pickup" in self.current_ml_action:
-            return self._finalize_action_return(chosen_action, self.parse_action_params[0])
-        elif any(s in self.current_ml_action for s in self.mdp.interact_actions):
+        primary_action, primary_params = self.parse_params_in_action(self.current_ml_action)
+        if primary_action == "pickup":
+            pickup_item = primary_params[0] if primary_params else ""
+            return self._finalize_action_return(chosen_action, pickup_item)
+        elif primary_action in self.mdp.interact_actions:
             return self._finalize_action_return(chosen_action, "[START]")
         else:
             return self._finalize_action_return(chosen_action, "")
@@ -1167,6 +1169,9 @@ class LLMAgents(LLMPair):
         cleaned = text.replace("```", "").replace("```]", "")
         cleaned = cleaned.replace("[```", "").replace("```", "")
         cleaned = cleaned.strip()
+        # Many LLMs emit one action per line / code fence; treat newlines as action separators.
+        cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = cleaned.replace("\n", ";")
         # Remove stray markdown fences or unmatched brackets
         cleaned = cleaned.rstrip("`")
         cleaned = cleaned.rstrip("]")
@@ -1413,9 +1418,9 @@ class LLMAgents(LLMPair):
                 False,
                 detail,
             )
-        if "place_obj_on_counter()" in action_string:
-            ml_action = f"place_obj_on_counter()"
-        elif "pickup(" in action_string:
+        if self.parse_action == "place_obj_on_counter":
+            ml_action = "place_obj_on_counter()"
+        elif self.parse_action == "pickup":
             if len(params) != 2:
                 detail = "Wrong pickup() params. It should have 2 params: obj and distination."
                 self._report_action_format_error(detail, action_string)
@@ -1468,7 +1473,7 @@ class LLMAgents(LLMPair):
                     detail,
                 )
             ml_action = f"pickup({params[0]},{params[1]})"
-        elif "put_obj_in_utensil(" in action_string:
+        elif self.parse_action == "put_obj_in_utensil":
             if len(params) != 1:
                 detail = "Wrong put_obj_in_utensil() params. It should have 1 params: utensil."
                 self._report_action_format_error(detail, action_string)
@@ -1476,14 +1481,21 @@ class LLMAgents(LLMPair):
                     False,
                     detail,
                 )
-            # check if LLM generate put_obj_in_utensil(obj,utensil),then only use the utensil params
             if params[0] in self.mdp.utensil_list:
                 ml_action = f"put_obj_in_utensil({params[0]})"
             else:
-                detail = f"Wrong put_obj_in_utensil() parmas:{params[0]}"
+                if params[0] == "dish":
+                    detail = (
+                        "Wrong put_obj_in_utensil() params: dish.\n"
+                        "Dish 不是 utensil，不能 put_obj_in_utensil(dish)。\n"
+                        "如果你想装盘：先 pickup(dish,dish_dispenser) 或 pickup(dish,counter)，再 fill_dish_with_food(utensil_name)。\n"
+                        "如果当前订单不需要 dish：直接 pickup(成品,utensil_name) 然后 deliver_soup()。"
+                    )
+                else:
+                    detail = f"Wrong put_obj_in_utensil() parmas:{params[0]}"
                 self._report_action_format_error(detail, action_string)
                 return False, detail
-        elif "fill_dish_with_food(" in action_string:
+        elif self.parse_action == "fill_dish_with_food":
             if len(params) != 1:
                 detail = "Wrong fill_dish_with_food() params. It should have 1 params: utensil."
                 self._report_action_format_error(detail, action_string)
@@ -1497,12 +1509,12 @@ class LLMAgents(LLMPair):
                 detail = f"Wrong fill_dish_with_food() parmas:{params[0]}"
                 self._report_action_format_error(detail, action_string)
                 return False, detail
-        elif "deliver_soup()" in action_string:
+        elif self.parse_action == "deliver_soup":
             ml_action = "deliver_soup()"
-        elif "check_recipe()" in action_string:
+        elif self.parse_action == "check_recipe":
             ml_action = "check_recipe()"
         # 	check all the action need to interact with utensils
-        elif any(item in action_string for item in self.mdp.interact_actions.keys()):
+        elif self.parse_action in self.mdp.interact_actions:
             if len(params) != 1:
                 detail = "Please ensure the Action field is a semicolon-separated list of function calls without narration."
                 self._report_action_format_error(detail, action_string)
@@ -1510,15 +1522,14 @@ class LLMAgents(LLMPair):
                     False,
                     detail,
                 )
-            for interact_action, utensils in self.mdp.interact_actions.items():
-                if interact_action in action_string:
-                    if params[0] in utensils:
-                        ml_action = f"{interact_action}({params[0]})"
-                    else:
-                        detail = f"Wrong {interact_action}() parmas:{params[0]}"
-                        self._report_action_format_error(detail, action_string)
-                        return False, detail
-        elif "wait" in action_string:
+            utensils = self.mdp.interact_actions.get(self.parse_action, [])
+            if params[0] in utensils:
+                ml_action = f"{self.parse_action}({params[0]})"
+            else:
+                detail = f"Wrong {self.parse_action}() parmas:{params[0]}"
+                self._report_action_format_error(detail, action_string)
+                return False, detail
+        elif self.parse_action == "wait":
             time_to_wait = self.parse_wait_string(action_string)
             if time_to_wait > 5:
                 detail = "Too long wait time. It should be less than 5."
@@ -2616,8 +2627,10 @@ class LLMAgents(LLMPair):
             ):
                 failed_message = f"There is no {self.parse_action_params[0]} in {self.parse_action_params[1]}, please check the item your want to pickup.\n"
             return failed_message + "\n"
-        elif "put" in self.current_ml_action:
+        elif self.parse_action == "put_obj_in_utensil":
             # check if the food in utensil is full
+            if not self.parse_action_params:
+                return "Wrong put_obj_in_utensil() params. It should have 1 params: utensil.\n"
             if self.parse_action_params[0] in utensil_state["cooking"]:
                 failed_message = f"{self.actor} can not put obj into  {self.parse_action_params[0]}. The utensil {self.parse_action_params[0]} is cooking, and you should wait for it is ready.\n"
                 return failed_message
@@ -2647,13 +2660,13 @@ class LLMAgents(LLMPair):
             elif player.get_object().name == "dish":
                 failed_message = f"You can not put dish into any utensil. Dish can only be placed on counter.\n"
             return failed_message
-        elif "place_obj_on_counter" in self.current_ml_action:
+        elif self.parse_action == "place_obj_on_counter":
             if not has_object:
                 failed_message = f"There is no object in {self.actor}'s hand, so can not place object on counter.\n"
             elif len(empty_counter) == 0:
                 failed_message = f"There is no empty counter to place object.\n"
             return failed_message
-        elif "fill" in self.current_ml_action:
+        elif self.parse_action == "fill_dish_with_food":
             # check if the recipe need dish
             if self.mdp.need_dish[self.order] == 0:
                 failed_message = f"{self.order} does not need dish. Please directly pick cooked food from utensil and deliver it to the service location.\n"
@@ -2668,7 +2681,7 @@ class LLMAgents(LLMPair):
                 if (not valide_obj("dish") and self.mdp.need_dish[self.order] == 1)
                 else failed_message
             )
-        elif "deliver" in self.current_ml_action:
+        elif self.parse_action == "deliver_soup":
             has_soup = False
             for s in self.mdp.need_dish.keys():
                 if valide_obj(s):
@@ -2701,7 +2714,7 @@ class LLMAgents(LLMPair):
                 failed_message = f"There is object in {self.actor}'s hand, so can not interact with utensil.\n"
             return failed_message
         # the same as pickup(toast,counter)
-        elif "check_recipe" in self.current_ml_action:
+        elif self.parse_action == "check_recipe":
             if self.actor != "chef":
                 failed_message = (
                     f"Assistant can not check recipe.Only chef can do it.\n"
@@ -2711,7 +2724,7 @@ class LLMAgents(LLMPair):
             else:
                 self.time_to_wait = 2
             return failed_message
-        elif "wait" in self.current_ml_action:
+        elif self.parse_action == "wait":
             match = re.search(r"\d+", self.current_ml_action)
             number = 1
             if match:
@@ -2802,6 +2815,10 @@ class LLMAgents(LLMPair):
         counter_objects = self.mdp.get_counter_objects_dict(
             state, list(self.mdp.terrain_pos_dict["X"])
         )
+        # NOTE: In RL mode, the model may accidentally emit multiple actions in one string
+        # (e.g., "put_obj_in_utensil(...)\n\npickup(...)\n..."). We always parse the *first*
+        # action, and branch based on the parsed function name instead of substring checks
+        # on the raw string to avoid mis-routing (e.g., "pickup" appearing later).
         self.parse_action, self.parse_action_params = self.parse_params_in_action(
             self.current_ml_action
         )
@@ -2810,7 +2827,10 @@ class LLMAgents(LLMPair):
         if ml_manager is None:
             raise AttributeError("MediumLevelPlanner missing ml_action_manager")
 
-        if "pick" in self.current_ml_action:
+        if self.parse_action == "pickup":
+            # pickup(obj, destination) requires 2 params; otherwise treat as unreachable/invalid.
+            if len(self.parse_action_params) < 2:
+                return []
             motion_goals = ml_manager.pickup_obj_actions(
                 state,
                 self.parse_action_params[0],
@@ -2818,29 +2838,35 @@ class LLMAgents(LLMPair):
                 self.agent_index,
                 counter_objects,
             )
-        elif "add_toast" in self.current_ml_action:
+        elif self.parse_action == "add_toast":
             motion_goals = ml_manager.pickup_obj_actions(
                 state, "toast", "counter", self.agent_index, counter_objects
             )
-        elif "put" in self.current_ml_action:
+        elif self.parse_action == "put_obj_in_utensil":
+            if not self.parse_action_params:
+                return []
             motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
-        elif "place_obj_on_counter" in self.current_ml_action:
+        elif self.parse_action == "place_obj_on_counter":
             motion_goals = self.find_shared_counters(state, self.mlam)
             if len(motion_goals) == 0:
                 motion_goals = ml_manager.place_obj_on_counter_actions(state)
-        elif "fill_dish_with_food" in self.current_ml_action:
+        elif self.parse_action == "fill_dish_with_food":
+            if not self.parse_action_params:
+                return []
             motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
-        elif "deliver_soup" in self.current_ml_action:
+        elif self.parse_action == "deliver_soup":
             motion_goals = ml_manager.deliver_soup_actions()
-        elif any(s in self.parse_action for s in ["cook", "cut", "stir", "bake"]):
+        elif any(s in (self.parse_action or "") for s in ["cook", "cut", "stir", "bake"]):
+            if not self.parse_action_params:
+                return []
             motion_goals = ml_manager.go_to_utensil_actions(
                 state, self.parse_action_params[0], self.agent_index
             )
-        elif "wait" in self.current_ml_action:
+        elif self.parse_action == "wait":
             motion_goals = ml_manager.wait_actions(player)
         else:
             raise ValueError("Invalid action: {}".format(self.current_ml_action))
