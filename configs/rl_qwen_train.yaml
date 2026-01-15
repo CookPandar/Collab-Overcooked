@@ -12,16 +12,16 @@ trainer:
   max_records_per_step: 10
 
   # 模型路径：基座 + 初始 LoRA（不要填 merged 模型）
-  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b    # 替换成你的基座模型目录
+  model_path: /datacache/LLMs/Qwen2.5-7B-Instruct    # 替换成你的基座模型目录
   lora_path: null
   lora: {}
   actor_adapters:
     agent_0:
       adapter_name: Chef
-      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/chef/20260107-222040/Chef
+      lora_path: ./runs/Chef
     agent_1:
       adapter_name: Assistant
-      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/assistant/20260107-221956/Assistant
+      lora_path: ./runs/Assistant
   critic_adapter: null
 
   # 训练输出 & rollouts 读取
