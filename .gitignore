@@ -183,7 +183,7 @@ wandb/
 experiments/ 
 history/
 results/
-runs/
+# runs/
 assets/
 
 # Data files (large datasets)
