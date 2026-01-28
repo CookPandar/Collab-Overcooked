@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -41,9 +42,15 @@ class TextTransition:
     done: float
     agent_index: int
     entropy: float
+    timestep: Optional[int] = None
     format_reward: float = 0.0
     validator_reward: float = 0.0
     process_reward: float = 0.0
+    # Reward breakdown (optional; depends on env/validator providing reward_breakdown)
+    # NOTE: `reward` is still the scalar used for RL updates; these fields are only for logging/analysis.
+    sequence_reward: float = 0.0
+    communication_reward: float = 0.0
+    breakdown_total_reward: float = 0.0
 
 
 @dataclass
@@ -266,14 +273,20 @@ class QwenLMActorCritic(nn.Module):
         adapter_name = self.actor_adapter_names.get(agent_index)
         with self._use_adapter(adapter_name):
             inputs = self._prepare_inputs(prompt)
-            gen_out = self.model.generate(
+            # Transformers requires `temperature` to be strictly positive whenever it is set.
+            # For deterministic/greedy decoding, set `do_sample=False` and do not pass
+            # temperature at all.
+            do_sample = self.temperature is not None and float(self.temperature) > 0.0
+            generate_kwargs: Dict[str, Any] = {
                 **inputs,
-                do_sample=True,
-                temperature=self.temperature,
-                max_new_tokens=self.max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
+                "do_sample": bool(do_sample),
+                "max_new_tokens": self.max_new_tokens,
+                "return_dict_in_generate": True,
+                "output_scores": True,
+            }
+            if do_sample:
+                generate_kwargs["temperature"] = float(self.temperature)
+            gen_out = self.model.generate(**generate_kwargs)
             full_seq = gen_out.sequences[0]
             prompt_len = inputs["input_ids"].shape[1]
             generated = full_seq[prompt_len:]
@@ -467,11 +480,26 @@ class MAPPOTrainer:
         trainer_cfg: Dict[str, Any],
         full_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.accelerator = Accelerator()
-        self.device = self.accelerator.device
         if full_config is None:
             raise ValueError("RL configs must provide the full YAML (with agents).")
         self.trainer_cfg = dict(trainer_cfg)
+
+        # Multi-adapter (multi-agent) LoRA setups naturally lead to some trainable adapter
+        # parameters being unused on a given rank/iteration (e.g., if a rank only sees
+        # agent0 samples in that step). Enable unused parameter detection in DDP to
+        # prevent "Expected to have finished reduction..." errors.
+        ddp_find_unused_default = bool(self.trainer_cfg.get("actor_adapters")) or bool(
+            self.trainer_cfg.get("critic_adapter")
+        )
+        ddp_find_unused = bool(
+            self.trainer_cfg.get(
+                "ddp_find_unused_parameters", ddp_find_unused_default
+            )
+        )
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=ddp_find_unused)
+        self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+        self.device = self.accelerator.device
+
         env_latest_file = os.getenv("RL_LATEST_MODEL_FILE", "").strip()
         cfg_latest_file = self.trainer_cfg.get("latest_model_path_file", "")
         latest_file = cfg_latest_file or env_latest_file
@@ -502,8 +530,15 @@ class MAPPOTrainer:
         self.snapshot_cycle = bool(trainer_cfg.get("snapshot_cycle", True))
         self._snapshot_cursor = 0
 
-        self.gamma = trainer_cfg.get("gamma", 0.99)
-        self.gae_lambda = trainer_cfg.get("gae_lambda", 0.95)
+        self.gamma = float(trainer_cfg.get("gamma", 0.99))
+        # Optional: discount within a single env timestep across multiple LLM calls,
+        # while preventing the number of calls in a timestep from amplifying discount
+        # across timesteps (see `discount_reset_per_timestep`).
+        self.gamma_call = float(trainer_cfg.get("gamma_call", self.gamma))
+        self.discount_reset_per_timestep = bool(
+            trainer_cfg.get("discount_reset_per_timestep", False)
+        )
+        self.gae_lambda = float(trainer_cfg.get("gae_lambda", 0.95))
         self.steps_per_update = trainer_cfg.get("steps_per_update", 256)
         self.local_steps_per_update = max(
             1, math.ceil(self.steps_per_update / self.accelerator.num_processes)
@@ -569,6 +604,42 @@ class MAPPOTrainer:
         else:
             self.session = None
         self.buffer = TextRolloutBuffer()
+        self._last_rollout_stats: Dict[str, Any] = {}
+
+    def _reset_rollout_stats(self):
+        self._last_rollout_stats = {
+            "env_steps": 0,
+            "episodes_completed": 0,
+            "success_episodes": 0,
+            "env_reward_sum": 0.0,
+            "positive_reward_steps": 0,
+            "policy_calls": 0,
+            "episode_return_sum": 0.0,
+            "episode_lengths_sum": 0,
+        }
+        self._current_episode_return = 0.0
+        self._current_episode_length = 0
+        self._current_episode_has_positive = False
+
+    def _update_rollout_stats(self, step_reward: float, done: bool, policy_calls: int):
+        stats = self._last_rollout_stats
+        stats["env_steps"] += 1
+        stats["env_reward_sum"] += float(step_reward)
+        stats["policy_calls"] += int(policy_calls)
+        if float(step_reward) > 0:
+            stats["positive_reward_steps"] += 1
+            self._current_episode_has_positive = True
+        self._current_episode_return += float(step_reward)
+        self._current_episode_length += 1
+        if done:
+            stats["episodes_completed"] += 1
+            if self._current_episode_has_positive:
+                stats["success_episodes"] += 1
+            stats["episode_return_sum"] += float(self._current_episode_return)
+            stats["episode_lengths_sum"] += int(self._current_episode_length)
+            self._current_episode_return = 0.0
+            self._current_episode_length = 0
+            self._current_episode_has_positive = False
 
     def _extract_agent_roles(self, agents_cfg: Dict[str, Any]) -> Dict[int, str]:
         roles: Dict[int, str] = {}
@@ -871,7 +942,9 @@ class MAPPOTrainer:
         if self.collect_only:
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
             for update_idx in range(1, self.total_updates + 1):
+                self._reset_rollout_stats()
                 self.collect_rollout()
+                self.log_performance(update_idx)
                 self.log_rewards(update_idx, self.buffer.storage)
                 self.save_rollout(self.buffer.storage, update_idx)
                 self.buffer.clear()
@@ -899,7 +972,9 @@ class MAPPOTrainer:
             return
 
         for update_idx in range(1, self.total_updates + 1):
+            self._reset_rollout_stats()
             self.collect_rollout()
+            self.log_performance(update_idx)
             self.log_rewards(update_idx, self.buffer.storage)
             loss_dict = self.update_policy(self.buffer.storage)
 
@@ -943,13 +1018,16 @@ class MAPPOTrainer:
             seq_reward = float(
                 breakdown.get("sequence_reward", raw_entry.get("sequence_reward", 0.0) or 0.0)
             )
-            if "communication_reward" in breakdown:
-                process_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
-            else:
-                process_reward = float(
-                    raw_entry.get("total", seq_reward + fmt_reward + validator_reward)
-                    or (seq_reward + fmt_reward + validator_reward)
-                )
+            communication_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
+            breakdown_total_reward = float(
+                raw_entry.get("total", seq_reward + fmt_reward + validator_reward)
+                or (seq_reward + fmt_reward + validator_reward)
+            )
+            # Back-compat: historically we logged `process_reward` as either communication_reward
+            # (if present) or the breakdown total; keep that behavior so old rollouts still load.
+            process_reward = (
+                communication_reward if "communication_reward" in breakdown else breakdown_total_reward
+            )
             self.buffer.add(
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
@@ -959,9 +1037,13 @@ class MAPPOTrainer:
                 done=done,
                 agent_index=record.agent_index,
                 entropy=meta.get("entropy", 0.0),
+                timestep=getattr(record, "timestep", None),
                 format_reward=fmt_reward,
                 validator_reward=validator_reward,
                 process_reward=process_reward,
+                sequence_reward=seq_reward,
+                communication_reward=communication_reward,
+                breakdown_total_reward=breakdown_total_reward,
             )
             added += 1
         return added
@@ -975,6 +1057,11 @@ class MAPPOTrainer:
         while step_count < local_target:
             step_result = self.session.step()
             records = step_result.policy_records or []
+            self._update_rollout_stats(
+                step_reward=step_result.reward,
+                done=bool(step_result.done),
+                policy_calls=len(records),
+            )
             if (
                 self.max_records_per_step
                 and len(records) > self.max_records_per_step
@@ -1017,6 +1104,11 @@ class MAPPOTrainer:
                 continue
             step_result = self.session.step()
             records = step_result.policy_records or []
+            self._update_rollout_stats(
+                step_reward=step_result.reward,
+                done=bool(step_result.done),
+                policy_calls=len(records),
+            )
             if (
                 self.max_records_per_step
                 and len(records) > self.max_records_per_step
@@ -1040,13 +1132,57 @@ class MAPPOTrainer:
         rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32)
         values = torch.tensor([t.value for t in transitions], dtype=torch.float32)
         dones = torch.tensor([t.done for t in transitions], dtype=torch.float32)
+
+        # Default: standard per-transition discounting (gamma applies on every LLM call).
+        if not self.discount_reset_per_timestep:
+            advantages = torch.zeros_like(rewards)
+            gae = 0.0
+            for idx in reversed(range(len(rewards))):
+                next_value = values[idx + 1] if idx + 1 < len(values) else 0.0
+                delta = (
+                    rewards[idx]
+                    + self.gamma * next_value * (1 - dones[idx])
+                    - values[idx]
+                )
+                gae = delta + self.gamma * self.gae_lambda * (1 - dones[idx]) * gae
+                advantages[idx] = gae
+            returns = advantages + values
+            return advantages, returns
+
+        # Special: per-call returns/advantages, but with a "reset" at env timestep boundaries.
+        #
+        # We still compute a return for *every LLM call* (every transition). The only change is
+        # that we use a different discount when moving from the last call of a timestep to the
+        # first call of the next timestep:
+        #   - within the same env timestep: use gamma_call
+        #   - across env timesteps: use gamma (so the number of calls in a timestep does not
+        #     amplify discounting across timesteps)
+        timesteps: List[int] = [
+            int(t.timestep) if t.timestep is not None else -1 for t in transitions
+        ]
+        n = len(transitions)
+        gammas: List[float] = []
+        for i in range(n):
+            if i + 1 >= n:
+                gammas.append(self.gamma)
+            elif timesteps[i] == timesteps[i + 1]:
+                gammas.append(self.gamma_call)
+            else:
+                gammas.append(self.gamma)
+
         advantages = torch.zeros_like(rewards)
         gae = 0.0
-        for idx in reversed(range(len(rewards))):
-            next_value = values[idx + 1] if idx + 1 < len(values) else 0.0
-            delta = rewards[idx] + self.gamma * next_value * (1 - dones[idx]) - values[idx]
-            gae = delta + self.gamma * self.gae_lambda * (1 - dones[idx]) * gae
+        for idx in reversed(range(n)):
+            gamma_t = float(gammas[idx])
+            next_value = values[idx + 1] if idx + 1 < n else 0.0
+            delta = (
+                rewards[idx]
+                + gamma_t * next_value * (1 - dones[idx])
+                - values[idx]
+            )
+            gae = delta + gamma_t * self.gae_lambda * (1 - dones[idx]) * gae
             advantages[idx] = gae
+
         returns = advantages + values
         return advantages, returns
 
@@ -1127,22 +1263,49 @@ class MAPPOTrainer:
             return
         num = len(transitions)
         agent_stats: Dict[int, Dict[str, float]] = {}
+        agent_counts: Dict[int, int] = {}
         for t in transitions:
             idx = int(t.agent_index)
             stats = agent_stats.setdefault(
                 idx,
-                {"format": 0.0, "validator": 0.0, "process": 0.0},
+                {
+                    "rl": 0.0,
+                    "format": 0.0,
+                    "validator": 0.0,
+                    "sequence": 0.0,
+                    "comm": 0.0,
+                    "breakdown_total": 0.0,
+                    "legacy_process": 0.0,
+                },
             )
+            agent_counts[idx] = agent_counts.get(idx, 0) + 1
+            stats["rl"] += float(getattr(t, "reward", 0.0))
             stats["format"] += float(getattr(t, "format_reward", 0.0))
             stats["validator"] += float(getattr(t, "validator_reward", 0.0))
-            stats["process"] += float(getattr(t, "process_reward", getattr(t, "reward", 0.0)))
+            stats["sequence"] += float(getattr(t, "sequence_reward", 0.0))
+            stats["comm"] += float(getattr(t, "communication_reward", 0.0))
+            stats["breakdown_total"] += float(getattr(t, "breakdown_total_reward", 0.0))
+            stats["legacy_process"] += float(getattr(t, "process_reward", getattr(t, "reward", 0.0)))
         # 近似步数：以 steps_per_update 为步长
         step_est = (update_idx - 1) * self.steps_per_update + num
         log_path = self.output_dir / "reward_curve.csv"
         header = (
             "update_idx,step,num_transitions,"
-            "agent0_format,agent0_validator,agent0_process,"
-            "agent1_format,agent1_validator,agent1_process"
+            "agent0_n,agent1_n,"
+            "agent0_rl_sum,agent0_rl_mean,"
+            "agent0_format_sum,agent0_format_mean,"
+            "agent0_validator_sum,agent0_validator_mean,"
+            "agent0_sequence_sum,agent0_sequence_mean,"
+            "agent0_comm_sum,agent0_comm_mean,"
+            "agent0_breakdown_total_sum,agent0_breakdown_total_mean,"
+            "agent0_legacy_process_sum,agent0_legacy_process_mean,"
+            "agent1_rl_sum,agent1_rl_mean,"
+            "agent1_format_sum,agent1_format_mean,"
+            "agent1_validator_sum,agent1_validator_mean,"
+            "agent1_sequence_sum,agent1_sequence_mean,"
+            "agent1_comm_sum,agent1_comm_mean,"
+            "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
+            "agent1_legacy_process_sum,agent1_legacy_process_mean"
         )
         if not log_path.exists():
             log_path.write_text(header + "\n", encoding="utf-8")
@@ -1159,13 +1322,175 @@ class MAPPOTrainer:
                 except OSError:
                     pass
                 log_path.write_text(header + "\n", encoding="utf-8")
-        a0_stats = agent_stats.get(0, {"format": 0.0, "validator": 0.0, "process": 0.0})
-        a1_stats = agent_stats.get(1, {"format": 0.0, "validator": 0.0, "process": 0.0})
+        a0_stats = agent_stats.get(
+            0,
+            {
+                "rl": 0.0,
+                "format": 0.0,
+                "validator": 0.0,
+                "sequence": 0.0,
+                "comm": 0.0,
+                "breakdown_total": 0.0,
+                "legacy_process": 0.0,
+            },
+        )
+        a1_stats = agent_stats.get(
+            1,
+            {
+                "rl": 0.0,
+                "format": 0.0,
+                "validator": 0.0,
+                "sequence": 0.0,
+                "comm": 0.0,
+                "breakdown_total": 0.0,
+                "legacy_process": 0.0,
+            },
+        )
+        a0_n = int(agent_counts.get(0, 0))
+        a1_n = int(agent_counts.get(1, 0))
+
+        def _mean(total: float, n: int) -> float:
+            return float(total) / float(n) if n > 0 else 0.0
+
         with log_path.open("a", encoding="utf-8") as f:
             f.write(
                 f"{update_idx},{step_est},{num},"
-                f"{a0_stats['format']},{a0_stats['validator']},{a0_stats['process']},"
-                f"{a1_stats['format']},{a1_stats['validator']},{a1_stats['process']}\n"
+                f"{a0_n},{a1_n},"
+                f"{a0_stats['rl']},{_mean(a0_stats['rl'], a0_n)},"
+                f"{a0_stats['format']},{_mean(a0_stats['format'], a0_n)},"
+                f"{a0_stats['validator']},{_mean(a0_stats['validator'], a0_n)},"
+                f"{a0_stats['sequence']},{_mean(a0_stats['sequence'], a0_n)},"
+                f"{a0_stats['comm']},{_mean(a0_stats['comm'], a0_n)},"
+                f"{a0_stats['breakdown_total']},{_mean(a0_stats['breakdown_total'], a0_n)},"
+                f"{a0_stats['legacy_process']},{_mean(a0_stats['legacy_process'], a0_n)},"
+                f"{a1_stats['rl']},{_mean(a1_stats['rl'], a1_n)},"
+                f"{a1_stats['format']},{_mean(a1_stats['format'], a1_n)},"
+                f"{a1_stats['validator']},{_mean(a1_stats['validator'], a1_n)},"
+                f"{a1_stats['sequence']},{_mean(a1_stats['sequence'], a1_n)},"
+                f"{a1_stats['comm']},{_mean(a1_stats['comm'], a1_n)},"
+                f"{a1_stats['breakdown_total']},{_mean(a1_stats['breakdown_total'], a1_n)},"
+                f"{a1_stats['legacy_process']},{_mean(a1_stats['legacy_process'], a1_n)}\n"
+            )
+
+    def log_performance(self, update_idx: int):
+        """Log environment-level performance metrics (traditional RL curves)."""
+        stats = dict(self._last_rollout_stats or {})
+        env_steps_local = float(stats.get("env_steps", 0) or 0)
+        episodes_local = float(stats.get("episodes_completed", 0) or 0)
+        successes_local = float(stats.get("success_episodes", 0) or 0)
+        env_reward_sum_local = float(stats.get("env_reward_sum", 0.0) or 0.0)
+        pos_steps_local = float(stats.get("positive_reward_steps", 0) or 0)
+        policy_calls_local = float(stats.get("policy_calls", 0) or 0)
+        ep_return_sum_local = float(stats.get("episode_return_sum", 0.0) or 0.0)
+        ep_len_sum_local = float(stats.get("episode_lengths_sum", 0) or 0)
+
+        # Aggregate across ranks so curves reflect full multi-proc sampling throughput.
+        packed = torch.tensor(
+            [
+                env_steps_local,
+                episodes_local,
+                successes_local,
+                env_reward_sum_local,
+                pos_steps_local,
+                policy_calls_local,
+                ep_return_sum_local,
+                ep_len_sum_local,
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        # NOTE: `accelerator.gather` has different shape semantics across versions:
+        # - Some return [world_size, N]
+        # - Some return [world_size * N] for 1D inputs
+        # We normalize to a length-N vector then sum across ranks.
+        summed = None
+        try:
+            # Prefer reduce if available (stable shape, cheaper than gather).
+            if hasattr(self.accelerator, "reduce"):
+                summed = self.accelerator.reduce(packed, reduction="sum")
+        except Exception:
+            summed = None
+        if summed is None:
+            gathered = self.accelerator.gather(packed)
+            if gathered.ndim == 2 and gathered.shape[-1] == packed.numel():
+                summed = gathered.sum(dim=0)
+            elif gathered.ndim == 1 and gathered.numel() == packed.numel():
+                summed = gathered
+            elif gathered.ndim == 1 and gathered.numel() % packed.numel() == 0:
+                world = int(gathered.numel() // packed.numel())
+                summed = gathered.view(world, packed.numel()).sum(dim=0)
+            else:
+                raise ValueError(
+                    f"Unexpected gathered stats shape {tuple(gathered.shape)} for packed {tuple(packed.shape)}"
+                )
+        (
+            env_steps_f,
+            episodes_f,
+            successes_f,
+            env_reward_sum,
+            pos_steps_f,
+            policy_calls_f,
+            ep_return_sum,
+            ep_len_sum_f,
+        ) = [float(x) for x in summed.tolist()]
+        env_steps = int(env_steps_f)
+        episodes = int(episodes_f)
+        successes = int(successes_f)
+        pos_steps = int(pos_steps_f)
+        policy_calls = int(policy_calls_f)
+        ep_len_sum = int(ep_len_sum_f)
+
+        avg_step_reward = env_reward_sum / env_steps if env_steps > 0 else 0.0
+        avg_calls_per_step = policy_calls / env_steps if env_steps > 0 else 0.0
+        avg_episode_return = ep_return_sum / episodes if episodes > 0 else 0.0
+        avg_episode_len = ep_len_sum / episodes if episodes > 0 else 0.0
+        success_rate = successes / episodes if episodes > 0 else 0.0
+
+        # If available, attach the training update index of the currently loaded model
+        # (useful when evaluation runs are launched separately and local update_idx resets).
+        model_update_idx = None
+        if self.latest_model_path_file and self.latest_model_path_file.exists():
+            try:
+                raw = self.latest_model_path_file.read_text(encoding="utf-8").strip()
+                parsed = json.loads(raw) if raw else None
+                if isinstance(parsed, dict) and parsed.get("update_idx") is not None:
+                    model_update_idx = int(parsed["update_idx"])
+            except Exception:
+                model_update_idx = None
+        # All ranks should rendezvous before main writes, to keep logging aligned.
+        self.accelerator.wait_for_everyone()
+        if not self.accelerator.is_main_process:
+            return
+
+        path = self.output_dir / "performance_curve.csv"
+        header = (
+            "update_idx,model_update_idx,env_steps,episodes_completed,success_episodes,success_rate,"
+            "env_reward_sum,avg_step_reward,positive_reward_steps,"
+            "policy_calls,avg_calls_per_step,"
+            "episode_return_sum,avg_episode_return,avg_episode_len"
+        )
+        if not path.exists():
+            path.write_text(header + "\n", encoding="utf-8")
+        else:
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+            except OSError:
+                first_line = ""
+            if first_line != header:
+                # Don't overwrite existing logs; start fresh if schema mismatch.
+                backup = path.with_suffix(path.suffix + ".bak")
+                try:
+                    path.replace(backup)
+                except OSError:
+                    pass
+                path.write_text(header + "\n", encoding="utf-8")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{update_idx},{'' if model_update_idx is None else model_update_idx},{env_steps},{episodes},{successes},{success_rate},"
+                f"{env_reward_sum},{avg_step_reward},{pos_steps},"
+                f"{policy_calls},{avg_calls_per_step},"
+                f"{ep_return_sum},{avg_episode_return},{avg_episode_len}\n"
             )
 
     # ------------------------------------------------------------------
@@ -1290,9 +1615,13 @@ class MAPPOTrainer:
             "done": t.done,
             "agent_index": t.agent_index,
             "entropy": t.entropy,
+            "timestep": t.timestep,
             "format_reward": t.format_reward,
             "validator_reward": t.validator_reward,
             "process_reward": t.process_reward,
+            "sequence_reward": t.sequence_reward,
+            "communication_reward": t.communication_reward,
+            "breakdown_total_reward": t.breakdown_total_reward,
         }
 
     def _dict_to_transition(self, d: Dict[str, Any]) -> TextTransition:
@@ -1305,9 +1634,18 @@ class MAPPOTrainer:
             done=float(d["done"]),
             agent_index=int(d["agent_index"]),
             entropy=float(d["entropy"]),
+            timestep=int(d["timestep"]) if d.get("timestep") is not None else None,
             format_reward=float(d.get("format_reward", 0.0)),
             validator_reward=float(d.get("validator_reward", 0.0)),
             process_reward=float(d.get("process_reward", d.get("reward", 0.0))),
+            sequence_reward=float(d.get("sequence_reward", 0.0)),
+            communication_reward=float(d.get("communication_reward", 0.0)),
+            breakdown_total_reward=float(
+                d.get(
+                    "breakdown_total_reward",
+                    d.get("raw_total_reward", 0.0),  # legacy fallback if present
+                )
+            ),
         )
 
     def save_rollout(self, transitions: List[TextTransition], update_idx: int):

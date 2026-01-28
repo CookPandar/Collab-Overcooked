@@ -434,7 +434,8 @@ class CollabMainSession:
                     seq_reward = float(reward_entry.get("sequence_reward", 0.0))
                     fmt_reward = float(reward_entry.get("format_reward", 0.0))
                     validator_reward = float(reward_entry.get("validator_reward", 0.0))
-                    record.reward = seq_reward + fmt_reward
+                    # RL scalar reward: include validator penalties as part of the training signal.
+                    record.reward = seq_reward + fmt_reward + validator_reward
                     breakdown = {
                         "sequence_reward": seq_reward,
                         "format_reward": fmt_reward,
