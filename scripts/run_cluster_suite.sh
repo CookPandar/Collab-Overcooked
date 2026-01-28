@@ -132,7 +132,7 @@ start_vllm() {
             --port "$port" \
             --gpu-memory-utilization "$GPU_MEM" \
             --served-model-name "$model" \
-            --data-parallel-size "${tp:-1}" \
+            --tensor-parallel-size "${tp:-1}" \
             --max-model-len 8192 \
             --dtype auto \
             --api-key "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM" \
@@ -145,7 +145,7 @@ start_vllm() {
             --port "$port" \
             --gpu-memory-utilization "$GPU_MEM" \
             --served-model-name "$model" \
-            --data-parallel-size "${tp:-1}" \
+            --tensor-parallel-size "${tp:-1}" \
             --max-model-len 8192 \
             --dtype auto \
             --api-key "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJHbW9oUjdNTTQ0cGpQTmIwZ2tKTjFIZ1J2bkJkcjdxQSJ9.0xbuBWNX5wKkvLrQTPo5xFMQ1t1-2MNIURnNQ4Q4KQM" \
