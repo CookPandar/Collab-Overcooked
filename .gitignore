@@ -200,3 +200,4 @@ src/batch_run.sh
 # Temporary debug scripts
 scripts/run_debug_main.py
 configs/rl_qwen_train.yaml
+runs/*
