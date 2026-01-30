@@ -225,16 +225,21 @@ class QwenLMActorCritic(nn.Module):
 
     def _attach_adapter(self, spec: AdapterSpec, base_model):
         if spec.lora_path:
+            lora_path = Path(spec.lora_path)
+            if lora_path.is_dir() and not (lora_path / "adapter_config.json").exists():
+                candidate = lora_path / spec.name
+                if (candidate / "adapter_config.json").exists():
+                    lora_path = candidate
             if isinstance(base_model, PeftModel):
                 base_model.load_adapter(
-                    spec.lora_path,
+                    str(lora_path),
                     adapter_name=spec.name,
                     is_trainable=True,
                 )
             else:
                 base_model = PeftModel.from_pretrained(
                     base_model,
-                    spec.lora_path,
+                    str(lora_path),
                     adapter_name=spec.name,
                     is_trainable=True,
                 )
@@ -512,6 +517,10 @@ class MAPPOTrainer:
         self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", False))
         self.agents_cfg = full_config.get("agents", {})
         self.agent_roles = self._extract_agent_roles(self.agents_cfg)
+
+        if self.latest_model_path_file and self.latest_model_path_file.exists():
+            self._apply_model_override_from_file(self.trainer_cfg)
+
         self.actor_adapters: Dict[int, AdapterSpec] = self._build_actor_specs(
             self.trainer_cfg, self.agents_cfg
         )
@@ -540,6 +549,10 @@ class MAPPOTrainer:
         )
         self.gae_lambda = float(trainer_cfg.get("gae_lambda", 0.95))
         self.steps_per_update = trainer_cfg.get("steps_per_update", 256)
+        horizon_cfg = env_config.get("horizon", 10)
+        self.rollout_horizon = (
+            int(horizon_cfg) if horizon_cfg is not None else None
+        )
         self.local_steps_per_update = max(
             1, math.ceil(self.steps_per_update / self.accelerator.num_processes)
         )
@@ -552,9 +565,6 @@ class MAPPOTrainer:
         self.model_path = trainer_cfg["model_path"]
         self.lora_cfg = trainer_cfg.get("lora", {})
         self.lora_path = trainer_cfg.get("lora_path", None)
-
-        if self.latest_model_path_file and self.latest_model_path_file.exists():
-            self._apply_model_override_from_file(self.trainer_cfg)
 
         self.output_dir = Path(
             trainer_cfg.get(
@@ -605,6 +615,15 @@ class MAPPOTrainer:
             self.session = None
         self.buffer = TextRolloutBuffer()
         self._last_rollout_stats: Dict[str, Any] = {}
+        self._current_update_idx: Optional[int] = None
+        self._episode_counter = 0
+        self._episode_log_path: Optional[Path] = None
+
+        if self.output_dir:
+            self._episode_log_path = (
+                self.output_dir
+                / f"episode_return_curve_rank{self.accelerator.process_index}.csv"
+            )
 
     def _reset_rollout_stats(self):
         self._last_rollout_stats = {
@@ -620,6 +639,22 @@ class MAPPOTrainer:
         self._current_episode_return = 0.0
         self._current_episode_length = 0
         self._current_episode_has_positive = False
+
+    def _log_episode_return(self, episode_return: float, episode_len: int, had_positive: bool):
+        if not self._episode_log_path:
+            return
+        header = "update_idx,episode_idx,episode_return,episode_len,had_positive,rank\n"
+        if not self._episode_log_path.exists():
+            self._episode_log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._episode_log_path.write_text(header, encoding="utf-8")
+        update_idx = self._current_update_idx if self._current_update_idx is not None else -1
+        rank = self.accelerator.process_index
+        self._episode_counter += 1
+        with self._episode_log_path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{update_idx},{self._episode_counter},{episode_return},"
+                f"{episode_len},{1 if had_positive else 0},{rank}\n"
+            )
 
     def _update_rollout_stats(self, step_reward: float, done: bool, policy_calls: int):
         stats = self._last_rollout_stats
@@ -637,9 +672,26 @@ class MAPPOTrainer:
                 stats["success_episodes"] += 1
             stats["episode_return_sum"] += float(self._current_episode_return)
             stats["episode_lengths_sum"] += int(self._current_episode_length)
+            self._log_episode_return(
+                episode_return=self._current_episode_return,
+                episode_len=self._current_episode_length,
+                had_positive=self._current_episode_has_positive,
+            )
             self._current_episode_return = 0.0
             self._current_episode_length = 0
             self._current_episode_has_positive = False
+
+    def _rollout_reached_horizon(self, step_result: SessionStep) -> bool:
+        if self.rollout_horizon is None:
+            return False
+        timestep = None
+        if isinstance(step_result.observation, dict):
+            timestep = step_result.observation.get("timestep")
+        if timestep is None:
+            timestep = getattr(step_result, "timestep", None)
+        if timestep is None:
+            return False
+        return int(timestep) >= self.rollout_horizon
 
     def _extract_agent_roles(self, agents_cfg: Dict[str, Any]) -> Dict[int, str]:
         roles: Dict[int, str] = {}
@@ -865,8 +917,9 @@ class MAPPOTrainer:
         if override:
             if override.get("model_path"):
                 cfg["model_path"] = override["model_path"]
-            if "lora_path" in override:
-                cfg["lora_path"] = override["lora_path"]
+            lora_path = override.get("lora_path")
+            if lora_path:
+                cfg["lora_path"] = lora_path
 
             # Multi-adapter override: patch per-agent adapter paths when present.
             actor_override = override.get("actor_adapters")
@@ -942,6 +995,7 @@ class MAPPOTrainer:
         if self.collect_only:
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
             for update_idx in range(1, self.total_updates + 1):
+                self._current_update_idx = update_idx
                 self._reset_rollout_stats()
                 self.collect_rollout()
                 self.log_performance(update_idx)
@@ -972,6 +1026,7 @@ class MAPPOTrainer:
             return
 
         for update_idx in range(1, self.total_updates + 1):
+            self._current_update_idx = update_idx
             self._reset_rollout_stats()
             self.collect_rollout()
             self.log_performance(update_idx)
@@ -1081,6 +1136,10 @@ class MAPPOTrainer:
                 step_count += 1
             else:
                 step_count += added
+            if self._rollout_reached_horizon(step_result):
+                if not step_result.done:
+                    self.session.reset()
+                break
 
     def _collect_snapshot_rollout(self):
         if self.session is None:
@@ -1101,6 +1160,12 @@ class MAPPOTrainer:
             except Exception as exc:
                 if self.accelerator.is_main_process:
                     self.accelerator.print(f"[MAPPO] Failed to load snapshot: {exc}")
+                continue
+            if self.rollout_horizon is not None:
+                snapshot_ts = getattr(self.session.env.state, "timestep", None)
+                if snapshot_ts is not None and int(snapshot_ts) >= self.rollout_horizon:
+                    break
+            if self.session.env.is_done():
                 continue
             step_result = self.session.step()
             records = step_result.policy_records or []
@@ -1126,6 +1191,8 @@ class MAPPOTrainer:
                 step_count += 1
             else:
                 step_count += added
+            if self._rollout_reached_horizon(step_result):
+                break
 
     # ------------------------------------------------------------------
     def compute_advantages(self, transitions: List[TextTransition]):

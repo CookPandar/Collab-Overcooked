@@ -20,6 +20,19 @@ Examples:
     --input results/mappo_boiled_egg/reward_curve.csv \
     --output results/mappo_boiled_egg/reward_curve_all.png \
     --all-segments
+
+  # Plot cumulative reward (running sum within each segment)
+  python scripts/plot_rl_reward_curve.py \
+    --input results/mappo_boiled_egg/reward_curve.csv \
+    --output results/mappo_boiled_egg/reward_curve_cumsum.png \
+    --metric sum \
+    --cumulative
+
+  # Plot per-episode return when each update is exactly one episode
+  python scripts/plot_rl_reward_curve.py \
+    --input results/mappo_boiled_egg/reward_curve.csv \
+    --output results/mappo_boiled_egg/episode_return.png \
+    --episode
 """
 
 from __future__ import annotations
@@ -45,6 +58,9 @@ class Row:
     agent1: Dict[str, float] = field(default_factory=dict)
 
 
+DEFAULT_LINES = "format,validator,sequence,comm,total"
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Plot RL reward_curve.csv (per-agent).")
     p.add_argument("--input", type=Path, required=True, help="Path to reward_curve.csv")
@@ -65,6 +81,19 @@ def parse_args() -> argparse.Namespace:
         choices=["mean", "sum"],
         default="mean",
         help="Plot per-transition means or sums (default: mean).",
+    )
+    p.add_argument(
+        "--episode",
+        action="store_true",
+        help=(
+            "Treat each row as one episode (use sum metrics and label as episode return). "
+            "This is only valid when each update contains exactly one episode."
+        ),
+    )
+    p.add_argument(
+        "--cumulative",
+        action="store_true",
+        help="Plot cumulative (running-sum) reward within each segment.",
     )
     p.add_argument(
         "--lines",
@@ -277,7 +306,25 @@ def _select_series(agent: Dict[str, float], components: Sequence[str], metric: s
     del include_total
     return {}
 
-def plot(rows: List[Row], output: Path, x_mode: str, include_total: bool, metric: str, lines: List[str]) -> None:
+def _cumsum(values: Sequence[float]) -> List[float]:
+    total = 0.0
+    out: List[float] = []
+    for v in values:
+        total += float(v)
+        out.append(total)
+    return out
+
+
+def plot(
+    rows: List[Row],
+    output: Path,
+    x_mode: str,
+    include_total: bool,
+    metric: str,
+    lines: List[str],
+    cumulative: bool,
+    episode_mode: bool,
+) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -327,6 +374,8 @@ def plot(rows: List[Row], output: Path, x_mode: str, include_total: bool, metric
             ys = agent_series
 
             for label, series in ys.items():
+                if cumulative:
+                    series = _cumsum(series)
                 lw = 2.0 if label == "total" else 1.2
                 a = min(1.0, alpha + (0.15 if label == "total" else 0.0))
                 ax.plot(x0, series, label=label if first else None, linewidth=lw, alpha=a)
@@ -337,8 +386,12 @@ def plot(rows: List[Row], output: Path, x_mode: str, include_total: bool, metric
     axes[1].set_title("agent1")
     axes[1].set_xlabel(x_mode)
     axes[0].legend(loc="upper right", frameon=False)
-    axes[0].set_ylabel(f"reward ({metric})")
-    axes[1].set_ylabel(f"reward ({metric})")
+    if episode_mode:
+        suffix = "episode return (cumulative)" if cumulative else "episode return"
+    else:
+        suffix = "cumulative" if cumulative else metric
+    axes[0].set_ylabel(f"reward ({suffix})")
+    axes[1].set_ylabel(f"reward ({suffix})")
 
     plt.tight_layout()
     plt.savefig(output, dpi=160)
@@ -352,9 +405,16 @@ def main() -> None:
         raise SystemExit(f"未在 {args.input} 中解析到有效数据行。")
     rows = pick_segment(rows, all_segments=args.all_segments)
     rows = downsample(rows, max_points=args.max_points)
-    lines = _parse_lines(args.lines)
+    lines_spec = args.lines
+    x_mode = args.x
+    metric = args.metric
+    if args.episode:
+        metric = "sum"
+        if lines_spec == DEFAULT_LINES:
+            lines_spec = "rl"
+    lines = _parse_lines(lines_spec)
     # If legacy schema (no *_mean), forcing mean would produce empty lines; fall back to sum.
-    if args.metric == "mean":
+    if metric == "mean":
         has_any_mean = any(
             (("format_mean" in r.agent0) and (r.agent0.get("format_mean") not in (None, 0.0)))
             or (("format_mean" in r.agent1) and (r.agent1.get("format_mean") not in (None, 0.0)))
@@ -363,7 +423,16 @@ def main() -> None:
         metric = "mean" if has_any_mean else "sum"
     else:
         metric = "sum"
-    plot(rows, args.output, x_mode=args.x, include_total=(not args.no_total), metric=metric, lines=lines)
+    plot(
+        rows,
+        args.output,
+        x_mode=x_mode,
+        include_total=(not args.no_total),
+        metric=metric,
+        lines=lines,
+        cumulative=args.cumulative,
+        episode_mode=args.episode,
+    )
     print(f"[plot] Saved: {args.output}")
 
 

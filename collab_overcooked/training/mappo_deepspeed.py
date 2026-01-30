@@ -390,6 +390,10 @@ class DeepSpeedMAPPOTrainer:
         self.gamma = trainer_cfg.get("gamma", 0.99)
         self.gae_lambda = trainer_cfg.get("gae_lambda", 0.95)
         self.steps_per_update = trainer_cfg.get("steps_per_update", 256)
+        horizon_cfg = env_config.get("horizon", 10)
+        self.rollout_horizon = (
+            int(horizon_cfg) if horizon_cfg is not None else None
+        )
         self.local_steps_per_update = max(
             1, math.ceil(self.steps_per_update / max(1, self.world_size))
         )
@@ -437,6 +441,19 @@ class DeepSpeedMAPPOTrainer:
             self.session = None
 
         self.buffer = TextRolloutBuffer()
+
+    # ------------------------------------------------------------------
+    def _rollout_reached_horizon(self, step_result: SessionStep) -> bool:
+        if self.rollout_horizon is None:
+            return False
+        timestep = None
+        if isinstance(step_result.observation, dict):
+            timestep = step_result.observation.get("timestep")
+        if timestep is None:
+            timestep = getattr(step_result, "timestep", None)
+        if timestep is None:
+            return False
+        return int(timestep) >= self.rollout_horizon
 
     # ------------------------------------------------------------------
     def _policy_call(self, agent_index: int, messages, context):
@@ -555,6 +572,10 @@ class DeepSpeedMAPPOTrainer:
                 self.session.reset()
             if not step_result.policy_records:
                 step_count += 1
+            if self._rollout_reached_horizon(step_result):
+                if not step_result.done:
+                    self.session.reset()
+                break
         self._sync_barrier()
 
     # ------------------------------------------------------------------

@@ -1,27 +1,27 @@
 environment:
   order: baked_bell_pepper   
-  horizon: 50
+  horizon: 16
 
 trainer:
   type: mappo
   collect_only: true
-  off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/snapshots/one_episode.jsonl
-  steps_per_update: 300
+  off_policy_snapshots: runs/rl/snapshots/one_episode.jsonl
+  steps_per_update: 200
   total_updates: 1
-  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b            # 共享基座
+  model_path: /datacache/LLMs/Qwen2.5-7B-Instruct            # 共享基座
   lora_path: null
   actor_adapters:
     agent_0:
       adapter_name: Chef
-      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/chef/20260107-222040/Chef      # Chef 初始 LoRA
+      lora_path: ./runs/Chef     # Chef 初始 LoRA
     agent_1:
       adapter_name: Assistant
-      lora_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/qwen2.5-sft-level12-gpt4o/assistant/20260107-221956/Assistant  # Assistant 初始 LoRA
+      lora_path: ./runs/Assistant   # Assistant 初始 LoRA
   critic_adapter: null
   latest_model_path_file: runs/rl/latest_model.json  # 采样前自动重载最新模型
   generation_temperature: 0.7              # 用温度做多样性
   evaluation_batch_size: 4
-  max_new_tokens: 4096
+  max_new_tokens: 512
   fix_mistral_regex: true
 
 

@@ -201,3 +201,12 @@ src/batch_run.sh
 scripts/run_debug_main.py
 configs/rl_qwen_train.yaml
 runs/*
+configs/rl_qwen_collect_snapshot.yaml
+configs/rl_qwen_collect.yaml
+configs/rl_qwen_eval.yaml
+configs/rl_qwen_train.yaml
+configs/rl_qwen_collect_snapshot.yaml
+configs/rl_qwen_collect.yaml
+configs/rl_qwen_train.yaml
+configs/rl_qwen_collect_snapshot.yaml
+configs/rl_qwen_collect_snapshot.yaml

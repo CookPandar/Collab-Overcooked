@@ -36,7 +36,7 @@ trainer:
   export_interval: 1
 
   # 生成相关
-  max_new_tokens: 4096
+  max_new_tokens: 512
   generation_temperature: 0.0
   evaluation_batch_size: 1
 
@@ -62,7 +62,7 @@ agents:
     base_url: "http://127.0.0.1:8000/v1"
     model_dirname: ""
     temperature: 0
-    max_tokens: 4096
+    max_tokens: 512
     timeout: 30
     max_retries: 3
     role: "Chef"
@@ -73,7 +73,7 @@ agents:
     base_url: "http://127.0.0.1:8001/v1"
     model_dirname: ""
     temperature: 0
-    max_tokens: 4096
+    max_tokens: 512
     timeout: 30
     max_retries: 3
     role: "Assistant"
