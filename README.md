@@ -197,6 +197,17 @@ python scripts/run_model_suite.py \
 
 3. **运行 RL 任务**
 
+    ```bash
+    export RL_COLLECT_CONFIG=configs/rl_qwen_collect_snapshot.yaml
+    export RL_TRAIN_CONFIG=configs/rl_qwen_train.yaml
+    export RL_EVAL_CONFIG=configs/rl_qwen_eval.yaml
+    export RL_LOOP_ROUNDS=1000
+    bash scripts/cluster_run_rl.sh /mnt/volumes/ss-sai-bd-ga/zhangshuwen/collab-overcooked
+    ```
+
+    `cluster_run_rl.sh` 会按 `collect -> train -> eval` 的顺序循环执行（任一阶段不设配置则自动跳过）。
+    当前基线配置使用共享基座模型 + 两个 LoRA actor 头，两个 LoRA 路径都在 `runs/` 目录下，通过 `trainer.actor_adapters.agent_0.lora_path` 和 `trainer.actor_adapters.agent_1.lora_path` 指定。
+
 ## 🧮 Reward Design
 
 Collab-Overcooked 的全过程奖励由 `ProcessRewardTracker` 统一管理，主要由以下几部分构成：
@@ -229,14 +240,6 @@ reward:
 ```
 
 这样既能保持与当前默认设置一致，也可以针对自研模型做更细粒度的训练和评估。
-
-    ```bash
-    RL_NUM_PROCS=8 \
-    bash scripts/cluster_run_rl.sh /mnt/shared/envs/collab_overcooked \
-      --config configs/examples/rl_qwen_baked_bell_pepper.yaml
-    ```
-
-    逻辑与 SFT 脚本相同，只是入口换成 `python -m collab_overcooked.main_rl`。
 
 4. **批量评测（会先在 vLLM 环境中托管推理服务，再调用 `run_model_suite.py`）**
 
@@ -274,7 +277,7 @@ bash scripts/run_cluster_suite.sh \
 | --- | --- | --- |
 | `scripts/cluster_env_setup.sh` | 在指定前缀创建/复用两个 conda 环境：`collab`（SFT/RL/批量脚本）与 `vllm`（仅托管推理服务）。 | 第 3 个参数可自定义 Python 版本，脚本会自动 `pip install -e .` 并拉取必要依赖。 |
 | `scripts/cluster_run_sft.sh` | 激活 `collab` 环境，并用 `accelerate launch` 运行 `scripts/train_qwen_sft.py`。 | 通过 `SFT_NUM_PROCS` / `SFT_ACCELERATE_ARGS` 控制 `accelerate` 行为。 |
-| `scripts/cluster_run_rl.sh` | 类似上面，但入口是 `python -m collab_overcooked.main_rl`。 | 支持 `RL_NUM_PROCS` / `RL_ACCELERATE_ARGS`。 |
+| `scripts/cluster_run_rl.sh` | 激活 `collab` 环境后运行 `python -m collab_overcooked.main_rl`，支持三阶段循环（collect/train/eval）。 | 推荐使用 `RL_COLLECT_CONFIG` / `RL_TRAIN_CONFIG` / `RL_EVAL_CONFIG` / `RL_LOOP_ROUNDS`；`RL_NUM_PROCS` 仅用于兼容旧单阶段用法。 |
 | `scripts/run_cluster_suite.sh` | 使用 `vllm` 环境启动 vLLM OpenAI API，再切到 `collab` 环境调用 `scripts/run_model_suite.py`。 | 传入模型路径、端口、`run_model_suite.py` 额外参数即可完成整套批量评测。 |
 | `scripts/run_evaluation.sh` | 执行旧版三段式评估 (`evaluation.py` → `organize_result.py` → `convert_result.py`) 并把结果放进 `results/`。 | 仅在需要兼容早期流程时使用。 |
 | `scripts/run_model_suite.py` | 新版多模型基准驱动，支持并发 worker、重复次数、温度网格等；推荐使用它跑日常评测。 | 既可单独调用，也可由 `run_cluster_suite.sh` 间接触发。 |
@@ -375,22 +378,25 @@ python scripts/train_qwen_sft.py \
 
 ### RL Baseline (MAPPO + Qwen2.5)
 
-我们提供 `python -m collab_overcooked.main_rl` 作为扩展入口：当配置文件包含 `trainer` 字段时，会自动切换到 MAPPO 训练流程，否则保持原有推理模式。例如：
+RL 入口为 `python -m collab_overcooked.main_rl`。当配置文件包含 `trainer` 字段时会进入 MAPPO 训练流程，否则保持普通推理模式。
+
+当前 RL 基线模型使用「共享基座 + 双 LoRA actor 头」：
+
+- `trainer.model_path`：共享基座模型（例如本地 Qwen2.5-7B）。
+- `trainer.actor_adapters.agent_0.lora_path`：Chef 的 LoRA 头（位于 `runs/.../Chef`）。
+- `trainer.actor_adapters.agent_1.lora_path`：Assistant 的 LoRA 头（位于 `runs/.../Assistant`）。
+
+在仓库现有流程中，推荐通过三阶段脚本启动 RL：
 
 ```bash
-python -m collab_overcooked.main_rl --config configs/examples/rl_qwen_baked_bell_pepper.yaml
+export RL_COLLECT_CONFIG=configs/rl_qwen_collect_snapshot.yaml
+export RL_TRAIN_CONFIG=configs/rl_qwen_train.yaml
+export RL_EVAL_CONFIG=configs/rl_qwen_eval.yaml
+export RL_LOOP_ROUNDS=1000
+bash scripts/cluster_run_rl.sh /mnt/volumes/ss-sai-bd-ga/zhangshuwen/collab-overcooked
 ```
 
-`trainer.model_path` 需要指向本地可用的 Hugging Face 检查点（如 Qwen2.5-7B-Instruct）；脚本会加载该模型作为共享的 actor-critic，对 Collab-Overcooked 奖励进行 RL 微调。
-
-RL 入口默认通过 `training/main_session.py` 复用 `collab_overcooked.main` 的真实 prompt / Think / Recent Goal / Action 流程。所有 planner 请求都会改由本地 HuggingFace 模型（`AutoModelForCausalLM`）生成，并在 PPO 更新时利用完整的 token 级 log-prob 与 value 估计，从而直接微调推理所用的 LLM。可额外指定 `trainer.max_new_tokens`、`trainer.generation_temperature` 等解码参数。
-
-根据 `trainer.type` 可选择不同的实现：
-
-- `mappo`（默认）：依赖 Accelerate/AdamW，在单 GPU 或数据并行模式下训练。
-- `mappo_deepspeed`：启用 DeepSpeed ZeRO +（可选）Tensor Parallel。配置中需提供 `trainer.deepspeed_config`，并使用 `deepspeed --num_gpus N python -m collab_overcooked.main_rl --config <yaml>` 启动。示例参考 `configs/examples/rl_qwen_deepspeed.yaml`。
-
-`trainer.output_dir` 用于指定权重与优化器状态的保存位置（默认写入 `results/mappo_<order>/` 或 `results/dsmappo_<order>/`）；每次训练结束都会把最终 checkpoint 存在 `<output_dir>/final/`，并可通过 `trainer.save_interval`（或 `trainer.checkpoint_interval`）设置按更新步数定期落盘。Accelerate 版本会调用 `Accelerator.save_state` 持久化，DeepSpeed 版本则使用 `engine.save_checkpoint`，可在相同命令下恢复训练。
+其中 `collect/train/eval` 每个阶段都由独立 YAML 控制；某个环境变量不设置时，该阶段会被跳过。
 
 ### Key Metrics
 
