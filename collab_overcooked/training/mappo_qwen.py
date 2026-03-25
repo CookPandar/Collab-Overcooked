@@ -1199,56 +1199,48 @@ class MAPPOTrainer:
         rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32)
         values = torch.tensor([t.value for t in transitions], dtype=torch.float32)
         dones = torch.tensor([t.done for t in transitions], dtype=torch.float32)
-
-        # Default: standard per-transition discounting (gamma applies on every LLM call).
-        if not self.discount_reset_per_timestep:
-            advantages = torch.zeros_like(rewards)
-            gae = 0.0
-            for idx in reversed(range(len(rewards))):
-                next_value = values[idx + 1] if idx + 1 < len(values) else 0.0
-                delta = (
-                    rewards[idx]
-                    + self.gamma * next_value * (1 - dones[idx])
-                    - values[idx]
-                )
-                gae = delta + self.gamma * self.gae_lambda * (1 - dones[idx]) * gae
-                advantages[idx] = gae
-            returns = advantages + values
-            return advantages, returns
-
-        # Special: per-call returns/advantages, but with a "reset" at env timestep boundaries.
-        #
-        # We still compute a return for *every LLM call* (every transition). The only change is
-        # that we use a different discount when moving from the last call of a timestep to the
-        # first call of the next timestep:
-        #   - within the same env timestep: use gamma_call
-        #   - across env timesteps: use gamma (so the number of calls in a timestep does not
-        #     amplify discounting across timesteps)
-        timesteps: List[int] = [
-            int(t.timestep) if t.timestep is not None else -1 for t in transitions
-        ]
-        n = len(transitions)
-        gammas: List[float] = []
-        for i in range(n):
-            if i + 1 >= n:
-                gammas.append(self.gamma)
-            elif timesteps[i] == timesteps[i + 1]:
-                gammas.append(self.gamma_call)
-            else:
-                gammas.append(self.gamma)
-
         advantages = torch.zeros_like(rewards)
-        gae = 0.0
-        for idx in reversed(range(n)):
-            gamma_t = float(gammas[idx])
-            next_value = values[idx + 1] if idx + 1 < n else 0.0
-            delta = (
-                rewards[idx]
-                + gamma_t * next_value * (1 - dones[idx])
-                - values[idx]
-            )
-            gae = delta + gamma_t * self.gae_lambda * (1 - dones[idx]) * gae
-            advantages[idx] = gae
+
+        def _compute_agent_advantages(agent_positions: List[int]) -> None:
+            if not agent_positions:
+                return
+
+            agent_timesteps: List[int] = [
+                int(transitions[pos].timestep)
+                if transitions[pos].timestep is not None
+                else -1
+                for pos in agent_positions
+            ]
+            gammas: List[float] = []
+            for local_idx in range(len(agent_positions)):
+                if not self.discount_reset_per_timestep:
+                    gammas.append(self.gamma)
+                    continue
+                if local_idx + 1 >= len(agent_positions):
+                    gammas.append(self.gamma)
+                elif agent_timesteps[local_idx] == agent_timesteps[local_idx + 1]:
+                    gammas.append(self.gamma_call)
+                else:
+                    gammas.append(self.gamma)
+
+            gae = 0.0
+            for local_idx in reversed(range(len(agent_positions))):
+                pos = agent_positions[local_idx]
+                gamma_t = float(gammas[local_idx])
+                if local_idx + 1 < len(agent_positions):
+                    next_pos = agent_positions[local_idx + 1]
+                    next_value = values[next_pos]
+                else:
+                    next_value = 0.0
+                delta = rewards[pos] + gamma_t * next_value * (1 - dones[pos]) - values[pos]
+                gae = delta + gamma_t * self.gae_lambda * (1 - dones[pos]) * gae
+                advantages[pos] = gae
+
+        agent_positions: Dict[int, List[int]] = {}
+        for idx, transition in enumerate(transitions):
+            agent_positions.setdefault(int(transition.agent_index), []).append(idx)
+        for positions in agent_positions.values():
+            _compute_agent_advantages(positions)
 
         returns = advantages + values
         return advantages, returns
