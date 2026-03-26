@@ -44,10 +44,10 @@ trainer:
   # PPO/MAPPO 超参
   gamma: 0.99
   gae_lambda: 0.95
-  lr: 2.0e-6
-  train_batch_size: 1
+  lr: 1.0e-7
+  train_batch_size: 2
   update_epochs: 1
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   target_kl: 5.0
   clip_coef: 0.2
   entropy_coef: 0.01

@@ -27,8 +27,7 @@ if [[ ! -x "$COLLAB_ENV/bin/python" ]]; then
     exit 1
 fi
 
-ACCELERATE_BIN=../collab-overcooked/bin/accelerate
-ACCEL_BIN="${ACCELERATE_BIN:-accelerate}"
+ACCEL_BIN="${ACCELERATE_BIN:-$COLLAB_ENV/bin/accelerate}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
 COLLECT_CFG="${RL_COLLECT_CONFIG:-}"
 TRAIN_CFG="${RL_TRAIN_CONFIG:-}"
