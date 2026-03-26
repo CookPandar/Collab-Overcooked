@@ -5,7 +5,7 @@ import copy
 from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class ProcessRewardTracker:
@@ -26,15 +26,22 @@ class ProcessRewardTracker:
 
         self.sequence_metric = str(self.settings.get("sequence_metric", "tes")).lower()
         self.sequence_weight = float(self.settings.get("sequence_weight", 1.0))
+        self.sequence_progress_reward = float(
+            self.settings.get("process_progress_reward", 1.0)
+        )
         self.product_reward_value = float(self.settings.get("product_reward", 0.5))
-        self.format_penalty_value = -abs(self.settings.get("format_penalty", 1.0))
-        self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 0.5))
+        self.format_penalty_value = -abs(self.settings.get("format_penalty", 0.1))
+        self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 0.1))
+        self.communication_penalty_value = -abs(
+            self.settings.get("communication_penalty", 0.1)
+        )
         self.enable_collab_reward = bool(self.settings.get("collab_reward_enabled", False))
 
         self.references = self._load_references()
         self.sequence_histories: List[List[str]] = [[], []]
         self.sequence_scores: List[float] = [0.0, 0.0]
         self.collab_sequence_scores: List[float] = [0.0, 0.0]
+        self.last_comm_actions: List[Optional[str]] = [None, None]
 
         self.recipe_lookup = self._build_recipe_lookup()
         self.intermediate_targets = self._resolve_recipe_targets(self.order)
@@ -62,6 +69,7 @@ class ProcessRewardTracker:
         self.sequence_histories = [[], []]
         self.sequence_scores = [0.0, 0.0]
         self.collab_sequence_scores = [0.0, 0.0]
+        self.last_comm_actions = [None, None]
         self.observed_targets.clear()
         self.call_events.clear()
         self.step_call_records.clear()
@@ -74,6 +82,7 @@ class ProcessRewardTracker:
             "sequence_histories": copy.deepcopy(self.sequence_histories),
             "sequence_scores": list(self.sequence_scores),
             "collab_sequence_scores": list(self.collab_sequence_scores),
+            "last_comm_actions": list(self.last_comm_actions),
             "observed_targets": list(self.observed_targets),
             "penalty_queue": copy.deepcopy(self.penalty_queue),
         }
@@ -96,6 +105,9 @@ class ProcessRewardTracker:
         )
         if len(self.collab_sequence_scores) < 2:
             self.collab_sequence_scores = [0.0, 0.0]
+        self.last_comm_actions = list(data.get("last_comm_actions", [None, None]))
+        if len(self.last_comm_actions) < 2:
+            self.last_comm_actions = [None, None]
         observed = data.get("observed_targets", [])
         self.observed_targets = set(observed) if observed else set()
         penalty_state = data.get("penalty_queue")
@@ -126,17 +138,26 @@ class ProcessRewardTracker:
 
         normalized_action = (action_text or "").strip()
         is_collab = self._is_collab_action(normalized_action)
+        similarity_before = self.sequence_scores[agent_index]
+        similarity_after = similarity_before
+        similarity_delta = 0.0
+        communication_reward = 0.0
         if is_collab:
-            if self.enable_collab_reward:
-                seq_reward = self._process_collab_reward(agent_index, normalized_action)
-            else:
-                seq_reward = 0.0
+            seq_reward = 0.0
+            communication_reward = self._process_communication_reward(
+                agent_index, normalized_action
+            )
         else:
-            seq_reward = self._process_sequence_reward(agent_index, normalized_action)
+            (
+                seq_reward,
+                similarity_before,
+                similarity_after,
+                similarity_delta,
+            ) = self._process_sequence_reward(agent_index, normalized_action)
         penalty_total, penalty_details = self._consume_penalties(agent_index)
         format_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "format")
         validator_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "validator")
-        total = seq_reward + penalty_total
+        total = seq_reward + communication_reward + penalty_total
 
         ts = -1 if timestamp is None else int(timestamp)
         entry = {
@@ -148,8 +169,12 @@ class ProcessRewardTracker:
             "action": normalized_action or "[EMPTY]",
             "sequence_reward": seq_reward,
             "progress_reward": seq_reward,
+            "communication_reward": communication_reward,
             "format_reward": format_reward,
             "validator_reward": validator_reward,
+            "similarity_before": similarity_before,
+            "similarity_after": similarity_after,
+            "similarity_delta": similarity_delta,
             "penalties": penalty_details,
             "is_collab": is_collab,
             "total": total,
@@ -173,14 +198,18 @@ class ProcessRewardTracker:
         for agent_idx in range(2):
             call_entries = bucket[agent_idx]
             seq_reward = sum(entry["sequence_reward"] for entry in call_entries)
+            communication_reward = sum(
+                entry.get("communication_reward", 0.0) for entry in call_entries
+            )
             agent_total = sum(entry["total"] for entry in call_entries)
-            penalty_total = agent_total - seq_reward
+            penalty_total = agent_total - seq_reward - communication_reward
             penalty_details = []
             for entry in call_entries:
                 penalty_details.extend(entry["penalties"])
             per_agent.append(
                 {
                     "sequence_reward": seq_reward,
+                    "communication_reward": communication_reward,
                     "penalty_total": penalty_total,
                     "penalties": penalty_details,
                     "similarity": self.sequence_scores[agent_idx],
@@ -211,23 +240,31 @@ class ProcessRewardTracker:
     # ------------------------------------------------------------------
     # Sequence reward helpers
     # ------------------------------------------------------------------
-    def _process_sequence_reward(self, agent_index: int, action: Optional[str]) -> float:
+    def _process_sequence_reward(
+        self, agent_index: int, action: Optional[str]
+    ) -> Tuple[float, float, float, float]:
+        before_score = self.sequence_scores[agent_index]
         if not action:
-            return 0.0
+            return 0.0, before_score, before_score, 0.0
         normalized = action.strip()
         if not normalized or normalized.lower().startswith("wait"):
-            return 0.0
+            return 0.0, before_score, before_score, 0.0
 
         self.sequence_histories[agent_index].append(normalized)
-        new_score = self._best_sequence_score(agent_index)
-        delta = max(0.0, new_score - self.sequence_scores[agent_index])
+        candidate_score = self._best_sequence_score(agent_index)
+        delta = max(0.0, candidate_score - before_score)
         if delta > 0:
-            self.sequence_scores[agent_index] = new_score
+            self.sequence_scores[agent_index] = candidate_score
             self.collab_sequence_scores[agent_index] = max(
-                self.collab_sequence_scores[agent_index], new_score
+                self.collab_sequence_scores[agent_index], candidate_score
             )
-            return delta * self.sequence_weight
-        return 0.0
+            return (
+                self.sequence_progress_reward,
+                before_score,
+                self.sequence_scores[agent_index],
+                delta,
+            )
+        return 0.0, before_score, self.sequence_scores[agent_index], 0.0
 
     def _best_sequence_score(self, agent_index: int) -> float:
         history = self.sequence_histories[agent_index]
@@ -267,6 +304,16 @@ class ProcessRewardTracker:
                 self.collab_sequence_scores[target_idx] = new_score
                 reward += delta * self.sequence_weight
         return reward
+
+    def _process_communication_reward(self, agent_index: int, action: str) -> float:
+        normalized = self._normalize_action(action)
+        if not normalized:
+            return 0.0
+        previous = self.last_comm_actions[agent_index]
+        self.last_comm_actions[agent_index] = normalized
+        if previous and previous == normalized:
+            return self.communication_penalty_value
+        return 0.0
 
     def _lcs_ratio(self, seq_a: List[str], seq_b: List[str]) -> float:
         if not seq_a or not seq_b:
@@ -531,4 +578,9 @@ class ProcessRewardTracker:
         return action.replace(" ", "")
 
     def _is_collab_action(self, action: str) -> bool:
-        return action.strip().lower().startswith("collab(") if action else False
+        if not action:
+            return False
+        lowered = action.strip().lower()
+        if lowered.startswith("collab("):
+            return True
+        return lowered.startswith(("request(", "seek(", "ack(", "deny("))

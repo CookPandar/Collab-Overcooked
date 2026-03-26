@@ -51,6 +51,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 @dataclass
 class Row:
     segment: int
+    row_idx: int
     update_idx: int
     step: int
     num_transitions: int
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         "--x",
         choices=["step", "update_idx", "row"],
         default="row",
-        help="X axis to use (default: row, i.e., a new monotonic 1..N index).",
+        help="X axis to use (default: row, preferring CSV row_idx when available).",
     )
     p.add_argument(
         "--all-segments",
@@ -170,6 +171,7 @@ def load_rows(path: Path) -> List[Row]:
                 rows.append(
                     Row(
                         segment=segment,
+                        row_idx=_safe_int(rec.get("row_idx", "")) or (len(rows) + 1),
                         update_idx=update_idx,
                         step=step,
                         num_transitions=num_transitions,
@@ -240,6 +242,7 @@ def load_rows(path: Path) -> List[Row]:
                 rows.append(
                     Row(
                         segment=segment,
+                        row_idx=len(rows) + 1,
                         update_idx=update_idx,
                         step=step,
                         num_transitions=num_transitions,
@@ -278,6 +281,8 @@ def pick_segment(rows: List[Row], all_segments: bool) -> List[Row]:
 
 
 def get_x(rows: List[Row], mode: str) -> List[float]:
+    if mode == "row":
+        return [float(r.row_idx) for r in rows]
     if mode == "update_idx":
         return [float(r.update_idx) for r in rows]
     return [float(r.step) for r in rows]
@@ -339,18 +344,8 @@ def plot(
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
 
-    # For x=row, we must not reset the x-axis per segment. Use a global 1..N axis
-    # derived from the plotted row order.
-    if x_mode == "row":
-        pos = {id(r): float(i + 1) for i, r in enumerate(rows)}
-
-        def x_for(seg_rows: List[Row]) -> List[float]:
-            return [pos[id(r)] for r in seg_rows]
-
-    else:
-
-        def x_for(seg_rows: List[Row]) -> List[float]:
-            return get_x(seg_rows, x_mode)
+    def x_for(seg_rows: List[Row]) -> List[float]:
+        return get_x(seg_rows, x_mode)
 
     # Plot each segment separately; legend only on the first segment.
     first = True

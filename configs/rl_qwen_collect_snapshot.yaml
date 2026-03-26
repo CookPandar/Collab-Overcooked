@@ -7,7 +7,7 @@ trainer:
   collect_only: true
   off_policy_snapshots: runs/rl/snapshots/one_episode.jsonl
   steps_per_update: 200
-  total_updates: 1
+  initial_rollout_cache_dir: runs/rl/train/initial_rollout_cache
   model_path: /datacache/LLMs/Qwen2.5-7B-Instruct            # 共享基座
   lora_path: null
   actor_adapters:

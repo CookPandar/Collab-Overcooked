@@ -966,6 +966,30 @@ class LLMAgents(LLMPair):
                 return token
         return tokens[0] if tokens else ""
 
+    def _split_action_tokens(self, action_block: Optional[str]) -> List[str]:
+        body = self._strip_action_prefix(action_block or "")
+        body = self._sanitize_action_text(body)
+        return [token.strip() for token in body.split(";") if token.strip()]
+
+    def _inspect_action_mode(self, action_block: Optional[str]) -> Dict[str, Any]:
+        tokens = self._split_action_tokens(action_block)
+        collab_tokens = [token for token in tokens if self._is_collab_action(token)]
+        embodied_tokens = [token for token in tokens if not self._is_collab_action(token)]
+        if not tokens:
+            mode = "empty"
+        elif collab_tokens and embodied_tokens:
+            mode = "mixed"
+        elif collab_tokens:
+            mode = "communication"
+        else:
+            mode = "planner_main"
+        return {
+            "mode": mode,
+            "tokens": tokens,
+            "collab_tokens": collab_tokens,
+            "embodied_tokens": embodied_tokens,
+        }
+
     def _strip_code_fences(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
@@ -1245,6 +1269,11 @@ class LLMAgents(LLMPair):
         if metadata:
             entry["metadata"] = metadata
         self.pending_llm_logs.append(entry)
+        if hasattr(self.planner, "annotate_last_record"):
+            try:
+                self.planner.annotate_last_record({"call_index": entry["call_index"]})
+            except Exception:
+                pass
     
     def _annotate_last_log_metadata(self, **fields):
         if not self.pending_llm_logs:
@@ -1266,6 +1295,21 @@ class LLMAgents(LLMPair):
             else:
                 metadata[key] = value
         entry["metadata"] = metadata
+        if hasattr(self.planner, "annotate_last_record"):
+            try:
+                self.planner.annotate_last_record(fields)
+            except Exception:
+                pass
+
+    def _annotate_last_action_mode(self, action_block: Optional[str]):
+        info = self._inspect_action_mode(action_block)
+        self._annotate_last_log_metadata(
+            action_mode=info["mode"],
+            action_tokens=info["tokens"],
+            collab_action_tokens=info["collab_tokens"],
+            embodied_action_tokens=info["embodied_tokens"],
+        )
+        return info
 
     def _handle_format_issues(self, issues: List[str]):
         if not issues:
@@ -1289,6 +1333,59 @@ class LLMAgents(LLMPair):
     def _report_action_format_error(self, detail: str, action_text: Optional[str] = None, call_type: str = "planner_main"):
         self._ensure_penalty_reward_entry(action_text, call_type)
         self._register_penalty("format", detail)
+
+    def _rewrite_mixed_action_response(self, last_response: str):
+        base_prompt = self.planner.current_user_message.get("content", "")
+        correction_prompt = (
+            base_prompt
+            + "\n\nYour previous reply mixed communication actions and embodied actions in the same Action field. "
+            "Rewrite the full reply so that Action is pure: either only Collab(...) communication primitives "
+            "or only embodied kitchen actions. Never mix both kinds in one reply, and do not add narration.\n\n"
+            "Your last reply was:\n"
+            + last_response
+            + "\n\nReturn a corrected reply that preserves the Think / Recent Goal / Action format."
+        )
+        self.planner.current_user_message = {"role": "user", "content": correction_prompt}
+        self._set_planner_call_context("format_correction", action_issue="mixed_action_types")
+        response, correction_tokens = self.planner.query(
+            proxy=self.proxy, stop="Scene", trace=True
+        )
+        self._log_llm_call(
+            "format_correction",
+            self.planner.current_user_message["content"],
+            response,
+            correction_tokens,
+            {"action_issue": "mixed_action_types"},
+        )
+        self.turn_statistics_dict["statistical_data"]["error"][self.agent_index][
+            "format_error"
+        ]["error_num"] += 1
+        self.turn_statistics_dict["statistical_data"]["error"][self.agent_index][
+            "format_error"
+        ]["error_message"].append(self.planner.current_user_message["content"])
+        self.turn_statistics_dict["statistical_data"]["error_correction"][
+            self.agent_index
+        ]["format_correction"]["correction_num"] += 1
+        self.turn_statistics_dict["statistical_data"]["error_correction"][
+            self.agent_index
+        ]["format_correction"]["correction_tokens"].append(correction_tokens)
+        return response, correction_tokens
+
+    def _ensure_pure_action_response(self, response: str):
+        action_text = self.parse_response(response, "action")
+        action_info = self._annotate_last_action_mode(action_text)
+        extra_tokens = 0
+        if action_info["mode"] != "mixed":
+            return response, extra_tokens, action_info
+
+        self._handle_format_issues(["mixed_action_types"])
+        response, correction_tokens = self._rewrite_mixed_action_response(response)
+        extra_tokens += correction_tokens
+        corrected_action = self.parse_response(response, "action")
+        corrected_info = self._annotate_last_action_mode(corrected_action)
+        if corrected_info["mode"] == "mixed":
+            self._handle_format_issues(["mixed_action_types"])
+        return response, extra_tokens, corrected_info
     
     def _format_food_description(self, food_state):
         if isinstance(food_state, str):
@@ -1615,6 +1712,15 @@ class LLMAgents(LLMPair):
         response, correction_tokens = self.planner.query(
             proxy=self.proxy, stop="Scene", trace=True
         )
+        self._log_llm_call(
+            "format_correction",
+            self.planner.current_user_message["content"],
+            response,
+            correction_tokens,
+            {"role": "collab_reply"},
+        )
+        response, extra_tokens, _ = self._ensure_pure_action_response(response)
+        correction_tokens += extra_tokens
         fmt_error = self.turn_statistics_dict["statistical_data"]["error"][self.agent_index]["format_error"]
         fmt_error["error_num"] += 1
         fmt_error["error_message"].append(correction_prompt)
@@ -1830,6 +1936,8 @@ class LLMAgents(LLMPair):
                 correction_tokens,
                 {"missing_part": part_type},
             )
+            response, extra_tokens, _ = self._ensure_pure_action_response(response)
+            correction_tokens += extra_tokens
             # statistic
             self.turn_statistics_dict["statistical_data"]["error"][self.agent_index][
                 "format_error"
@@ -1891,6 +1999,8 @@ class LLMAgents(LLMPair):
             tokens_num + extra_tokens,
             {"role": role},
         )
+        response, purity_tokens, action_info = self._ensure_pure_action_response(response)
+        extra_tokens += purity_tokens
         if collab_violation_response is not None:
             violation_action = self.parse_response(collab_violation_response, "action")
             self._record_communication_penalty(
@@ -1913,6 +2023,8 @@ class LLMAgents(LLMPair):
         action_text = self.parse_response(response, "action")
         if action_text == "":
             format_issues.append("missing_action")
+        elif action_info["mode"] == "mixed":
+            format_issues.append("mixed_action_types")
         recent_goal_text = self.parse_response(response, "recent_goal")
         if recent_goal_text == "":
             format_issues.append("missing_recent_goal")
@@ -2277,6 +2389,7 @@ class LLMAgents(LLMPair):
                 tokens_num,
             )
             planner_call_index = len(self.pending_llm_logs) - 1
+            response, _, action_info = self._ensure_pure_action_response(response)
             print(response)
             # check whether need communication
             # check whether has the action
@@ -2291,6 +2404,8 @@ class LLMAgents(LLMPair):
             action_text_block = self.parse_response(response, "action")
             if action_text_block == "":
                 format_issues.append("missing_action")
+            elif action_info["mode"] == "mixed":
+                format_issues.append("mixed_action_types")
             think_output = think_text
             if think_text == "":
                 print("\n\n\n******No Think Part, Correcting*********\n\n\n")

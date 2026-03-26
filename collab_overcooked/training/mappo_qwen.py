@@ -43,6 +43,7 @@ class TextTransition:
     agent_index: int
     entropy: float
     timestep: Optional[int] = None
+    critic_input_ids: Optional[torch.Tensor] = None
     format_reward: float = 0.0
     validator_reward: float = 0.0
     process_reward: float = 0.0
@@ -86,6 +87,7 @@ class LMGenerationResult:
         log_prob: float,
         entropy: float,
         value: float,
+        critic_input_ids: Optional[torch.Tensor] = None,
     ) -> None:
         self.text = text
         self.prompt_ids = prompt_ids
@@ -93,6 +95,7 @@ class LMGenerationResult:
         self.log_prob = log_prob
         self.entropy = entropy
         self.value = value
+        self.critic_input_ids = critic_input_ids
 
 
 class QwenLMActorCritic(nn.Module):
@@ -273,9 +276,53 @@ class QwenLMActorCritic(nn.Module):
         )
         return {k: v.to(self.device) for k, v in inputs.items()}
 
+    def _use_critic_adapter(self):
+        if self.critic_adapter_name:
+            return self._use_adapter(self.critic_adapter_name)
+        if self.is_lora and isinstance(self.model, PeftModel):
+            return self.model.disable_adapter()
+        return nullcontext()
+
+    def _evaluate_value_inputs(
+        self, input_tensors: List[torch.Tensor], use_critic_adapter: bool = True
+    ) -> torch.Tensor:
+        if not input_tensors:
+            return torch.empty(0, device=self.device, dtype=torch.float32)
+        pad_id = self.tokenizer.pad_token_id
+        inputs = pad_sequence(input_tensors, batch_first=True, padding_value=pad_id)
+        attention_mask = inputs.ne(pad_id).long()
+        context = self._use_critic_adapter() if use_critic_adapter else nullcontext()
+        with context:
+            outputs = self.model(
+                inputs,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+        hidden_states = outputs.hidden_states[-1]
+        lengths = attention_mask.sum(dim=-1).clamp(min=1) - 1
+        gather_index = lengths.view(-1, 1, 1).expand(-1, 1, hidden_states.size(-1))
+        last_hidden = hidden_states.gather(dim=1, index=gather_index).squeeze(1)
+        return self.value_head(last_hidden).squeeze(-1)
+
     @torch.no_grad()
-    def act(self, prompt: str, agent_index: int) -> LMGenerationResult:
+    def evaluate_text_value(self, prompt: str) -> Tuple[torch.Tensor, float]:
+        inputs = self._prepare_inputs(prompt)
+        input_ids = inputs["input_ids"].squeeze(0).cpu()
+        value = self._evaluate_value_inputs(
+            [input_ids.to(self.device)], use_critic_adapter=True
+        )[0].item()
+        return input_ids, value
+
+    @torch.no_grad()
+    def act(
+        self,
+        prompt: str,
+        agent_index: int,
+        critic_prompt: Optional[str] = None,
+    ) -> LMGenerationResult:
         adapter_name = self.actor_adapter_names.get(agent_index)
+        critic_input_ids = None
         with self._use_adapter(adapter_name):
             inputs = self._prepare_inputs(prompt)
             # Transformers requires `temperature` to be strictly positive whenever it is set.
@@ -312,16 +359,22 @@ class QwenLMActorCritic(nn.Module):
                 torch.stack(entropies).mean().item() if entropies else 0.0
             )
 
+        prompt_ids = inputs["input_ids"].squeeze(0).cpu()
+        response_ids = generated.cpu()
+        value = 0.0
+        if critic_prompt:
+            critic_inputs = self._prepare_inputs(critic_prompt)
+            critic_input_ids = critic_inputs["input_ids"].squeeze(0).cpu()
+            value = self._evaluate_value_inputs(
+                [critic_input_ids.to(self.device)], use_critic_adapter=True
+            )[0].item()
+        else:
             seq = full_seq.unsqueeze(0)
             outputs = self.model(seq, use_cache=False, output_hidden_states=True)
             hidden = outputs.hidden_states[-1][:, -1, :]
-            actor_value = self.value_head(hidden).squeeze(-1).item()
-
-        prompt_ids = inputs["input_ids"].squeeze(0).cpu()
-        response_ids = generated.cpu()
-        value = actor_value
-        if self.critic_adapter_name and self.critic_adapter_name != adapter_name:
-            value = self._evaluate_value_single(prompt_ids, response_ids)
+            value = self.value_head(hidden).squeeze(-1).item()
+            if self.critic_adapter_name and self.critic_adapter_name != adapter_name:
+                value = self._evaluate_value_single(prompt_ids, response_ids)
 
         return LMGenerationResult(
             response_text,
@@ -330,6 +383,7 @@ class QwenLMActorCritic(nn.Module):
             log_prob=total_log_prob,
             entropy=avg_entropy,
             value=value,
+            critic_input_ids=critic_input_ids,
         )
 
     def _evaluate_value_single(self, prompt_ids: torch.Tensor, response_ids: torch.Tensor) -> float:
@@ -349,10 +403,16 @@ class QwenLMActorCritic(nn.Module):
         prompt_tensors: List[torch.Tensor],
         response_tensors: List[torch.Tensor],
         agent_indices: List[int],
+        critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
     ):
         num_samples = len(prompt_tensors)
         prompt_device = [t.to(self.device) for t in prompt_tensors]
         response_device = [t.to(self.device) for t in response_tensors]
+        critic_device = (
+            [t.to(self.device) if t is not None else None for t in critic_tensors]
+            if critic_tensors is not None
+            else [None] * num_samples
+        )
         log_probs_buf: List[Optional[torch.Tensor]] = [None] * num_samples
         entropy_buf: List[Optional[torch.Tensor]] = [None] * num_samples
         values_buf: List[Optional[torch.Tensor]] = [None] * num_samples
@@ -365,13 +425,27 @@ class QwenLMActorCritic(nn.Module):
         else:
             groups = {None: list(range(num_samples))}
 
+        critic_indices = [idx for idx, tensor in enumerate(critic_device) if tensor is not None]
+        if critic_indices:
+            critic_values = self._evaluate_value_inputs(
+                [critic_device[idx] for idx in critic_indices if critic_device[idx] is not None],
+                use_critic_adapter=True,
+            )
+            for local_idx, global_idx in enumerate(critic_indices):
+                values_buf[global_idx] = critic_values[local_idx]
+        missing_value_indices = [
+            idx for idx, value in enumerate(values_buf) if value is None
+        ]
+
         critic_matches_actor = False
         if self.critic_adapter_name and self.actor_adapter_names:
             critic_matches_actor = all(
                 self.actor_adapter_names.get(agent_idx) == self.critic_adapter_name
                 for agent_idx in agent_indices
             )
-        need_actor_values = self.critic_adapter_name is None or critic_matches_actor
+        need_actor_values = bool(missing_value_indices) and (
+            self.critic_adapter_name is None or critic_matches_actor
+        )
         for adapter_name, sample_indices in groups.items():
             subset_prompts = [prompt_device[i] for i in sample_indices]
             subset_responses = [response_device[i] for i in sample_indices]
@@ -385,19 +459,19 @@ class QwenLMActorCritic(nn.Module):
             for local_idx, global_idx in enumerate(sample_indices):
                 log_probs_buf[global_idx] = logp[local_idx]
                 entropy_buf[global_idx] = ent[local_idx]
-                if need_actor_values:
+                if need_actor_values and global_idx in missing_value_indices:
                     values_buf[global_idx] = vals[local_idx]
 
-        if self.critic_adapter_name and not critic_matches_actor:
+        if self.critic_adapter_name and not critic_matches_actor and missing_value_indices:
             with self._use_adapter(self.critic_adapter_name):
                 _, _, critic_vals = self._evaluate_chunk(
-                    prompt_device,
-                    response_device,
+                    [prompt_device[idx] for idx in missing_value_indices],
+                    [response_device[idx] for idx in missing_value_indices],
                     need_policy=False,
                     need_value=True,
                 )
-            for idx in range(num_samples):
-                values_buf[idx] = critic_vals[idx]
+            for local_idx, global_idx in enumerate(missing_value_indices):
+                values_buf[global_idx] = critic_vals[local_idx]
 
         return (
             torch.stack([t for t in log_probs_buf if t is not None]),
@@ -464,11 +538,17 @@ class QwenLMActorCritic(nn.Module):
         prompt_tensors: List[torch.Tensor],
         response_tensors: List[torch.Tensor],
         agent_indices: Optional[List[int]] = None,
+        critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
     ):
         """DDP forward pass delegates to evaluate_batch."""
         if agent_indices is None:
             agent_indices = [0] * len(prompt_tensors)
-        return self.evaluate_batch(prompt_tensors, response_tensors, agent_indices)
+        return self.evaluate_batch(
+            prompt_tensors,
+            response_tensors,
+            agent_indices,
+            critic_tensors=critic_tensors,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -514,9 +594,10 @@ class MAPPOTrainer:
         self.collect_only = bool(trainer_cfg.get("collect_only", False))
         self.train_only = bool(trainer_cfg.get("train_only", False))
         self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
-        self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", False))
+        self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", True))
         self.agents_cfg = full_config.get("agents", {})
         self.agent_roles = self._extract_agent_roles(self.agents_cfg)
+        self.critic_role_prompt = self._load_critic_role_prompt()
 
         if self.latest_model_path_file and self.latest_model_path_file.exists():
             self._apply_model_override_from_file(self.trainer_cfg)
@@ -557,8 +638,12 @@ class MAPPOTrainer:
             1, math.ceil(self.steps_per_update / self.accelerator.num_processes)
         )
         self.train_batch_size = int(trainer_cfg.get("train_batch_size", 32))
-        self.total_updates = trainer_cfg.get("total_updates", 1000)
+        self.update_epochs = int(trainer_cfg.get("update_epochs", 4))
         self.clip_coef = trainer_cfg.get("clip_coef", 0.2)
+        self.value_clip_coef = trainer_cfg.get(
+            "value_clip_coef", trainer_cfg.get("cliprange_value", self.clip_coef)
+        )
+        self.shuffle_minibatches = bool(trainer_cfg.get("shuffle_minibatches", True))
         self.entropy_coef = trainer_cfg.get("entropy_coef", 0.01)
         self.value_coef = trainer_cfg.get("value_coef", 0.5)
         self.max_grad_norm = trainer_cfg.get("max_grad_norm", 0.5)
@@ -573,6 +658,18 @@ class MAPPOTrainer:
             )
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.initial_rollout_cache_updates = int(
+            trainer_cfg.get("initial_rollout_cache_updates", 3)
+        )
+        self.reuse_initial_rollout_cache = bool(
+            trainer_cfg.get("reuse_initial_rollout_cache", True)
+        )
+        cache_dir_cfg = trainer_cfg.get("initial_rollout_cache_dir")
+        self.initial_rollout_cache_dir = (
+            Path(cache_dir_cfg) if cache_dir_cfg else self.output_dir / "initial_rollout_cache"
+        )
+        if self.initial_rollout_cache_updates > 0:
+            self.initial_rollout_cache_dir.mkdir(parents=True, exist_ok=True)
         if self.trainer_cfg.get("export_latest_dir"):
             self.export_latest_dir = Path(self.trainer_cfg["export_latest_dir"])
         elif self.export_latest_dir is None and latest_file:
@@ -640,19 +737,47 @@ class MAPPOTrainer:
         self._current_episode_length = 0
         self._current_episode_has_positive = False
 
+    def _prepare_csv_log(self, path: Path, header: str) -> Tuple[int, Optional[Dict[str, str]]]:
+        """Ensure the CSV header exists and return the next monotonic row index."""
+        last_row: Optional[Dict[str, str]] = None
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(header + "\n", encoding="utf-8")
+            return 1, None
+
+        try:
+            lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except OSError:
+            lines = []
+
+        if not lines or lines[0] != header:
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            try:
+                path.replace(backup_path)
+            except OSError:
+                pass
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(header + "\n", encoding="utf-8")
+            return 1, None
+
+        if len(lines) > 1:
+            columns = header.split(",")
+            values = lines[-1].split(",")
+            if len(values) == len(columns):
+                last_row = dict(zip(columns, values))
+        return len(lines), last_row
+
     def _log_episode_return(self, episode_return: float, episode_len: int, had_positive: bool):
         if not self._episode_log_path:
             return
-        header = "update_idx,episode_idx,episode_return,episode_len,had_positive,rank\n"
-        if not self._episode_log_path.exists():
-            self._episode_log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._episode_log_path.write_text(header, encoding="utf-8")
+        header = "row_idx,update_idx,episode_idx,episode_return,episode_len,had_positive,rank"
+        row_idx, _ = self._prepare_csv_log(self._episode_log_path, header)
         update_idx = self._current_update_idx if self._current_update_idx is not None else -1
         rank = self.accelerator.process_index
         self._episode_counter += 1
         with self._episode_log_path.open("a", encoding="utf-8") as f:
             f.write(
-                f"{update_idx},{self._episode_counter},{episode_return},"
+                f"{row_idx},{update_idx},{self._episode_counter},{episode_return},"
                 f"{episode_len},{1 if had_positive else 0},{rank}\n"
             )
 
@@ -778,6 +903,164 @@ class MAPPOTrainer:
         if critic_path:
             return AdapterSpec(name="critic", lora_path=critic_path, lora_config=None)
         return None
+
+    def _load_critic_role_prompt(self) -> str:
+        prompt_path = (
+            Path(__file__).resolve().parents[1]
+            / "prompts"
+            / "critic"
+            / "centralized_critic_role.txt"
+        )
+        try:
+            content = prompt_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            content = ""
+        if content:
+            return content
+        return (
+            "You are a centralized critic. You do not generate a new action. "
+            "You estimate how good the current transition is for future cumulative return "
+            "using the global state, both agents' context, and the current output."
+        )
+
+    def _prompt_root(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "prompts" / "gpt"
+
+    def _read_prompt_file(self, filename: str) -> str:
+        path = self._prompt_root() / filename
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _recipe_access_text(self, role_name: str) -> str:
+        lowered = (role_name or "").lower()
+        if "chef" in lowered:
+            return "You have access to the recipe."
+        return "You do not have direct recipe access and may need to ask the chef."
+
+    def _format_rule_template(self, template: str, role_name: str, teammate_name: str) -> str:
+        content = template or ""
+        replacements = {
+            "{role}": role_name,
+            "{teammate}": teammate_name,
+            "{has_recipe}": self._recipe_access_text(role_name),
+            "{recipe}": "[Recipe omitted in critic input]",
+            "{skill}": "[Skill section omitted in this template]",
+            "{communication_rule}": "[Communication rule omitted in this template]",
+        }
+        for key, value in replacements.items():
+            content = content.replace(key, value)
+        return content.strip()
+
+    def _build_game_rule_block(self) -> str:
+        env_rule = self._format_rule_template(
+            self._read_prompt_file("environment_rule.txt"),
+            "Chef",
+            "Assistant",
+        )
+        return self._compact_text(env_rule, limit=2600) if env_rule else ""
+
+    def _extract_action_space(self, role_name: str) -> str:
+        skill_file = "chef_skill.txt" if "chef" in role_name.lower() else "assistant_skill.txt"
+        raw = self._read_prompt_file(skill_file)
+        if not raw:
+            return ""
+        content = raw
+        start = content.find("**'Operation actions'**:")
+        if start != -1:
+            content = content[start:]
+        return self._compact_text(content.strip(), limit=2400)
+
+    @staticmethod
+    def _compact_text(text: Optional[str], limit: int = 800) -> str:
+        content = (text or "").strip()
+        if len(content) <= limit:
+            return content
+        return content[: limit - 3].rstrip() + "..."
+
+    def _agent_label(self, agent_index: int) -> str:
+        return self.agent_roles.get(agent_index) or f"agent_{agent_index}"
+
+    def _format_global_observation(self, observation: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(observation, dict):
+            return "[MISSING]"
+        players = observation.get("players") or {}
+        lines = [
+            f"timestep: {observation.get('timestep')}",
+            f"orders: {observation.get('orders')}",
+            f"grid: {self._compact_text(str(observation.get('grid', '')), limit=600)}",
+            f"pot_states: {self._compact_text(str(observation.get('pot_states', {})), limit=400)}",
+            f"counters: {self._compact_text(str(observation.get('counters', {})), limit=400)}",
+        ]
+        for idx in (0, 1):
+            player = players.get(idx) or players.get(str(idx)) or {}
+            lines.append(
+                f"player_{idx}: pos={player.get('position')} orient={player.get('orientation')} "
+                f"obj={player.get('object')}"
+            )
+        return "\n".join(lines)
+
+    def _build_critic_prompt(
+        self,
+        agent_index: int,
+        messages: List[Dict[str, str]],
+        context: Dict[str, Any],
+        output_text: str,
+    ) -> str:
+        shared_traces = context.get("shared_agent_traces") or {}
+        current_user = next(
+            (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+            "",
+        )
+        role_name = self._agent_label(agent_index)
+        teammate_index = 1 - int(agent_index)
+        teammate_name = self._agent_label(teammate_index)
+        teammate_trace = shared_traces.get(teammate_index) or {}
+        game_rules = self._build_game_rule_block()
+        acting_actions = self._extract_action_space(role_name)
+        teammate_actions = self._extract_action_space(teammate_name)
+        sections = [
+            self.critic_role_prompt,
+            "",
+            "[Global Observation]",
+            self._format_global_observation(context.get("global_observation")),
+            "",
+            "[Game Rules]",
+            game_rules or "[MISSING]",
+            "",
+            f"[{role_name} Action Space]",
+            acting_actions or "[MISSING]",
+            "",
+            f"[{teammate_name} Action Space]",
+            teammate_actions or "[MISSING]",
+            "",
+            "[Current Transition]",
+            f"acting_agent: {role_name} (index={agent_index})",
+            f"call_type: {context.get('call_type')}",
+            "acting_agent_observation_excerpt:\n"
+            + self._compact_text(context.get("observation_excerpt") or current_user, limit=1400),
+            "acting_agent_output:\n" + self._compact_text(output_text, limit=1200),
+            "",
+            "[Teammate Recent Context]",
+            f"teammate_agent: {teammate_name} (index={teammate_index})",
+            f"teammate_recent_call_type: {teammate_trace.get('call_type', '[MISSING]')}",
+            "teammate_recent_observation_excerpt:\n"
+            + self._compact_text(
+                teammate_trace.get("observation_excerpt", "[MISSING]"), limit=1000
+            ),
+            "teammate_recent_output:\n"
+            + self._compact_text(
+                teammate_trace.get("response_excerpt", "[MISSING]"), limit=1000
+            ),
+            "",
+            "[Evaluation Focus]",
+            "Estimate the value of this transition for future cumulative return. "
+            "Focus on task progress, coordination quality, rule compliance, repeated communication, "
+            "format errors, validator errors, and whether the output is an effective embodied action "
+            "or an effective communication move under the stated constraints.",
+        ]
+        return "\n".join(sections)
 
     def _load_snapshot_dataset(self, paths: List[Union[str, Path]]) -> List[SnapshotRecord]:
         dataset: List[SnapshotRecord] = []
@@ -972,6 +1255,13 @@ class MAPPOTrainer:
             f"{agent_index} prompt_chars={len(chat_prompt)}"
         )
         result = model.act(chat_prompt, agent_index=agent_index)
+        critic_prompt = self._build_critic_prompt(
+            agent_index=agent_index,
+            messages=messages,
+            context=context,
+            output_text=result.text,
+        )
+        critic_input_ids, critic_value = model.evaluate_text_value(critic_prompt)
         print(
             "[MAPPOTrainer] policy_call agent="
             f"{agent_index} generated_tokens={len(result.response_ids)}"
@@ -980,9 +1270,10 @@ class MAPPOTrainer:
             "prompt_ids": result.prompt_ids,
             "response_ids": result.response_ids,
             "log_prob": result.log_prob,
-            "value": result.value,
+            "value": critic_value,
             "entropy": result.entropy,
             "token_count": len(result.response_ids),
+            "critic_input_ids": critic_input_ids,
         }
         return result.text, metadata
 
@@ -994,53 +1285,63 @@ class MAPPOTrainer:
         # Collect-only mode: just roll out and save to disk.
         if self.collect_only:
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
-            for update_idx in range(1, self.total_updates + 1):
-                self._current_update_idx = update_idx
-                self._reset_rollout_stats()
-                self.collect_rollout()
-                self.log_performance(update_idx)
-                self.log_rewards(update_idx, self.buffer.storage)
-                self.save_rollout(self.buffer.storage, update_idx)
-                self.buffer.clear()
-                self.accelerator.wait_for_everyone()
-                self.accelerator.print(f"[Collect] saved rollout u{update_idx:05d}")
+            update_idx = 1
+            self._current_update_idx = update_idx
+            self._reset_rollout_stats()
+            self.collect_rollout()
+            self._maybe_save_initial_cached_rollout(update_idx, self.buffer.storage)
+            self.log_performance(update_idx)
+            self.log_rewards(update_idx, self.buffer.storage)
+            self.save_rollout(self.buffer.storage, update_idx)
+            self.buffer.clear()
+            self.accelerator.wait_for_everyone()
+            self.accelerator.print(f"[Collect] saved rollout u{update_idx:05d}")
             return
 
         # Train-only mode: load rollouts from disk and update policy.
         if self.train_only:
-            for update_idx in range(1, self.total_updates + 1):
-                transitions = self.load_rollouts()
-                if not transitions:
-                    self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
-                    break
-                loss_dict = self.update_policy(transitions)
-                self.log_rewards(update_idx, transitions)
-                if self.cleanup_rollouts and self.accelerator.is_main_process:
-                    self._cleanup_rollout_files()
-                self.accelerator.print(
-                    f"[TrainOnly] Update {update_idx} "
-                    f"loss={loss_dict['loss']:.4f} policy={loss_dict['policy']:.4f} "
-                    f"value={loss_dict['value']:.4f} entropy={loss_dict['entropy']:.4f}"
-                )
-                self._maybe_export_latest(update_idx)
-            return
-
-        for update_idx in range(1, self.total_updates + 1):
-            self._current_update_idx = update_idx
-            self._reset_rollout_stats()
-            self.collect_rollout()
-            self.log_performance(update_idx)
-            self.log_rewards(update_idx, self.buffer.storage)
-            loss_dict = self.update_policy(self.buffer.storage)
-
+            update_idx = 1
+            transitions = self.load_rollouts()
+            if not transitions:
+                self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
+                return
+            loss_dict = self.update_policy(transitions)
+            self.log_rewards(update_idx, transitions)
+            self.log_train_metrics(update_idx, loss_dict, transitions)
+            if self.cleanup_rollouts and self.accelerator.is_main_process:
+                self._cleanup_rollout_files()
             self.accelerator.print(
-                f"[MAPPO] Update {update_idx}/{self.total_updates} "
+                f"[TrainOnly] Update {update_idx} "
                 f"loss={loss_dict['loss']:.4f} policy={loss_dict['policy']:.4f} "
                 f"value={loss_dict['value']:.4f} entropy={loss_dict['entropy']:.4f}"
             )
             self._maybe_export_latest(update_idx)
-            if self.checkpoint_interval and update_idx % self.checkpoint_interval == 0:
-                self.save_checkpoint(tag=f"checkpoint_{update_idx:05d}")
+            return
+
+        update_idx = 1
+        self._current_update_idx = update_idx
+        self._reset_rollout_stats()
+        reused_cache = self._maybe_load_initial_cached_rollout(update_idx)
+        if not reused_cache:
+            self.collect_rollout()
+            self._maybe_save_initial_cached_rollout(update_idx, self.buffer.storage)
+            self.log_performance(update_idx)
+        else:
+            self.accelerator.print(
+                f"[MAPPO] Reusing cached initial rollout for update {update_idx}."
+            )
+        self.log_rewards(update_idx, self.buffer.storage)
+        loss_dict = self.update_policy(self.buffer.storage)
+        self.log_train_metrics(update_idx, loss_dict, self.buffer.storage)
+
+        self.accelerator.print(
+            f"[MAPPO] Update {update_idx} "
+            f"loss={loss_dict['loss']:.4f} policy={loss_dict['policy']:.4f} "
+            f"value={loss_dict['value']:.4f} entropy={loss_dict['entropy']:.4f}"
+        )
+        self._maybe_export_latest(update_idx)
+        if self.checkpoint_interval and update_idx % self.checkpoint_interval == 0:
+            self.save_checkpoint(tag=f"checkpoint_{update_idx:05d}")
         self.accelerator.wait_for_everyone()
         self.save_checkpoint(tag="final")
 
@@ -1075,14 +1376,13 @@ class MAPPOTrainer:
             )
             communication_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
             breakdown_total_reward = float(
-                raw_entry.get("total", seq_reward + fmt_reward + validator_reward)
-                or (seq_reward + fmt_reward + validator_reward)
+                raw_entry.get(
+                    "total",
+                    seq_reward + fmt_reward + validator_reward + communication_reward,
+                )
+                or (seq_reward + fmt_reward + validator_reward + communication_reward)
             )
-            # Back-compat: historically we logged `process_reward` as either communication_reward
-            # (if present) or the breakdown total; keep that behavior so old rollouts still load.
-            process_reward = (
-                communication_reward if "communication_reward" in breakdown else breakdown_total_reward
-            )
+            process_reward = seq_reward
             self.buffer.add(
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
@@ -1093,6 +1393,7 @@ class MAPPOTrainer:
                 agent_index=record.agent_index,
                 entropy=meta.get("entropy", 0.0),
                 timestep=getattr(record, "timestep", None),
+                critic_input_ids=meta.get("critic_input_ids"),
                 format_reward=fmt_reward,
                 validator_reward=validator_reward,
                 process_reward=process_reward,
@@ -1250,6 +1551,7 @@ class MAPPOTrainer:
         assert self.text_policy is not None
         prompt_tensors = [t.prompt_ids for t in transitions]
         response_tensors = [t.response_ids for t in transitions]
+        critic_tensors = [t.critic_input_ids for t in transitions]
         agent_indices = [t.agent_index for t in transitions]
         old_log_probs = torch.tensor(
             [t.log_prob for t in transitions], dtype=torch.float32, device=self.device
@@ -1258,6 +1560,8 @@ class MAPPOTrainer:
             [t.value for t in transitions], dtype=torch.float32, device=self.device
         )
         advantages, returns = self.compute_advantages(transitions)
+        raw_advantages = advantages.clone()
+        returns_stats = returns.clone()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         advantages = advantages.to(self.device)
         returns = returns.to(self.device)
@@ -1265,56 +1569,121 @@ class MAPPOTrainer:
         batch_size = max(1, self.train_batch_size)
         num_transitions = len(transitions)
         num_minibatches = math.ceil(num_transitions / batch_size)
+        total_optimization_steps = max(1, self.update_epochs * num_minibatches)
         total_loss = 0.0
         total_policy = 0.0
         total_value = 0.0
         total_entropy = 0.0
+        total_clipfrac = 0.0
+        total_approx_kl = 0.0
+        total_value_clipfrac = 0.0
 
         self.optimizer.zero_grad()
-        for start in range(0, num_transitions, batch_size):
-            end = min(start + batch_size, num_transitions)
-            batch_prompts = prompt_tensors[start:end]
-            batch_responses = response_tensors[start:end]
-            batch_agent_indices = agent_indices[start:end]
-            batch_old_log_probs = old_log_probs[start:end]
-            batch_adv = advantages[start:end]
-            batch_returns = returns[start:end]
+        for _ in range(self.update_epochs):
+            if self.shuffle_minibatches and num_transitions > 1:
+                perm = torch.randperm(num_transitions)
+                ordered_indices = perm.tolist()
+            else:
+                ordered_indices = list(range(num_transitions))
 
-            log_probs, entropies, values = self.text_policy(
-                batch_prompts, batch_responses, batch_agent_indices
-            )
-            log_probs = log_probs.to(self.device, dtype=torch.float32)
-            entropies = entropies.to(self.device, dtype=torch.float32)
-            values = values.to(self.device, dtype=torch.float32)
+            for start in range(0, num_transitions, batch_size):
+                end = min(start + batch_size, num_transitions)
+                batch_indices = ordered_indices[start:end]
+                batch_prompts = [prompt_tensors[i] for i in batch_indices]
+                batch_responses = [response_tensors[i] for i in batch_indices]
+                batch_critic = [critic_tensors[i] for i in batch_indices]
+                batch_agent_indices = [agent_indices[i] for i in batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
+                batch_old_values = old_values[batch_indices]
+                batch_adv = advantages[batch_indices]
+                batch_returns = returns[batch_indices]
 
-            ratios = torch.exp(log_probs - batch_old_log_probs)
-            surr1 = ratios * batch_adv
-            surr2 = torch.clamp(ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef) * batch_adv
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = F.mse_loss(values, batch_returns)
-            entropy_loss = -entropies.mean()
-            loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+                log_probs, entropies, values = self.text_policy(
+                    batch_prompts,
+                    batch_responses,
+                    batch_agent_indices,
+                    critic_tensors=batch_critic,
+                )
+                log_probs = log_probs.to(self.device, dtype=torch.float32)
+                entropies = entropies.to(self.device, dtype=torch.float32)
+                values = values.to(self.device, dtype=torch.float32)
 
-            self.accelerator.backward(loss / num_minibatches)
+                ratios = torch.exp(log_probs - batch_old_log_probs)
+                surr1 = ratios * batch_adv
+                clipped_ratios = torch.clamp(
+                    ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef
+                )
+                surr2 = clipped_ratios * batch_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_pred_clipped = torch.clamp(
+                    values,
+                    batch_old_values - self.value_clip_coef,
+                    batch_old_values + self.value_clip_coef,
+                )
+                value_losses = (values - batch_returns) ** 2
+                value_losses_clipped = (value_pred_clipped - batch_returns) ** 2
+                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                entropy_loss = -entropies.mean()
+                loss = (
+                    policy_loss
+                    + self.value_coef * value_loss
+                    + self.entropy_coef * entropy_loss
+                )
 
-            total_loss += loss.item()
-            total_policy += policy_loss.item()
-            total_value += value_loss.item()
-            total_entropy += entropies.mean().item()
+                self.accelerator.backward(loss / total_optimization_steps)
+
+                total_loss += loss.item()
+                total_policy += policy_loss.item()
+                total_value += value_loss.item()
+                total_entropy += entropies.mean().item()
+                total_clipfrac += (
+                    ((ratios - 1.0).abs() > self.clip_coef).float().mean().item()
+                )
+                total_approx_kl += (batch_old_log_probs - log_probs).mean().item()
+                total_value_clipfrac += (
+                    (value_losses_clipped > value_losses).float().mean().item()
+                )
 
         self.accelerator.clip_grad_norm_(self.text_policy.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
-        avg_loss = total_loss / num_minibatches if num_minibatches > 0 else 0.0
-        avg_policy = total_policy / num_minibatches if num_minibatches > 0 else 0.0
-        avg_value = total_value / num_minibatches if num_minibatches > 0 else 0.0
-        avg_entropy = total_entropy / num_minibatches if num_minibatches > 0 else 0.0
+        avg_loss = total_loss / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_policy = total_policy / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_value = total_value / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_entropy = total_entropy / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_clipfrac = total_clipfrac / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_approx_kl = total_approx_kl / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        avg_value_clipfrac = (
+            total_value_clipfrac / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        )
+        reward_mean = (
+            float(sum(float(t.reward) for t in transitions)) / float(len(transitions))
+            if transitions
+            else 0.0
+        )
+        old_values_cpu = old_values.detach().cpu()
+        returns_cpu = returns_stats.detach().cpu()
+        returns_var = float(torch.var(returns_cpu, unbiased=False).item())
+        if returns_var > 1e-8:
+            explained_var = 1.0 - float(
+                torch.var(returns_cpu - old_values_cpu, unbiased=False).item()
+            ) / returns_var
+        else:
+            explained_var = 0.0
 
         return {
             "loss": avg_loss,
             "policy": avg_policy,
             "value": avg_value,
             "entropy": avg_entropy,
+            "reward_mean": reward_mean,
+            "adv_mean": float(raw_advantages.mean().item()),
+            "return_mean": float(returns_cpu.mean().item()),
+            "value_mean": float(old_values_cpu.mean().item()),
+            "explained_var": explained_var,
+            "clipfrac": avg_clipfrac,
+            "approx_kl": avg_approx_kl,
+            "value_clipfrac": avg_value_clipfrac,
         }
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
@@ -1345,11 +1714,9 @@ class MAPPOTrainer:
             stats["comm"] += float(getattr(t, "communication_reward", 0.0))
             stats["breakdown_total"] += float(getattr(t, "breakdown_total_reward", 0.0))
             stats["legacy_process"] += float(getattr(t, "process_reward", getattr(t, "reward", 0.0)))
-        # 近似步数：以 steps_per_update 为步长
-        step_est = (update_idx - 1) * self.steps_per_update + num
         log_path = self.output_dir / "reward_curve.csv"
         header = (
-            "update_idx,step,num_transitions,"
+            "row_idx,update_idx,step,num_transitions,"
             "agent0_n,agent1_n,"
             "agent0_rl_sum,agent0_rl_mean,"
             "agent0_format_sum,agent0_format_mean,"
@@ -1366,21 +1733,14 @@ class MAPPOTrainer:
             "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
             "agent1_legacy_process_sum,agent1_legacy_process_mean"
         )
-        if not log_path.exists():
-            log_path.write_text(header + "\n", encoding="utf-8")
-        else:
+        row_idx, last_row = self._prepare_csv_log(log_path, header)
+        prev_step = 0
+        if last_row is not None:
             try:
-                with log_path.open("r", encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-            except OSError:
-                first_line = ""
-            if first_line != header:
-                backup_path = log_path.with_suffix(log_path.suffix + ".bak")
-                try:
-                    log_path.replace(backup_path)
-                except OSError:
-                    pass
-                log_path.write_text(header + "\n", encoding="utf-8")
+                prev_step = int(float(last_row.get("step", "0") or 0))
+            except (TypeError, ValueError):
+                prev_step = 0
+        step_est = prev_step + num
         a0_stats = agent_stats.get(
             0,
             {
@@ -1413,7 +1773,7 @@ class MAPPOTrainer:
 
         with log_path.open("a", encoding="utf-8") as f:
             f.write(
-                f"{update_idx},{step_est},{num},"
+                f"{row_idx},{update_idx},{step_est},{num},"
                 f"{a0_n},{a1_n},"
                 f"{a0_stats['rl']},{_mean(a0_stats['rl'], a0_n)},"
                 f"{a0_stats['format']},{_mean(a0_stats['format'], a0_n)},"
@@ -1429,6 +1789,33 @@ class MAPPOTrainer:
                 f"{a1_stats['comm']},{_mean(a1_stats['comm'], a1_n)},"
                 f"{a1_stats['breakdown_total']},{_mean(a1_stats['breakdown_total'], a1_n)},"
                 f"{a1_stats['legacy_process']},{_mean(a1_stats['legacy_process'], a1_n)}\n"
+            )
+
+    def log_train_metrics(
+        self,
+        update_idx: int,
+        loss_dict: Dict[str, float],
+        transitions: List[TextTransition],
+    ) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        path = self.output_dir / "train_curve.csv"
+        header = (
+            "row_idx,update_idx,num_transitions,loss,policy_loss,value_loss,entropy,"
+            "reward_mean,adv_mean,return_mean,value_mean,explained_var,"
+            "clipfrac,approx_kl,value_clipfrac"
+        )
+        row_idx, _ = self._prepare_csv_log(path, header)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{row_idx},{update_idx},{len(transitions)},"
+                f"{loss_dict.get('loss', 0.0)},{loss_dict.get('policy', 0.0)},"
+                f"{loss_dict.get('value', 0.0)},{loss_dict.get('entropy', 0.0)},"
+                f"{loss_dict.get('reward_mean', 0.0)},{loss_dict.get('adv_mean', 0.0)},"
+                f"{loss_dict.get('return_mean', 0.0)},{loss_dict.get('value_mean', 0.0)},"
+                f"{loss_dict.get('explained_var', 0.0)},"
+                f"{loss_dict.get('clipfrac', 0.0)},{loss_dict.get('approx_kl', 0.0)},"
+                f"{loss_dict.get('value_clipfrac', 0.0)}\n"
             )
 
     def log_performance(self, update_idx: int):
@@ -1523,30 +1910,15 @@ class MAPPOTrainer:
 
         path = self.output_dir / "performance_curve.csv"
         header = (
-            "update_idx,model_update_idx,env_steps,episodes_completed,success_episodes,success_rate,"
+            "row_idx,update_idx,model_update_idx,env_steps,episodes_completed,success_episodes,success_rate,"
             "env_reward_sum,avg_step_reward,positive_reward_steps,"
             "policy_calls,avg_calls_per_step,"
             "episode_return_sum,avg_episode_return,avg_episode_len"
         )
-        if not path.exists():
-            path.write_text(header + "\n", encoding="utf-8")
-        else:
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-            except OSError:
-                first_line = ""
-            if first_line != header:
-                # Don't overwrite existing logs; start fresh if schema mismatch.
-                backup = path.with_suffix(path.suffix + ".bak")
-                try:
-                    path.replace(backup)
-                except OSError:
-                    pass
-                path.write_text(header + "\n", encoding="utf-8")
+        row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as f:
             f.write(
-                f"{update_idx},{'' if model_update_idx is None else model_update_idx},{env_steps},{episodes},{successes},{success_rate},"
+                f"{row_idx},{update_idx},{'' if model_update_idx is None else model_update_idx},{env_steps},{episodes},{successes},{success_rate},"
                 f"{env_reward_sum},{avg_step_reward},{pos_steps},"
                 f"{policy_calls},{avg_calls_per_step},"
                 f"{ep_return_sum},{avg_episode_return},{avg_episode_len}\n"
@@ -1668,6 +2040,7 @@ class MAPPOTrainer:
         return {
             "prompt_ids": _cpu(t.prompt_ids),
             "response_ids": _cpu(t.response_ids),
+            "critic_input_ids": _cpu(t.critic_input_ids),
             "log_prob": t.log_prob,
             "value": t.value,
             "reward": t.reward,
@@ -1687,6 +2060,7 @@ class MAPPOTrainer:
         return TextTransition(
             prompt_ids=d["prompt_ids"],
             response_ids=d["response_ids"],
+            critic_input_ids=d.get("critic_input_ids"),
             log_prob=float(d["log_prob"]),
             value=float(d["value"]),
             reward=float(d["reward"]),
@@ -1713,6 +2087,54 @@ class MAPPOTrainer:
         path = self.rollout_dir / f"rollout_rank{self.accelerator.process_index}_u{update_idx:05d}.pt"
         payload = [self._transition_to_dict(t) for t in transitions]
         torch.save(payload, path)
+
+    def _initial_cache_path(self, update_idx: int, rank: Optional[int] = None) -> Path:
+        use_rank = self.accelerator.process_index if rank is None else int(rank)
+        return (
+            self.initial_rollout_cache_dir
+            / f"rollout_rank{use_rank}_u{int(update_idx):05d}.pt"
+        )
+
+    def _maybe_save_initial_cached_rollout(
+        self, update_idx: int, transitions: List[TextTransition]
+    ) -> None:
+        if self.initial_rollout_cache_updates <= 0:
+            return
+        if int(update_idx) > self.initial_rollout_cache_updates:
+            return
+        if not transitions:
+            return
+        path = self._initial_cache_path(update_idx)
+        if path.exists():
+            return
+        payload = [self._transition_to_dict(t) for t in transitions]
+        torch.save(payload, path)
+        if self.accelerator.is_main_process:
+            self.accelerator.print(
+                f"[MAPPO] Saved initial cached rollout -> {path}"
+            )
+
+    def _maybe_load_initial_cached_rollout(self, update_idx: int) -> bool:
+        if not self.reuse_initial_rollout_cache:
+            return False
+        if self.initial_rollout_cache_updates <= 0:
+            return False
+        if int(update_idx) > self.initial_rollout_cache_updates:
+            return False
+        self.accelerator.wait_for_everyone()
+        world_size = max(1, int(self.accelerator.num_processes))
+        paths = [
+            self._initial_cache_path(update_idx, rank=rank)
+            for rank in range(world_size)
+        ]
+        if not all(path.exists() for path in paths):
+            return False
+        loaded: List[TextTransition] = []
+        for path in paths:
+            data = torch.load(path, map_location="cpu")
+            loaded.extend([self._dict_to_transition(d) for d in data])
+        self.buffer.storage = loaded
+        return True
 
     def load_rollouts(self) -> List[TextTransition]:
         self.accelerator.wait_for_everyone()

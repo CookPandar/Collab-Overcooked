@@ -102,20 +102,60 @@ class RLPlannerProxy:
     :class:`LLMAgents` can continue to interact with it transparently.
     """
 
-    def __init__(self, planner, agent_index: int, policy_fn: RLPolicyFn):
+    def __init__(
+        self,
+        planner,
+        agent_index: int,
+        policy_fn: RLPolicyFn,
+        shared_trace_store: Optional[Dict[int, Dict[str, Any]]] = None,
+    ):
         object.__setattr__(self, "_planner", planner)
         object.__setattr__(self, "agent_index", agent_index)
         object.__setattr__(self, "policy_fn", policy_fn)
         object.__setattr__(self, "_records", [])  # type: ignore[var-annotated]
+        object.__setattr__(self, "_shared_trace_store", shared_trace_store if shared_trace_store is not None else {})
 
     def __getattr__(self, item):
         return getattr(self._planner, item)
 
     def __setattr__(self, key, value):
-        if key in {"_planner", "agent_index", "policy_fn", "_records"}:
+        if key in {"_planner", "agent_index", "policy_fn", "_records", "_shared_trace_store"}:
             object.__setattr__(self, key, value)
         else:
             setattr(self._planner, key, value)
+
+    @staticmethod
+    def _compact_text(text: Optional[str], limit: int = 600) -> str:
+        content = (text or "").strip()
+        if len(content) <= limit:
+            return content
+        return content[: limit - 3].rstrip() + "..."
+
+    @classmethod
+    def _extract_observation_excerpt(cls, text: Optional[str]) -> str:
+        content = text or ""
+        anchors = [
+            "Current Observation:",
+            "Current observation:",
+            "Observation:",
+            "Scene:",
+        ]
+        for anchor in anchors:
+            start = content.find(anchor)
+            if start == -1:
+                continue
+            end_candidates = [
+                pos for pos in (
+                    content.find("\n\n", start + len(anchor)),
+                    content.find("Think:", start + len(anchor)),
+                    content.find("Recent Goal:", start + len(anchor)),
+                    content.find("Action:", start + len(anchor)),
+                )
+                if pos != -1
+            ]
+            end = min(end_candidates) if end_candidates else len(content)
+            return cls._compact_text(content[start:end].strip(), limit=900)
+        return cls._compact_text(content, limit=900)
 
     # pylint: disable=too-many-arguments
     def query(
@@ -153,6 +193,19 @@ class RLPlannerProxy:
             "agent_name": getattr(self._planner, "name", None),
             "timestep": getattr(self._planner, "current_timestep", None),
         }
+        latest_user_message = next(
+            (msg for msg in reversed(messages) if msg.get("role") == "user"),
+            {},
+        )
+        latest_user_content = latest_user_message.get("content", "")
+        context["prompt_excerpt"] = self._compact_text(latest_user_content, limit=1200)
+        context["observation_excerpt"] = self._extract_observation_excerpt(
+            latest_user_content
+        )
+        context["global_observation"] = copy.deepcopy(
+            getattr(self._planner, "_rl_global_observation", None)
+        )
+        context["shared_agent_traces"] = copy.deepcopy(self._shared_trace_store)
         call_context = getattr(self._planner, "_rl_call_context", None)
         if isinstance(call_context, dict):
             context.update(call_context)
@@ -176,6 +229,15 @@ class RLPlannerProxy:
             timestep=context.get("timestep"),
         )
         self._records.append(record)
+        self._shared_trace_store[self.agent_index] = {
+            "agent_index": self.agent_index,
+            "agent_name": context.get("agent_name"),
+            "timestep": context.get("timestep"),
+            "call_type": context.get("call_type"),
+            "observation_excerpt": context.get("observation_excerpt", ""),
+            "prompt_excerpt": context.get("prompt_excerpt", ""),
+            "response_excerpt": self._compact_text(response_text, limit=800),
+        }
         print(
             "[RLPlannerProxy] agent="
             f"{self.agent_index} response_tokens={token_count} meta_keys={sorted(metadata.keys())}"
@@ -203,6 +265,16 @@ class RLPlannerProxy:
             metadata = dict(record.metadata or {})
             metadata.update(extra_metadata)
             record.metadata = metadata
+        return True
+
+    def annotate_last_record(self, extra_metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Attach metadata to the most recent query record without changing call_type."""
+        if not self._records or not extra_metadata:
+            return False
+        record = self._records[-1]
+        metadata = dict(record.metadata or {})
+        metadata.update(extra_metadata)
+        record.metadata = metadata
         return True
 
 
@@ -267,10 +339,16 @@ class CollabMainSession:
         self.agents = self._build_agents()
         self.team = AgentGroup(*self.agents)
         self._init_policy_record_logging(len(self.agents))
+        self._shared_agent_traces: Dict[int, Dict[str, Any]] = {}
         self.rl_modules: List[RLPlannerProxy] = []
         for idx, agent in enumerate(self.team.agents):
             if isinstance(agent, LLMAgents):
-                proxy = RLPlannerProxy(agent.planner, idx, self.policy_fn)
+                proxy = RLPlannerProxy(
+                    agent.planner,
+                    idx,
+                    self.policy_fn,
+                    shared_trace_store=self._shared_agent_traces,
+                )
                 agent.planner = proxy
                 proxy.disable_remote_calls()
                 self.rl_modules.append(proxy)
@@ -293,6 +371,7 @@ class CollabMainSession:
         if self.reward_tracker:
             self.reward_tracker.reset()
         self.team.reset()
+        self._shared_agent_traces.clear()
         for proxy in self.rl_modules:
             proxy.consume_records()
         return self._build_observation(self.env.state)
@@ -308,6 +387,9 @@ class CollabMainSession:
 
     def step(self) -> SessionStep:
         state = self.env.state
+        current_observation = self._build_observation(state)
+        for proxy in self.rl_modules:
+            setattr(proxy, "_rl_global_observation", current_observation)
         print(f"[CollabMainSession] Beginning step at timestep {state.timestep}")
         joint_action, pickup_parm = self.team.joint_action(state)
         obs, reward, done, env_info = self.env.step(joint_action, pickup_parm)
@@ -414,49 +496,78 @@ class CollabMainSession:
         if not records:
             return
         reward_queues: Dict[int, List[Dict[str, Any]]] = {0: [], 1: []}
+        reward_by_call_index: Dict[int, Dict[int, Dict[str, Any]]] = {0: {}, 1: {}}
         if process_reward and isinstance(process_reward, dict):
             per_agent = process_reward.get("per_agent") or []
             for agent_idx in range(min(len(per_agent), 2)):
                 agent_calls = per_agent[agent_idx].get("calls") if isinstance(per_agent[agent_idx], dict) else None
                 if agent_calls:
-                    reward_queues[agent_idx].extend(agent_calls)
+                    for entry in agent_calls:
+                        if not isinstance(entry, dict):
+                            continue
+                        reward_queues[agent_idx].append(entry)
+                        call_index = entry.get("call_index")
+                        if call_index is not None:
+                            reward_by_call_index[agent_idx][int(call_index)] = entry
 
-        action_call_types = {"planner_main"}
         for idx, record in enumerate(records):
-            call_type = (record.context or {}).get("call_type")
             metadata = dict(record.metadata)
-            if call_type:
-                metadata.setdefault("call_type", call_type)
-            if call_type in action_call_types:
+            context_call_type = (record.context or {}).get("call_type")
+            action_mode = metadata.get("action_mode")
+            semantic_call_type = (
+                action_mode
+                if action_mode in {"planner_main", "communication"}
+                else context_call_type
+            )
+            if context_call_type:
+                metadata.setdefault("call_type", context_call_type)
+            if semantic_call_type:
+                metadata.setdefault("semantic_call_type", semantic_call_type)
+            reward_entry = None
+            call_index = metadata.get("call_index")
+            if call_index is not None:
+                reward_entry = reward_by_call_index.get(record.agent_index, {}).pop(
+                    int(call_index), None
+                )
+                if reward_entry is not None:
+                    queue = reward_queues.get(record.agent_index, [])
+                    reward_queues[record.agent_index] = [
+                        entry for entry in queue if entry is not reward_entry
+                    ]
+            if reward_entry is None:
                 queue = reward_queues.get(record.agent_index, [])
                 reward_entry = queue.pop(0) if queue else None
-                if reward_entry:
-                    seq_reward = float(reward_entry.get("sequence_reward", 0.0))
-                    fmt_reward = float(reward_entry.get("format_reward", 0.0))
-                    validator_reward = float(reward_entry.get("validator_reward", 0.0))
-                    # RL scalar reward: include validator penalties as part of the training signal.
-                    record.reward = seq_reward + fmt_reward + validator_reward
-                    breakdown = {
-                        "sequence_reward": seq_reward,
-                        "format_reward": fmt_reward,
-                        "validator_reward": validator_reward,
-                        "call_type": reward_entry.get("call_type"),
-                        "raw": reward_entry,
-                    }
-                    metadata["reward_breakdown"] = breakdown
-                else:
-                    record.reward = 0.0
-                    metadata.setdefault("reward_breakdown", {}).setdefault("missing_reward_entry", True)
+            if reward_entry:
+                seq_reward = float(reward_entry.get("sequence_reward", 0.0))
+                fmt_reward = float(reward_entry.get("format_reward", 0.0))
+                validator_reward = float(reward_entry.get("validator_reward", 0.0))
+                communication_reward = float(
+                    reward_entry.get("communication_reward", 0.0)
+                )
+                record.reward = (
+                    seq_reward + fmt_reward + validator_reward + communication_reward
+                )
+                breakdown = {
+                    "sequence_reward": seq_reward,
+                    "format_reward": fmt_reward,
+                    "validator_reward": validator_reward,
+                    "communication_reward": communication_reward,
+                    "call_type": reward_entry.get("call_type"),
+                    "raw": reward_entry,
+                }
+                metadata["reward_breakdown"] = breakdown
             else:
                 record.reward = 0.0
-                metadata.setdefault("reward_breakdown", {}).setdefault("communication_reward", 0.0)
+                metadata.setdefault("reward_breakdown", {}).setdefault(
+                    "missing_reward_entry", True
+                )
             record.metadata = metadata
             record.done = bool(done_flag) if idx == len(records) - 1 else False
 
     def _metadata_snapshot(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
         for key, value in metadata.items():
-            if key in {"prompt_ids", "response_ids"}:
+            if key in {"prompt_ids", "response_ids", "critic_input_ids"}:
                 length = 0
                 if hasattr(value, "numel"):
                     try:

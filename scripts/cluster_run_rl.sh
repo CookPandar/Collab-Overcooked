@@ -34,6 +34,7 @@ COLLECT_CFG="${RL_COLLECT_CONFIG:-}"
 TRAIN_CFG="${RL_TRAIN_CONFIG:-}"
 EVAL_CFG="${RL_EVAL_CONFIG:-}"
 LOOP_ROUNDS="${RL_LOOP_ROUNDS:-1}"
+EVAL_EVERY="${RL_EVAL_EVERY:-5}"
 RUN_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -179,7 +180,8 @@ run_stage() {
     return "$stage_status"
 }
 
-# 三阶段模式：任意一个阶段配置存在，就按 Round 循环执行 collect -> train -> eval（缺省阶段会跳过）。
+# 三阶段模式：任意一个阶段配置存在，就按 Round 循环执行 collect -> train，
+# eval 默认每 5 轮执行一次（可用 RL_EVAL_EVERY 覆盖；设为 1 表示每轮都 eval）。
 if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
     STATUS=0
     for ((i=1; i<=LOOP_ROUNDS; i++)); do
@@ -204,11 +206,15 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
         fi
 
         if [[ -n "$EVAL_CFG" ]]; then
-            run_stage "Round ${i} eval" "$EVAL_CFG" "$EVAL_NUM_PROCS"
-            STATUS=$?
-            if [[ $STATUS -ne 0 ]]; then
-                echo "[cluster-rl] Eval failed (round $i), abort." >&2
-                break
+            if (( EVAL_EVERY > 0 )) && (( i % EVAL_EVERY == 0 )); then
+                run_stage "Round ${i} eval" "$EVAL_CFG" "$EVAL_NUM_PROCS"
+                STATUS=$?
+                if [[ $STATUS -ne 0 ]]; then
+                    echo "[cluster-rl] Eval failed (round $i), abort." >&2
+                    break
+                fi
+            else
+                echo "[cluster-rl] Round ${i} skip eval (eval_every=${EVAL_EVERY})"
             fi
         fi
     done

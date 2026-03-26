@@ -27,6 +27,7 @@ trainer:
   # 训练输出 & rollouts 读取
   rollout_dir: "./rollouts"
   output_dir: "runs/rl/train"
+  initial_rollout_cache_dir: runs/rl/train/initial_rollout_cache
   save_interval: 10
   checkpoint_interval: 0
 
@@ -43,10 +44,9 @@ trainer:
   # PPO/MAPPO 超参
   gamma: 0.99
   gae_lambda: 0.95
-  lr: 1.0e-5
-  steps_per_update: 24
+  lr: 5.0e-6
   train_batch_size: 1
-  total_updates: 15
+  update_epochs: 2
   clip_coef: 0.2
   entropy_coef: 0.01
   value_coef: 0.5
