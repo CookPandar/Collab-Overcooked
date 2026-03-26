@@ -6,7 +6,7 @@ trainer:
   collect_only: true
   steps_per_update: 24
   total_updates: 1
-  model_path: ../models/qwen2.5-7b            # 共享基座
+  model_path: /datacache/LLMs/Qwen2.5-7B-Instruct            # 共享基座
   lora_path: null
   actor_adapters:
     agent_0:

@@ -37,6 +37,7 @@ class TextTransition:
     prompt_ids: torch.Tensor
     response_ids: torch.Tensor
     log_prob: float
+    policy_temperature: Optional[float]
     value: float
     reward: float
     done: float
@@ -85,6 +86,7 @@ class LMGenerationResult:
         prompt_ids: torch.Tensor,
         response_ids: torch.Tensor,
         log_prob: float,
+        policy_temperature: Optional[float],
         entropy: float,
         value: float,
         critic_input_ids: Optional[torch.Tensor] = None,
@@ -93,6 +95,7 @@ class LMGenerationResult:
         self.prompt_ids = prompt_ids
         self.response_ids = response_ids
         self.log_prob = log_prob
+        self.policy_temperature = policy_temperature
         self.entropy = entropy
         self.value = value
         self.critic_input_ids = critic_input_ids
@@ -179,6 +182,13 @@ class QwenLMActorCritic(nn.Module):
         self.device = device
         self.eval_batch_size = max(1, int(eval_batch_size))
         self.to(device)
+
+    def _effective_policy_temperature(self) -> Optional[float]:
+        """Return the sampling temperature used to define policy log-probs."""
+        if self.temperature is None:
+            return None
+        temp = float(self.temperature)
+        return temp if temp > 0.0 else None
 
     def _build_lora_config(self, override: Optional[Dict[str, Any]] = None) -> LoraConfig:
         cfg = dict(self.default_lora_cfg or {})
@@ -381,6 +391,7 @@ class QwenLMActorCritic(nn.Module):
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             log_prob=total_log_prob,
+            policy_temperature=self._effective_policy_temperature(),
             entropy=avg_entropy,
             value=value,
             critic_input_ids=critic_input_ids,
@@ -404,6 +415,7 @@ class QwenLMActorCritic(nn.Module):
         response_tensors: List[torch.Tensor],
         agent_indices: List[int],
         critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
+        policy_temperatures: Optional[List[Optional[float]]] = None,
     ):
         num_samples = len(prompt_tensors)
         prompt_device = [t.to(self.device) for t in prompt_tensors]
@@ -416,6 +428,8 @@ class QwenLMActorCritic(nn.Module):
         log_probs_buf: List[Optional[torch.Tensor]] = [None] * num_samples
         entropy_buf: List[Optional[torch.Tensor]] = [None] * num_samples
         values_buf: List[Optional[torch.Tensor]] = [None] * num_samples
+        if policy_temperatures is None:
+            policy_temperatures = [self._effective_policy_temperature()] * num_samples
 
         groups: Dict[Optional[str], List[int]] = {}
         if self.actor_adapters:
@@ -453,6 +467,7 @@ class QwenLMActorCritic(nn.Module):
                 logp, ent, vals = self._evaluate_chunk(
                     subset_prompts,
                     subset_responses,
+                    policy_temperatures=[policy_temperatures[i] for i in sample_indices],
                     need_policy=True,
                     need_value=need_actor_values,
                 )
@@ -483,6 +498,7 @@ class QwenLMActorCritic(nn.Module):
         self,
         prompt_tensors: List[torch.Tensor],
         response_tensors: List[torch.Tensor],
+        policy_temperatures: Optional[List[Optional[float]]] = None,
         need_policy: bool = True,
         need_value: bool = True,
     ):
@@ -507,6 +523,8 @@ class QwenLMActorCritic(nn.Module):
         log_probs: List[torch.Tensor] = []
         entropies: List[torch.Tensor] = []
         values: List[torch.Tensor] = []
+        if policy_temperatures is None:
+            policy_temperatures = [self._effective_policy_temperature()] * input_ids.size(0)
         for i in range(input_ids.size(0)):
             p_len = int(prompt_lengths[i].item())
             r_len = int(response_lengths[i].item())
@@ -518,6 +536,12 @@ class QwenLMActorCritic(nn.Module):
                     start = max(p_len - 1, 0)
                     end = start + r_len
                     token_logits = logits[i, start:end, :]
+                    temp = policy_temperatures[i]
+                    if temp is not None:
+                        # Align PPO re-evaluation with generation-time sampling scores.
+                        temp_value = float(temp)
+                        if temp_value > 0.0:
+                            token_logits = token_logits / temp_value
                     token_ids = input_ids[i, p_len : p_len + r_len]
                     logprob = torch.log_softmax(token_logits, dim=-1)
                     gathered = logprob.gather(dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
@@ -1499,6 +1523,7 @@ class MAPPOTrainer:
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
                 log_prob=meta["log_prob"],
+                policy_temperature=meta.get("policy_temperature"),
                 value=meta["value"],
                 reward=reward,
                 done=done,
@@ -1667,6 +1692,7 @@ class MAPPOTrainer:
         response_tensors = [t.response_ids for t in transitions]
         critic_tensors = [t.critic_input_ids for t in transitions]
         agent_indices = [t.agent_index for t in transitions]
+        policy_temperatures = [t.policy_temperature for t in transitions]
         old_log_probs = torch.tensor(
             [t.log_prob for t in transitions], dtype=torch.float32, device=self.device
         )
@@ -1721,6 +1747,7 @@ class MAPPOTrainer:
                     batch_responses,
                     batch_agent_indices,
                     critic_tensors=batch_critic,
+                    policy_temperatures=[policy_temperatures[i] for i in batch_indices],
                 )
                 log_probs = log_probs.to(self.device, dtype=torch.float32)
                 entropies = entropies.to(self.device, dtype=torch.float32)
@@ -2204,6 +2231,7 @@ class MAPPOTrainer:
             "response_ids": _cpu(t.response_ids),
             "critic_input_ids": _cpu(t.critic_input_ids),
             "log_prob": t.log_prob,
+            "policy_temperature": t.policy_temperature,
             "value": t.value,
             "reward": t.reward,
             "done": t.done,
@@ -2224,6 +2252,11 @@ class MAPPOTrainer:
             response_ids=d["response_ids"],
             critic_input_ids=d.get("critic_input_ids"),
             log_prob=float(d["log_prob"]),
+            policy_temperature=(
+                float(d["policy_temperature"])
+                if d.get("policy_temperature") is not None
+                else None
+            ),
             value=float(d["value"]),
             reward=float(d["reward"]),
             done=float(d["done"]),
