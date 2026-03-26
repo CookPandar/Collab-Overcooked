@@ -644,6 +644,11 @@ class MAPPOTrainer:
             "value_clip_coef", trainer_cfg.get("cliprange_value", self.clip_coef)
         )
         self.shuffle_minibatches = bool(trainer_cfg.get("shuffle_minibatches", True))
+        self.gradient_accumulation_steps = max(
+            1, int(trainer_cfg.get("gradient_accumulation_steps", 8))
+        )
+        target_kl_cfg = trainer_cfg.get("target_kl", None)
+        self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
         self.entropy_coef = trainer_cfg.get("entropy_coef", 0.01)
         self.value_coef = trainer_cfg.get("value_coef", 0.5)
         self.max_grad_norm = trainer_cfg.get("max_grad_norm", 0.5)
@@ -732,10 +737,26 @@ class MAPPOTrainer:
             "policy_calls": 0,
             "episode_return_sum": 0.0,
             "episode_lengths_sum": 0,
+            "agent0_custom_return_sum": 0.0,
+            "agent1_custom_return_sum": 0.0,
+            "team_custom_return_sum": 0.0,
         }
         self._current_episode_return = 0.0
         self._current_episode_length = 0
         self._current_episode_has_positive = False
+        self._current_episode_custom_stats = {
+            "agent0_total": 0.0,
+            "agent0_sequence": 0.0,
+            "agent0_format": 0.0,
+            "agent0_validator": 0.0,
+            "agent0_comm": 0.0,
+            "agent1_total": 0.0,
+            "agent1_sequence": 0.0,
+            "agent1_format": 0.0,
+            "agent1_validator": 0.0,
+            "agent1_comm": 0.0,
+            "team_total": 0.0,
+        }
 
     def _prepare_csv_log(self, path: Path, header: str) -> Tuple[int, Optional[Dict[str, str]]]:
         """Ensure the CSV header exists and return the next monotonic row index."""
@@ -767,10 +788,21 @@ class MAPPOTrainer:
                 last_row = dict(zip(columns, values))
         return len(lines), last_row
 
-    def _log_episode_return(self, episode_return: float, episode_len: int, had_positive: bool):
+    def _log_episode_return(
+        self,
+        episode_return: float,
+        episode_len: int,
+        had_positive: bool,
+        custom_stats: Dict[str, float],
+    ):
         if not self._episode_log_path:
             return
-        header = "row_idx,update_idx,episode_idx,episode_return,episode_len,had_positive,rank"
+        header = (
+            "row_idx,update_idx,episode_idx,episode_return,episode_len,had_positive,rank,"
+            "agent0_custom_return,agent0_sequence_sum,agent0_format_sum,agent0_validator_sum,agent0_comm_sum,"
+            "agent1_custom_return,agent1_sequence_sum,agent1_format_sum,agent1_validator_sum,agent1_comm_sum,"
+            "team_custom_return"
+        )
         row_idx, _ = self._prepare_csv_log(self._episode_log_path, header)
         update_idx = self._current_update_idx if self._current_update_idx is not None else -1
         rank = self.accelerator.process_index
@@ -778,10 +810,60 @@ class MAPPOTrainer:
         with self._episode_log_path.open("a", encoding="utf-8") as f:
             f.write(
                 f"{row_idx},{update_idx},{self._episode_counter},{episode_return},"
-                f"{episode_len},{1 if had_positive else 0},{rank}\n"
+                f"{episode_len},{1 if had_positive else 0},{rank},"
+                f"{custom_stats.get('agent0_total', 0.0)},{custom_stats.get('agent0_sequence', 0.0)},"
+                f"{custom_stats.get('agent0_format', 0.0)},{custom_stats.get('agent0_validator', 0.0)},"
+                f"{custom_stats.get('agent0_comm', 0.0)},"
+                f"{custom_stats.get('agent1_total', 0.0)},{custom_stats.get('agent1_sequence', 0.0)},"
+                f"{custom_stats.get('agent1_format', 0.0)},{custom_stats.get('agent1_validator', 0.0)},"
+                f"{custom_stats.get('agent1_comm', 0.0)},{custom_stats.get('team_total', 0.0)}\n"
             )
 
-    def _update_rollout_stats(self, step_reward: float, done: bool, policy_calls: int):
+    def _extract_step_custom_reward_stats(
+        self, process_reward: Optional[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        stats = {
+            "agent0_total": 0.0,
+            "agent0_sequence": 0.0,
+            "agent0_format": 0.0,
+            "agent0_validator": 0.0,
+            "agent0_comm": 0.0,
+            "agent1_total": 0.0,
+            "agent1_sequence": 0.0,
+            "agent1_format": 0.0,
+            "agent1_validator": 0.0,
+            "agent1_comm": 0.0,
+            "team_total": 0.0,
+        }
+        if not process_reward or not isinstance(process_reward, dict):
+            return stats
+        per_agent = process_reward.get("per_agent") or []
+        for agent_idx in range(min(len(per_agent), 2)):
+            reward_entry = per_agent[agent_idx]
+            if not isinstance(reward_entry, dict):
+                continue
+            calls = reward_entry.get("calls") or []
+            seq = sum(float(call.get("sequence_reward", 0.0) or 0.0) for call in calls)
+            fmt = sum(float(call.get("format_reward", 0.0) or 0.0) for call in calls)
+            validator = sum(float(call.get("validator_reward", 0.0) or 0.0) for call in calls)
+            comm = sum(float(call.get("communication_reward", 0.0) or 0.0) for call in calls)
+            total = seq + fmt + validator + comm
+            prefix = f"agent{agent_idx}"
+            stats[f"{prefix}_total"] = total
+            stats[f"{prefix}_sequence"] = seq
+            stats[f"{prefix}_format"] = fmt
+            stats[f"{prefix}_validator"] = validator
+            stats[f"{prefix}_comm"] = comm
+            stats["team_total"] += total
+        return stats
+
+    def _update_rollout_stats(
+        self,
+        step_reward: float,
+        done: bool,
+        policy_calls: int,
+        process_reward: Optional[Dict[str, Any]] = None,
+    ):
         stats = self._last_rollout_stats
         stats["env_steps"] += 1
         stats["env_reward_sum"] += float(step_reward)
@@ -791,20 +873,35 @@ class MAPPOTrainer:
             self._current_episode_has_positive = True
         self._current_episode_return += float(step_reward)
         self._current_episode_length += 1
+        step_custom_stats = self._extract_step_custom_reward_stats(process_reward)
+        for key, value in step_custom_stats.items():
+            self._current_episode_custom_stats[key] += float(value)
         if done:
             stats["episodes_completed"] += 1
             if self._current_episode_has_positive:
                 stats["success_episodes"] += 1
             stats["episode_return_sum"] += float(self._current_episode_return)
             stats["episode_lengths_sum"] += int(self._current_episode_length)
+            stats["agent0_custom_return_sum"] += float(
+                self._current_episode_custom_stats["agent0_total"]
+            )
+            stats["agent1_custom_return_sum"] += float(
+                self._current_episode_custom_stats["agent1_total"]
+            )
+            stats["team_custom_return_sum"] += float(
+                self._current_episode_custom_stats["team_total"]
+            )
             self._log_episode_return(
                 episode_return=self._current_episode_return,
                 episode_len=self._current_episode_length,
                 had_positive=self._current_episode_has_positive,
+                custom_stats=dict(self._current_episode_custom_stats),
             )
             self._current_episode_return = 0.0
             self._current_episode_length = 0
             self._current_episode_has_positive = False
+            for key in list(self._current_episode_custom_stats.keys()):
+                self._current_episode_custom_stats[key] = 0.0
 
     def _rollout_reached_horizon(self, step_result: SessionStep) -> bool:
         if self.rollout_horizon is None:
@@ -1417,6 +1514,7 @@ class MAPPOTrainer:
                 step_reward=step_result.reward,
                 done=bool(step_result.done),
                 policy_calls=len(records),
+                process_reward=step_result.process_reward,
             )
             if (
                 self.max_records_per_step
@@ -1474,6 +1572,7 @@ class MAPPOTrainer:
                 step_reward=step_result.reward,
                 done=bool(step_result.done),
                 policy_calls=len(records),
+                process_reward=step_result.process_reward,
             )
             if (
                 self.max_records_per_step
@@ -1577,6 +1676,10 @@ class MAPPOTrainer:
         total_clipfrac = 0.0
         total_approx_kl = 0.0
         total_value_clipfrac = 0.0
+        metric_steps = 0
+        actual_optimization_steps = 0
+        accum_counter = 0
+        stop_early = False
 
         self.optimizer.zero_grad()
         for _ in range(self.update_epochs):
@@ -1630,7 +1733,22 @@ class MAPPOTrainer:
                     + self.entropy_coef * entropy_loss
                 )
 
-                self.accelerator.backward(loss / total_optimization_steps)
+                self.accelerator.backward(
+                    loss / float(self.gradient_accumulation_steps)
+                )
+                accum_counter += 1
+                should_step = (
+                    accum_counter >= self.gradient_accumulation_steps
+                    or end >= num_transitions
+                )
+                if should_step:
+                    self.accelerator.clip_grad_norm_(
+                        self.text_policy.parameters(), self.max_grad_norm
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    actual_optimization_steps += 1
+                    accum_counter = 0
 
                 total_loss += loss.item()
                 total_policy += policy_loss.item()
@@ -1643,18 +1761,26 @@ class MAPPOTrainer:
                 total_value_clipfrac += (
                     (value_losses_clipped > value_losses).float().mean().item()
                 )
+                metric_steps += 1
+                if (
+                    should_step
+                    and self.target_kl is not None
+                    and abs((batch_old_log_probs - log_probs).mean().item()) > self.target_kl
+                ):
+                    stop_early = True
+                    break
+            if stop_early:
+                break
 
-        self.accelerator.clip_grad_norm_(self.text_policy.parameters(), self.max_grad_norm)
-        self.optimizer.step()
-
-        avg_loss = total_loss / total_optimization_steps if total_optimization_steps > 0 else 0.0
-        avg_policy = total_policy / total_optimization_steps if total_optimization_steps > 0 else 0.0
-        avg_value = total_value / total_optimization_steps if total_optimization_steps > 0 else 0.0
-        avg_entropy = total_entropy / total_optimization_steps if total_optimization_steps > 0 else 0.0
-        avg_clipfrac = total_clipfrac / total_optimization_steps if total_optimization_steps > 0 else 0.0
-        avg_approx_kl = total_approx_kl / total_optimization_steps if total_optimization_steps > 0 else 0.0
+        metric_denom = metric_steps if metric_steps > 0 else 1
+        avg_loss = total_loss / metric_denom if metric_denom > 0 else 0.0
+        avg_policy = total_policy / metric_denom if metric_denom > 0 else 0.0
+        avg_value = total_value / metric_denom if metric_denom > 0 else 0.0
+        avg_entropy = total_entropy / metric_denom if metric_denom > 0 else 0.0
+        avg_clipfrac = total_clipfrac / metric_denom if metric_denom > 0 else 0.0
+        avg_approx_kl = total_approx_kl / metric_denom if metric_denom > 0 else 0.0
         avg_value_clipfrac = (
-            total_value_clipfrac / total_optimization_steps if total_optimization_steps > 0 else 0.0
+            total_value_clipfrac / metric_denom if metric_denom > 0 else 0.0
         )
         reward_mean = (
             float(sum(float(t.reward) for t in transitions)) / float(len(transitions))
@@ -1684,6 +1810,8 @@ class MAPPOTrainer:
             "clipfrac": avg_clipfrac,
             "approx_kl": avg_approx_kl,
             "value_clipfrac": avg_value_clipfrac,
+            "optimizer_steps": float(actual_optimization_steps),
+            "stopped_early": 1.0 if stop_early else 0.0,
         }
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
@@ -1803,7 +1931,7 @@ class MAPPOTrainer:
         header = (
             "row_idx,update_idx,num_transitions,loss,policy_loss,value_loss,entropy,"
             "reward_mean,adv_mean,return_mean,value_mean,explained_var,"
-            "clipfrac,approx_kl,value_clipfrac"
+            "clipfrac,approx_kl,value_clipfrac,optimizer_steps,stopped_early"
         )
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as handle:
@@ -1815,7 +1943,8 @@ class MAPPOTrainer:
                 f"{loss_dict.get('return_mean', 0.0)},{loss_dict.get('value_mean', 0.0)},"
                 f"{loss_dict.get('explained_var', 0.0)},"
                 f"{loss_dict.get('clipfrac', 0.0)},{loss_dict.get('approx_kl', 0.0)},"
-                f"{loss_dict.get('value_clipfrac', 0.0)}\n"
+                f"{loss_dict.get('value_clipfrac', 0.0)},{loss_dict.get('optimizer_steps', 0.0)},"
+                f"{loss_dict.get('stopped_early', 0.0)}\n"
             )
 
     def log_performance(self, update_idx: int):
@@ -1829,6 +1958,9 @@ class MAPPOTrainer:
         policy_calls_local = float(stats.get("policy_calls", 0) or 0)
         ep_return_sum_local = float(stats.get("episode_return_sum", 0.0) or 0.0)
         ep_len_sum_local = float(stats.get("episode_lengths_sum", 0) or 0)
+        agent0_custom_sum_local = float(stats.get("agent0_custom_return_sum", 0.0) or 0.0)
+        agent1_custom_sum_local = float(stats.get("agent1_custom_return_sum", 0.0) or 0.0)
+        team_custom_sum_local = float(stats.get("team_custom_return_sum", 0.0) or 0.0)
 
         # Aggregate across ranks so curves reflect full multi-proc sampling throughput.
         packed = torch.tensor(
@@ -1841,6 +1973,9 @@ class MAPPOTrainer:
                 policy_calls_local,
                 ep_return_sum_local,
                 ep_len_sum_local,
+                agent0_custom_sum_local,
+                agent1_custom_sum_local,
+                team_custom_sum_local,
             ],
             device=self.device,
             dtype=torch.float64,
@@ -1878,6 +2013,9 @@ class MAPPOTrainer:
             policy_calls_f,
             ep_return_sum,
             ep_len_sum_f,
+            agent0_custom_sum,
+            agent1_custom_sum,
+            team_custom_sum,
         ) = [float(x) for x in summed.tolist()]
         env_steps = int(env_steps_f)
         episodes = int(episodes_f)
@@ -1891,6 +2029,9 @@ class MAPPOTrainer:
         avg_episode_return = ep_return_sum / episodes if episodes > 0 else 0.0
         avg_episode_len = ep_len_sum / episodes if episodes > 0 else 0.0
         success_rate = successes / episodes if episodes > 0 else 0.0
+        avg_agent0_custom_return = agent0_custom_sum / episodes if episodes > 0 else 0.0
+        avg_agent1_custom_return = agent1_custom_sum / episodes if episodes > 0 else 0.0
+        avg_team_custom_return = team_custom_sum / episodes if episodes > 0 else 0.0
 
         # If available, attach the training update index of the currently loaded model
         # (useful when evaluation runs are launched separately and local update_idx resets).
@@ -1913,7 +2054,10 @@ class MAPPOTrainer:
             "row_idx,update_idx,model_update_idx,env_steps,episodes_completed,success_episodes,success_rate,"
             "env_reward_sum,avg_step_reward,positive_reward_steps,"
             "policy_calls,avg_calls_per_step,"
-            "episode_return_sum,avg_episode_return,avg_episode_len"
+            "episode_return_sum,avg_episode_return,avg_episode_len,"
+            "agent0_custom_return_sum,avg_agent0_custom_return,"
+            "agent1_custom_return_sum,avg_agent1_custom_return,"
+            "team_custom_return_sum,avg_team_custom_return"
         )
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as f:
@@ -1921,7 +2065,10 @@ class MAPPOTrainer:
                 f"{row_idx},{update_idx},{'' if model_update_idx is None else model_update_idx},{env_steps},{episodes},{successes},{success_rate},"
                 f"{env_reward_sum},{avg_step_reward},{pos_steps},"
                 f"{policy_calls},{avg_calls_per_step},"
-                f"{ep_return_sum},{avg_episode_return},{avg_episode_len}\n"
+                f"{ep_return_sum},{avg_episode_return},{avg_episode_len},"
+                f"{agent0_custom_sum},{avg_agent0_custom_return},"
+                f"{agent1_custom_sum},{avg_agent1_custom_return},"
+                f"{team_custom_sum},{avg_team_custom_return}\n"
             )
 
     # ------------------------------------------------------------------
