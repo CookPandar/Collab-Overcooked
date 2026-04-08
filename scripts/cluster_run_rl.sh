@@ -146,6 +146,9 @@ run_stage() {
     local stage_name="$1"
     local stage_cfg="$2"
     local stage_num_procs="$3"
+    local stage_phase="$4"
+    local stage_round_idx="$5"
+    local loop_round_idx="$6"
 
     if [[ -z "$stage_cfg" ]]; then
         return 0
@@ -156,7 +159,7 @@ run_stage() {
         stage_cfg="$(abs_path "$stage_cfg")"
     fi
 
-    echo "[cluster-rl] ${stage_name} -> ${stage_cfg} (num_procs=${stage_num_procs})"
+    echo "[cluster-rl] ${stage_name} -> ${stage_cfg} (num_procs=${stage_num_procs}, stage_round=${stage_round_idx}, loop_round=${loop_round_idx})"
     set +e
     # 集群作业环境有时会预设 WORLD_SIZE/RANK/MASTER_* 等分布式变量（例如 8 卡作业），
     # 这会导致单进程（num_procs=1）启动时依然尝试 init_process_group，最终 rendezvous timeout。
@@ -168,10 +171,19 @@ run_stage() {
             -u NODE_RANK -u GROUP_RANK -u ROLE_RANK \
             -u TORCHELASTIC_RUN_ID -u TORCHELASTIC_RESTART_COUNT -u TORCHELASTIC_MAX_RESTARTS \
             -u PET_RANK -u PET_NNODES -u PET_NODE_RANK -u PET_MASTER_ADDR -u PET_MASTER_PORT \
+            RL_STAGE_PHASE="$stage_phase" \
+            RL_STAGE_ROUND_IDX="$stage_round_idx" \
+            RL_LOOP_ROUND_IDX="$loop_round_idx" \
+            RL_LOOP_ROUNDS="$LOOP_ROUNDS" \
             "$ACCEL_BIN" launch --num_processes "$stage_num_procs" "${EXTRA_ACCEL[@]}" \
             -m collab_overcooked.main_rl --config "$stage_cfg" "${RUN_ARGS[@]}"
     else
-        "$ACCEL_BIN" launch --num_processes "$stage_num_procs" "${EXTRA_ACCEL[@]}" \
+        env \
+            RL_STAGE_PHASE="$stage_phase" \
+            RL_STAGE_ROUND_IDX="$stage_round_idx" \
+            RL_LOOP_ROUND_IDX="$loop_round_idx" \
+            RL_LOOP_ROUNDS="$LOOP_ROUNDS" \
+            "$ACCEL_BIN" launch --num_processes "$stage_num_procs" "${EXTRA_ACCEL[@]}" \
             -m collab_overcooked.main_rl --config "$stage_cfg" "${RUN_ARGS[@]}"
     fi
     local stage_status=$?
@@ -183,9 +195,13 @@ run_stage() {
 # eval 默认每 5 轮执行一次（可用 RL_EVAL_EVERY 覆盖；设为 1 表示每轮都 eval）。
 if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
     STATUS=0
+    COLLECT_ROUND=0
+    TRAIN_ROUND=0
+    EVAL_ROUND=0
     for ((i=1; i<=LOOP_ROUNDS; i++)); do
         if [[ -n "$COLLECT_CFG" ]]; then
-            run_stage "Round ${i} collect" "$COLLECT_CFG" "$COLLECT_NUM_PROCS"
+            COLLECT_ROUND=$((COLLECT_ROUND + 1))
+            run_stage "Round ${i} collect" "$COLLECT_CFG" "$COLLECT_NUM_PROCS" "collect" "$COLLECT_ROUND" "$i"
             STATUS=$?
             if [[ $STATUS -ne 0 ]]; then
                 echo "[cluster-rl] Collect failed (round $i), abort." >&2
@@ -196,7 +212,8 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
         if [[ -n "$TRAIN_CFG" ]]; then
             # 训练阶段也用 accelerate 启动，避免在集群环境中仅启动单进程却继承 WORLD_SIZE/RANK
             # 等分布式环境变量导致 init_process_group 等待其它 rank 最终 timeout。
-            run_stage "Round ${i} train" "$TRAIN_CFG" "$TRAIN_NUM_PROCS"
+            TRAIN_ROUND=$((TRAIN_ROUND + 1))
+            run_stage "Round ${i} train" "$TRAIN_CFG" "$TRAIN_NUM_PROCS" "train" "$TRAIN_ROUND" "$i"
             STATUS=$?
             if [[ $STATUS -ne 0 ]]; then
                 echo "[cluster-rl] Train failed (round $i), abort." >&2
@@ -206,7 +223,8 @@ if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
 
         if [[ -n "$EVAL_CFG" ]]; then
             if (( EVAL_EVERY > 0 )) && (( i % EVAL_EVERY == 0 )); then
-                run_stage "Round ${i} eval" "$EVAL_CFG" "$EVAL_NUM_PROCS"
+                EVAL_ROUND=$((EVAL_ROUND + 1))
+                run_stage "Round ${i} eval" "$EVAL_CFG" "$EVAL_NUM_PROCS" "eval" "$EVAL_ROUND" "$i"
                 STATUS=$?
                 if [[ $STATUS -ne 0 ]]; then
                     echo "[cluster-rl] Eval failed (round $i), abort." >&2

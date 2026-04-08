@@ -6,6 +6,7 @@ import json
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+import copy
 import os
 from pathlib import Path
 import re
@@ -20,6 +21,8 @@ from accelerate.utils import DistributedDataParallelKwargs
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
+from transformers.generation.logits_process import LogitsProcessorList
 from peft import LoraConfig, PeftModel, get_peft_model
 
 from .main_session import CollabMainSession
@@ -45,6 +48,7 @@ class TextTransition:
     entropy: float
     timestep: Optional[int] = None
     critic_input_ids: Optional[torch.Tensor] = None
+    response_log_probs: Optional[torch.Tensor] = None
     format_reward: float = 0.0
     validator_reward: float = 0.0
     process_reward: float = 0.0
@@ -85,6 +89,7 @@ class LMGenerationResult:
         text: str,
         prompt_ids: torch.Tensor,
         response_ids: torch.Tensor,
+        response_log_probs: Optional[torch.Tensor],
         log_prob: float,
         policy_temperature: Optional[float],
         entropy: float,
@@ -94,11 +99,19 @@ class LMGenerationResult:
         self.text = text
         self.prompt_ids = prompt_ids
         self.response_ids = response_ids
+        self.response_log_probs = response_log_probs
         self.log_prob = log_prob
         self.policy_temperature = policy_temperature
         self.entropy = entropy
         self.value = value
         self.critic_input_ids = critic_input_ids
+
+
+@dataclass
+class PrefixCacheEntry:
+    input_ids: torch.Tensor
+    past_key_values: Any
+    token_count: int
 
 
 class QwenLMActorCritic(nn.Module):
@@ -141,7 +154,8 @@ class QwenLMActorCritic(nn.Module):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
-            "dtype": self.dtype,
+            "torch_dtype": self.dtype,
+            "low_cpu_mem_usage": True,
         }
         # 有 flash-attn2 则启用，否则退回 sdpa，避免缺依赖时报错
         if torch.cuda.is_available():
@@ -151,6 +165,7 @@ class QwenLMActorCritic(nn.Module):
                 model_kwargs["attn_implementation"] = "flash_attention_2"
             except Exception:
                 model_kwargs["attn_implementation"] = "sdpa"
+            model_kwargs["device_map"] = {"": str(device)}
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
 
         # LoRA support: either load existing adapters or create new ones.
@@ -173,6 +188,8 @@ class QwenLMActorCritic(nn.Module):
 
         hidden_size = self.model.config.hidden_size
         self.value_head = nn.Linear(hidden_size, 1, device=device, dtype=self.dtype)
+        nn.init.zeros_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
         # value head总是训练
         for p in self.value_head.parameters():
             p.requires_grad = True
@@ -181,7 +198,244 @@ class QwenLMActorCritic(nn.Module):
         self.temperature = temperature
         self.device = device
         self.eval_batch_size = max(1, int(eval_batch_size))
-        self.to(device)
+        self._prefix_cache: Dict[Tuple[Optional[str], str], PrefixCacheEntry] = {}
+        self._prefix_cache_order: List[Tuple[Optional[str], str]] = []
+        self._prefix_cache_max_entries = 4
+        if not torch.cuda.is_available():
+            self.to(device)
+
+    def clear_prefix_cache(self) -> None:
+        self._prefix_cache.clear()
+        self._prefix_cache_order.clear()
+
+    def _touch_prefix_cache_key(self, key: Tuple[Optional[str], str]) -> None:
+        if key in self._prefix_cache_order:
+            self._prefix_cache_order.remove(key)
+        self._prefix_cache_order.append(key)
+        while len(self._prefix_cache_order) > self._prefix_cache_max_entries:
+            evicted = self._prefix_cache_order.pop(0)
+            self._prefix_cache.pop(evicted, None)
+
+    def _get_prefix_cache_entry(
+        self,
+        prefix_text: str,
+        adapter_name: Optional[str] = None,
+    ) -> Optional[PrefixCacheEntry]:
+        content = prefix_text or ""
+        if not content.strip():
+            return None
+        key = (adapter_name, content)
+        entry = self._prefix_cache.get(key)
+        if entry is not None:
+            self._touch_prefix_cache_key(key)
+            return entry
+        inputs = self._prepare_inputs(content)
+        with self._use_adapter(adapter_name):
+            outputs = self.model(
+                **inputs,
+                use_cache=True,
+                return_dict=True,
+            )
+        entry = PrefixCacheEntry(
+            input_ids=inputs["input_ids"].squeeze(0).detach().cpu(),
+            past_key_values=self._clone_past_key_values(outputs.past_key_values),
+            token_count=int(inputs["input_ids"].shape[1]),
+        )
+        self._prefix_cache[key] = entry
+        self._touch_prefix_cache_key(key)
+        return entry
+
+    def _clone_past_key_values(self, past_key_values: Any) -> Any:
+        if past_key_values is None:
+            return None
+        if isinstance(past_key_values, DynamicCache):
+            cloned = DynamicCache(config=self.model.config)
+            for src_layer, dst_layer in zip(past_key_values.layers, cloned.layers):
+                if not getattr(src_layer, "is_initialized", False):
+                    continue
+                dst_layer.lazy_initialization(src_layer.keys, src_layer.values)
+                dst_layer.keys = src_layer.keys.detach().clone()
+                dst_layer.values = src_layer.values.detach().clone()
+                dst_layer.is_initialized = True
+            return cloned
+        if isinstance(past_key_values, torch.Tensor):
+            return past_key_values.detach().clone()
+        if isinstance(past_key_values, (list, tuple)):
+            cloned = [self._clone_past_key_values(item) for item in past_key_values]
+            return type(past_key_values)(cloned)
+        return copy.deepcopy(past_key_values)
+
+    def _split_full_input_by_prefix(
+        self,
+        full_text: str,
+        prefix_text: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        full_inputs = self._prepare_inputs(full_text)
+        full_ids = full_inputs["input_ids"].squeeze(0)
+        if not prefix_text or not prefix_text.strip():
+            return full_ids, full_ids.new_empty((0,), dtype=full_ids.dtype)
+        prefix_inputs = self._prepare_inputs(prefix_text)
+        prefix_ids = prefix_inputs["input_ids"].squeeze(0)
+        prefix_len = int(prefix_ids.shape[0])
+        if prefix_len <= 0 or prefix_len > int(full_ids.shape[0]):
+            raise RuntimeError("Invalid prefix tokenization length for KV cache split.")
+        if not torch.equal(full_ids[:prefix_len], prefix_ids):
+            raise RuntimeError("Prefix tokens do not align with full prompt tokens.")
+        suffix_ids = full_ids[prefix_len:]
+        return full_ids, suffix_ids
+
+    def _generate_with_prefix_cache(
+        self,
+        full_text: str,
+        prefix_text: str,
+        adapter_name: Optional[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prefix_entry = self._get_prefix_cache_entry(prefix_text, adapter_name=adapter_name)
+        if prefix_entry is None:
+            raise RuntimeError("Prefix cache generation requires a non-empty prefix.")
+        full_prompt_ids, suffix_ids_1d = self._split_full_input_by_prefix(full_text, prefix_text)
+        response_ids = self._decode_with_generation_processors(
+            prompt_ids=full_prompt_ids,
+            adapter_name=adapter_name,
+            past_key_values=self._clone_past_key_values(prefix_entry.past_key_values),
+            processed_prompt_len=prefix_entry.token_count,
+        )
+        return full_prompt_ids.detach().cpu(), response_ids
+
+    def _decode_with_generation_processors(
+        self,
+        prompt_ids: torch.Tensor,
+        adapter_name: Optional[str],
+        past_key_values: Any = None,
+        processed_prompt_len: int = 0,
+    ) -> torch.Tensor:
+        prompt_ids = prompt_ids.to(self.device)
+        do_sample = self.temperature is not None and float(self.temperature) > 0.0
+        generation_config = copy.deepcopy(self.model.generation_config)
+        generation_config.do_sample = bool(do_sample)
+        generation_config.max_new_tokens = int(self.max_new_tokens)
+        # PPO log-prob re-evaluation currently models temperature scaling only.
+        # Neutralize inherited sampling warpers from the base model config so the
+        # rollout distribution exactly matches `_evaluate_chunk`.
+        generation_config.repetition_penalty = 1.0
+        for attr in (
+            "top_k",
+            "top_p",
+            "min_p",
+            "typical_p",
+            "epsilon_cutoff",
+            "eta_cutoff",
+            "top_h",
+        ):
+            if hasattr(generation_config, attr):
+                setattr(generation_config, attr, None)
+        if do_sample:
+            generation_config.temperature = float(self.temperature)
+        else:
+            generation_config.temperature = None
+        logits_processor = self.model._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=int(prompt_ids.shape[0]),
+            logits_processor=LogitsProcessorList(),
+            device=str(self.device),
+        )
+        current_ids = prompt_ids.unsqueeze(0)
+        with self._use_adapter(adapter_name):
+            if processed_prompt_len > 0:
+                prefill_ids = prompt_ids[processed_prompt_len:].unsqueeze(0)
+                cache_position = torch.arange(
+                    processed_prompt_len,
+                    int(prompt_ids.shape[0]),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                prefill_ids = prompt_ids.unsqueeze(0)
+                cache_position = torch.arange(
+                    0, int(prompt_ids.shape[0]), device=self.device, dtype=torch.long
+                )
+            outputs = self.model(
+                input_ids=prefill_ids,
+                attention_mask=torch.ones(
+                    (1, int(prompt_ids.shape[0])),
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_ids=cache_position.unsqueeze(0),
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_logits = outputs.logits[:, -1, :]
+            generated_tokens: List[torch.Tensor] = []
+            total_length = int(prompt_ids.shape[0])
+            eos_token_id = self.tokenizer.eos_token_id
+            for _ in range(self.max_new_tokens):
+                processed_scores = logits_processor(current_ids, next_logits.float())
+                if do_sample:
+                    next_token = torch.multinomial(
+                        torch.softmax(processed_scores, dim=-1),
+                        num_samples=1,
+                    )
+                else:
+                    next_token = torch.argmax(processed_scores, dim=-1, keepdim=True)
+                generated_tokens.append(next_token.squeeze(0))
+                current_ids = torch.cat([current_ids, next_token], dim=1)
+                if eos_token_id is not None and int(next_token.item()) == int(eos_token_id):
+                    break
+                step_position = torch.tensor([total_length], device=self.device, dtype=torch.long)
+                total_length += 1
+                outputs = self.model(
+                    input_ids=next_token,
+                    attention_mask=torch.ones(
+                        (1, total_length),
+                        device=self.device,
+                        dtype=torch.long,
+                    ),
+                    past_key_values=past_key_values,
+                    cache_position=step_position,
+                    position_ids=step_position.unsqueeze(0),
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = outputs.past_key_values
+                next_logits = outputs.logits[:, -1, :]
+        return (
+            torch.cat(generated_tokens, dim=0).detach().cpu()
+            if generated_tokens
+            else torch.empty(0, dtype=torch.long)
+        )
+
+    def _evaluate_value_text_with_prefix(
+        self,
+        prefix_text: str,
+        full_text: str,
+        adapter_name: Optional[str],
+    ) -> Tuple[torch.Tensor, float]:
+        prefix_entry = self._get_prefix_cache_entry(prefix_text, adapter_name=adapter_name)
+        if prefix_entry is None:
+            return self.evaluate_text_value(full_text)
+        full_prompt_ids, suffix_ids_1d = self._split_full_input_by_prefix(full_text, prefix_text)
+        suffix_ids = suffix_ids_1d.unsqueeze(0)
+        past_key_values = self._clone_past_key_values(prefix_entry.past_key_values)
+        with self._use_adapter(adapter_name):
+            outputs = self.model(
+                input_ids=suffix_ids,
+                attention_mask=torch.ones(
+                    (1, prefix_entry.token_count + suffix_ids.shape[1]),
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                past_key_values=past_key_values,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        hidden = outputs.hidden_states[-1][:, -1, :]
+        value = self.value_head(hidden).squeeze(-1).item()
+        return full_prompt_ids.detach().cpu(), value
 
     def _effective_policy_temperature(self) -> Optional[float]:
         """Return the sampling temperature used to define policy log-probs."""
@@ -235,6 +489,28 @@ class QwenLMActorCritic(nn.Module):
         for name, param in self.model.named_parameters():
             if "lora_" not in name:
                 param.requires_grad = False
+        self._enable_all_trainable_adapters()
+
+    def _all_trainable_adapter_names(self) -> List[str]:
+        names = [spec.name for _, spec in sorted(self.actor_adapters.items())]
+        if self.critic_adapter is not None:
+            names.append(self.critic_adapter.name)
+        deduped: List[str] = []
+        for name in names:
+            if name and name not in deduped:
+                deduped.append(name)
+        return deduped
+
+    def _enable_all_trainable_adapters(self) -> None:
+        if not self.is_lora or not isinstance(self.model, PeftModel):
+            return
+        adapter_names = self._all_trainable_adapter_names()
+        if not adapter_names:
+            return
+        try:
+            self.model.set_requires_grad(adapter_names, requires_grad=True)
+        except Exception:
+            pass
 
     def _attach_adapter(self, spec: AdapterSpec, base_model):
         if spec.lora_path:
@@ -274,6 +550,7 @@ class QwenLMActorCritic(nn.Module):
             return nullcontext()
         if adapter_name:
             self.model.set_adapter(adapter_name)
+            self._enable_all_trainable_adapters()
             return nullcontext()
         return self.model.disable_adapter()
 
@@ -293,6 +570,55 @@ class QwenLMActorCritic(nn.Module):
             return self.model.disable_adapter()
         return nullcontext()
 
+    def _forward_last_hidden(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        base_lm = (
+            self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        )
+        backbone = getattr(base_lm, "model", None)
+        if backbone is None:
+            outputs = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = outputs.hidden_states
+            if hidden_states is None:
+                raise RuntimeError("Model did not return hidden states for value evaluation.")
+            return hidden_states[-1]
+
+        peft_ctx = (
+            self.model._enable_peft_forward_hooks(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            if hasattr(self.model, "_enable_peft_forward_hooks")
+            else nullcontext()
+        )
+        with peft_ctx:
+            outputs = backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+        last_hidden = getattr(outputs, "last_hidden_state", None)
+        if last_hidden is None:
+            if isinstance(outputs, tuple) and outputs:
+                last_hidden = outputs[0]
+            else:
+                raise RuntimeError("Backbone did not return last hidden state.")
+        return last_hidden
+
     def _evaluate_value_inputs(
         self, input_tensors: List[torch.Tensor], use_critic_adapter: bool = True
     ) -> torch.Tensor:
@@ -303,13 +629,7 @@ class QwenLMActorCritic(nn.Module):
         attention_mask = inputs.ne(pad_id).long()
         context = self._use_critic_adapter() if use_critic_adapter else nullcontext()
         with context:
-            outputs = self.model(
-                inputs,
-                attention_mask=attention_mask,
-                use_cache=False,
-                output_hidden_states=True,
-            )
-        hidden_states = outputs.hidden_states[-1]
+            hidden_states = self._forward_last_hidden(inputs, attention_mask)
         lengths = attention_mask.sum(dim=-1).clamp(min=1) - 1
         gather_index = lengths.view(-1, 1, 1).expand(-1, 1, hidden_states.size(-1))
         last_hidden = hidden_states.gather(dim=1, index=gather_index).squeeze(1)
@@ -330,47 +650,44 @@ class QwenLMActorCritic(nn.Module):
         prompt: str,
         agent_index: int,
         critic_prompt: Optional[str] = None,
+        prompt_prefix: Optional[str] = None,
     ) -> LMGenerationResult:
         adapter_name = self.actor_adapter_names.get(agent_index)
         critic_input_ids = None
-        with self._use_adapter(adapter_name):
+        prefix_text = prompt_prefix or ""
+        if prefix_text:
+            prompt_ids, response_ids = self._generate_with_prefix_cache(
+                full_text=prompt,
+                prefix_text=prefix_text,
+                adapter_name=adapter_name,
+            )
+        else:
             inputs = self._prepare_inputs(prompt)
-            # Transformers requires `temperature` to be strictly positive whenever it is set.
-            # For deterministic/greedy decoding, set `do_sample=False` and do not pass
-            # temperature at all.
-            do_sample = self.temperature is not None and float(self.temperature) > 0.0
-            generate_kwargs: Dict[str, Any] = {
-                **inputs,
-                "do_sample": bool(do_sample),
-                "max_new_tokens": self.max_new_tokens,
-                "return_dict_in_generate": True,
-                "output_scores": True,
-            }
-            if do_sample:
-                generate_kwargs["temperature"] = float(self.temperature)
-            gen_out = self.model.generate(**generate_kwargs)
-            full_seq = gen_out.sequences[0]
-            prompt_len = inputs["input_ids"].shape[1]
-            generated = full_seq[prompt_len:]
-            response_text = self.tokenizer.decode(
-                generated, skip_special_tokens=True
+            prompt_ids = inputs["input_ids"].squeeze(0).cpu()
+            response_ids = self._decode_with_generation_processors(
+                prompt_ids=prompt_ids,
+                adapter_name=adapter_name,
+                past_key_values=None,
+                processed_prompt_len=0,
             )
-
-            log_probs = []
-            entropies = []
-            for step, logits in enumerate(gen_out.scores):
-                probs = torch.log_softmax(logits[0], dim=-1)
-                token_id = generated[step]
-                log_probs.append(probs[token_id])
-                dist = torch.distributions.Categorical(logits=logits[0])
-                entropies.append(dist.entropy())
-            total_log_prob = torch.stack(log_probs).sum().item() if log_probs else 0.0
-            avg_entropy = (
-                torch.stack(entropies).mean().item() if entropies else 0.0
+        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        policy_temperature = self._effective_policy_temperature()
+        full_seq = torch.cat(
+            [prompt_ids.to(self.device), response_ids.to(self.device)], dim=0
+        )
+        with self._use_adapter(adapter_name):
+            log_probs, entropies, token_log_probs = self.evaluate_policy_batch(
+                [prompt_ids.to(self.device)],
+                [response_ids.to(self.device)],
+                [agent_index],
+                policy_temperatures=[policy_temperature],
             )
+        total_log_prob = float(log_probs[0].item()) if log_probs is not None else 0.0
+        avg_entropy = float(entropies[0].item()) if entropies is not None else 0.0
+        response_log_probs = (
+            token_log_probs[0].detach().cpu() if token_log_probs else None
+        )
 
-        prompt_ids = inputs["input_ids"].squeeze(0).cpu()
-        response_ids = generated.cpu()
         value = 0.0
         if critic_prompt:
             critic_inputs = self._prepare_inputs(critic_prompt)
@@ -380,8 +697,8 @@ class QwenLMActorCritic(nn.Module):
             )[0].item()
         else:
             seq = full_seq.unsqueeze(0)
-            outputs = self.model(seq, use_cache=False, output_hidden_states=True)
-            hidden = outputs.hidden_states[-1][:, -1, :]
+            attention_mask = torch.ones_like(seq, dtype=torch.long, device=self.device)
+            hidden = self._forward_last_hidden(seq, attention_mask)[:, -1, :]
             value = self.value_head(hidden).squeeze(-1).item()
             if self.critic_adapter_name and self.critic_adapter_name != adapter_name:
                 value = self._evaluate_value_single(prompt_ids, response_ids)
@@ -390,8 +707,9 @@ class QwenLMActorCritic(nn.Module):
             response_text,
             prompt_ids=prompt_ids,
             response_ids=response_ids,
+            response_log_probs=response_log_probs,
             log_prob=total_log_prob,
-            policy_temperature=self._effective_policy_temperature(),
+            policy_temperature=policy_temperature,
             entropy=avg_entropy,
             value=value,
             critic_input_ids=critic_input_ids,
@@ -401,7 +719,7 @@ class QwenLMActorCritic(nn.Module):
         prompt = prompt_ids.to(self.device)
         response = response_ids.to(self.device)
         with self._use_adapter(self.critic_adapter_name):
-            _, _, values = self._evaluate_chunk(
+            _, _, values, _ = self._evaluate_chunk(
                 [prompt],
                 [response],
                 need_policy=False,
@@ -464,7 +782,7 @@ class QwenLMActorCritic(nn.Module):
             subset_prompts = [prompt_device[i] for i in sample_indices]
             subset_responses = [response_device[i] for i in sample_indices]
             with self._use_adapter(adapter_name):
-                logp, ent, vals = self._evaluate_chunk(
+                logp, ent, vals, _ = self._evaluate_chunk(
                     subset_prompts,
                     subset_responses,
                     policy_temperatures=[policy_temperatures[i] for i in sample_indices],
@@ -479,7 +797,7 @@ class QwenLMActorCritic(nn.Module):
 
         if self.critic_adapter_name and not critic_matches_actor and missing_value_indices:
             with self._use_adapter(self.critic_adapter_name):
-                _, _, critic_vals = self._evaluate_chunk(
+                _, _, critic_vals, _ = self._evaluate_chunk(
                     [prompt_device[idx] for idx in missing_value_indices],
                     [response_device[idx] for idx in missing_value_indices],
                     need_policy=False,
@@ -494,6 +812,187 @@ class QwenLMActorCritic(nn.Module):
             torch.stack([t for t in values_buf if t is not None]),
         )
 
+    def evaluate_policy_batch(
+        self,
+        prompt_tensors: List[torch.Tensor],
+        response_tensors: List[torch.Tensor],
+        agent_indices: List[int],
+        policy_temperatures: Optional[List[Optional[float]]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        num_samples = len(prompt_tensors)
+        if num_samples == 0:
+            empty = torch.empty(0, device=self.device, dtype=torch.float32)
+            return empty, empty, []
+        prompt_device = [t.to(self.device) for t in prompt_tensors]
+        response_device = [t.to(self.device) for t in response_tensors]
+        if policy_temperatures is None:
+            policy_temperatures = [self._effective_policy_temperature()] * num_samples
+
+        log_probs_buf: List[Optional[torch.Tensor]] = [None] * num_samples
+        entropy_buf: List[Optional[torch.Tensor]] = [None] * num_samples
+        token_log_probs_buf: List[Optional[torch.Tensor]] = [None] * num_samples
+        groups: Dict[Optional[str], List[int]] = {}
+        if self.actor_adapters:
+            for idx, agent_idx in enumerate(agent_indices):
+                adapter_name = self.actor_adapter_names.get(agent_idx)
+                groups.setdefault(adapter_name, []).append(idx)
+        else:
+            groups = {None: list(range(num_samples))}
+
+        for adapter_name, sample_indices in groups.items():
+            subset_prompts = [prompt_device[i] for i in sample_indices]
+            subset_responses = [response_device[i] for i in sample_indices]
+            with self._use_adapter(adapter_name):
+                logp, ent, _, token_log_probs = self._evaluate_chunk(
+                    subset_prompts,
+                    subset_responses,
+                    policy_temperatures=[policy_temperatures[i] for i in sample_indices],
+                    need_policy=True,
+                    need_value=False,
+                )
+            for local_idx, global_idx in enumerate(sample_indices):
+                log_probs_buf[global_idx] = logp[local_idx]
+                entropy_buf[global_idx] = ent[local_idx]
+                token_log_probs_buf[global_idx] = token_log_probs[local_idx]
+
+        return (
+            torch.stack([t for t in log_probs_buf if t is not None]),
+            torch.stack([t for t in entropy_buf if t is not None]),
+            [
+                t
+                if t is not None
+                else torch.empty(0, device=self.device, dtype=torch.float32)
+                for t in token_log_probs_buf
+            ],
+        )
+
+    def evaluate_values_batch_train(
+        self,
+        prompt_tensors: List[torch.Tensor],
+        response_tensors: List[torch.Tensor],
+        agent_indices: List[int],
+        critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        num_samples = len(prompt_tensors)
+        if num_samples == 0:
+            return torch.empty(0, device=self.device, dtype=torch.float32)
+        prompt_device = [t.to(self.device) for t in prompt_tensors]
+        response_device = [t.to(self.device) for t in response_tensors]
+        critic_device = (
+            [t.to(self.device) if t is not None else None for t in critic_tensors]
+            if critic_tensors is not None
+            else [None] * num_samples
+        )
+        values: List[torch.Tensor] = []
+        for idx in range(num_samples):
+            critic_tensor = critic_device[idx]
+            if critic_tensor is not None:
+                values.append(
+                    self._evaluate_value_inputs(
+                        [critic_tensor], use_critic_adapter=True
+                    )[0]
+                )
+                continue
+
+            agent_idx = agent_indices[idx]
+            actor_adapter_name = (
+                self.actor_adapter_names.get(agent_idx) if self.actor_adapters else None
+            )
+            use_actor_value = (
+                self.critic_adapter_name is None
+                or actor_adapter_name == self.critic_adapter_name
+            )
+            adapter_ctx = (
+                self._use_adapter(actor_adapter_name)
+                if use_actor_value
+                else self._use_adapter(self.critic_adapter_name)
+            )
+            with adapter_ctx:
+                _, _, vals, _ = self._evaluate_chunk(
+                    [prompt_device[idx]],
+                    [response_device[idx]],
+                    need_policy=False,
+                    need_value=True,
+                )
+            values.append(vals[0])
+
+        return torch.stack(values)
+
+    @torch.no_grad()
+    def evaluate_values_batch(
+        self,
+        prompt_tensors: List[torch.Tensor],
+        response_tensors: List[torch.Tensor],
+        agent_indices: List[int],
+        critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
+    ) -> torch.Tensor:
+        num_samples = len(prompt_tensors)
+        if num_samples == 0:
+            return torch.empty(0, device=self.device, dtype=torch.float32)
+        prompt_device = [t.to(self.device) for t in prompt_tensors]
+        response_device = [t.to(self.device) for t in response_tensors]
+        critic_device = (
+            [t.to(self.device) if t is not None else None for t in critic_tensors]
+            if critic_tensors is not None
+            else [None] * num_samples
+        )
+        values_buf: List[Optional[torch.Tensor]] = [None] * num_samples
+
+        critic_indices = [
+            idx for idx, tensor in enumerate(critic_device) if tensor is not None
+        ]
+        if critic_indices:
+            critic_values = self._evaluate_value_inputs(
+                [critic_device[idx] for idx in critic_indices if critic_device[idx] is not None],
+                use_critic_adapter=True,
+            )
+            for local_idx, global_idx in enumerate(critic_indices):
+                values_buf[global_idx] = critic_values[local_idx]
+
+        missing_value_indices = [
+            idx for idx, value in enumerate(values_buf) if value is None
+        ]
+        if not missing_value_indices:
+            return torch.stack([t for t in values_buf if t is not None])
+
+        critic_matches_actor = False
+        if self.critic_adapter_name and self.actor_adapter_names:
+            critic_matches_actor = all(
+                self.actor_adapter_names.get(agent_idx) == self.critic_adapter_name
+                for agent_idx in agent_indices
+            )
+        use_actor_values = self.critic_adapter_name is None or critic_matches_actor
+        if use_actor_values:
+            groups: Dict[Optional[str], List[int]] = {}
+            if self.actor_adapters:
+                for idx in missing_value_indices:
+                    adapter_name = self.actor_adapter_names.get(agent_indices[idx])
+                    groups.setdefault(adapter_name, []).append(idx)
+            else:
+                groups = {None: list(missing_value_indices)}
+            for adapter_name, sample_indices in groups.items():
+                with self._use_adapter(adapter_name):
+                    _, _, vals, _ = self._evaluate_chunk(
+                        [prompt_device[idx] for idx in sample_indices],
+                        [response_device[idx] for idx in sample_indices],
+                        need_policy=False,
+                        need_value=True,
+                    )
+                for local_idx, global_idx in enumerate(sample_indices):
+                    values_buf[global_idx] = vals[local_idx]
+        else:
+            with self._use_adapter(self.critic_adapter_name):
+                _, _, vals, _ = self._evaluate_chunk(
+                    [prompt_device[idx] for idx in missing_value_indices],
+                    [response_device[idx] for idx in missing_value_indices],
+                    need_policy=False,
+                    need_value=True,
+                )
+            for local_idx, global_idx in enumerate(missing_value_indices):
+                values_buf[global_idx] = vals[local_idx]
+
+        return torch.stack([t for t in values_buf if t is not None])
+
     def _evaluate_chunk(
         self,
         prompt_tensors: List[torch.Tensor],
@@ -501,7 +1000,12 @@ class QwenLMActorCritic(nn.Module):
         policy_temperatures: Optional[List[Optional[float]]] = None,
         need_policy: bool = True,
         need_value: bool = True,
-    ):
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        List[torch.Tensor],
+    ]:
         device = self.device
         pad_id = self.tokenizer.pad_token_id
         prompt_lengths = torch.tensor([len(t) for t in prompt_tensors], device=device)
@@ -512,19 +1016,71 @@ class QwenLMActorCritic(nn.Module):
         ]
         input_ids = pad_sequence(combined, batch_first=True, padding_value=pad_id)
         attention_mask = input_ids.ne(pad_id).long()
-        outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        logits = outputs.logits if need_policy else None
-        hidden_states = outputs.hidden_states[-1]
+        base_lm = self.model.get_base_model() if hasattr(self.model, "get_base_model") else self.model
+        backbone = getattr(base_lm, "model", None)
+        lm_head = getattr(base_lm, "lm_head", None)
+        if backbone is None or lm_head is None:
+            outputs = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            hidden_states = outputs.hidden_states[-1]
+            logits = outputs.logits if need_policy else None
+        else:
+            peft_ctx = (
+                self.model._enable_peft_forward_hooks(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                if hasattr(self.model, "_enable_peft_forward_hooks")
+                else nullcontext()
+            )
+            with peft_ctx:
+                outputs = backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+            hidden_states = getattr(outputs, "last_hidden_state", None)
+            if hidden_states is None:
+                if isinstance(outputs, tuple) and outputs:
+                    hidden_states = outputs[0]
+                else:
+                    raise RuntimeError("Backbone did not return last hidden state.")
+            logits = None
         log_probs: List[torch.Tensor] = []
         entropies: List[torch.Tensor] = []
         values: List[torch.Tensor] = []
+        token_log_probs: List[torch.Tensor] = []
         if policy_temperatures is None:
             policy_temperatures = [self._effective_policy_temperature()] * input_ids.size(0)
+        token_logits_by_sample: List[Optional[torch.Tensor]] = [None] * input_ids.size(0)
+        if need_policy and logits is None:
+            gather_hidden: List[torch.Tensor] = []
+            gather_meta: List[Tuple[int, int]] = []
+            for i in range(input_ids.size(0)):
+                p_len = int(prompt_lengths[i].item())
+                r_len = int(response_lengths[i].item())
+                if r_len <= 0:
+                    continue
+                start = max(p_len - 1, 0)
+                end = start + r_len
+                gather_hidden.append(hidden_states[i, start:end, :])
+                gather_meta.append((i, r_len))
+            if gather_hidden:
+                flat_hidden = torch.cat(gather_hidden, dim=0)
+                flat_logits = lm_head(flat_hidden)
+                offset = 0
+                for sample_idx, r_len in gather_meta:
+                    token_logits_by_sample[sample_idx] = flat_logits[offset : offset + r_len]
+                    offset += r_len
         for i in range(input_ids.size(0)):
             p_len = int(prompt_lengths[i].item())
             r_len = int(response_lengths[i].item())
@@ -532,10 +1088,18 @@ class QwenLMActorCritic(nn.Module):
                 if r_len == 0:
                     log_probs.append(torch.tensor(0.0, device=device))
                     entropies.append(torch.tensor(0.0, device=device))
+                    token_log_probs.append(
+                        torch.empty(0, device=device, dtype=torch.float32)
+                    )
                 else:
-                    start = max(p_len - 1, 0)
-                    end = start + r_len
-                    token_logits = logits[i, start:end, :]
+                    if logits is not None:
+                        start = max(p_len - 1, 0)
+                        end = start + r_len
+                        token_logits = logits[i, start:end, :]
+                    else:
+                        token_logits = token_logits_by_sample[i]
+                        if token_logits is None:
+                            raise RuntimeError("Missing response logits for policy evaluation.")
                     temp = policy_temperatures[i]
                     if temp is not None:
                         # Align PPO re-evaluation with generation-time sampling scores.
@@ -546,6 +1110,7 @@ class QwenLMActorCritic(nn.Module):
                     logprob = torch.log_softmax(token_logits, dim=-1)
                     gathered = logprob.gather(dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
                     log_probs.append(gathered.sum())
+                    token_log_probs.append(gathered)
                     dists = torch.distributions.Categorical(logits=token_logits)
                     entropies.append(dists.entropy().mean())
             if need_value:
@@ -555,7 +1120,7 @@ class QwenLMActorCritic(nn.Module):
         lp_tensor = torch.stack(log_probs) if need_policy else None
         ent_tensor = torch.stack(entropies) if need_policy else None
         val_tensor = torch.stack(values) if need_value else None
-        return lp_tensor, ent_tensor, val_tensor
+        return lp_tensor, ent_tensor, val_tensor, token_log_probs
 
     def forward(
         self,
@@ -563,6 +1128,7 @@ class QwenLMActorCritic(nn.Module):
         response_tensors: List[torch.Tensor],
         agent_indices: Optional[List[int]] = None,
         critic_tensors: Optional[List[Optional[torch.Tensor]]] = None,
+        policy_temperatures: Optional[List[Optional[float]]] = None,
     ):
         """DDP forward pass delegates to evaluate_batch."""
         if agent_indices is None:
@@ -572,6 +1138,7 @@ class QwenLMActorCritic(nn.Module):
             response_tensors,
             agent_indices,
             critic_tensors=critic_tensors,
+            policy_temperatures=policy_temperatures,
         )
 
 
@@ -617,13 +1184,21 @@ class MAPPOTrainer:
         self.export_interval = max(1, int(self.trainer_cfg.get("export_interval", 1)))
         self.collect_only = bool(trainer_cfg.get("collect_only", False))
         self.train_only = bool(trainer_cfg.get("train_only", False))
+        apply_latest_default = not self.train_only
+        self.apply_latest_model_override = bool(
+            self.trainer_cfg.get("apply_latest_model_override", apply_latest_default)
+        )
         self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
         self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", True))
         self.agents_cfg = full_config.get("agents", {})
         self.agent_roles = self._extract_agent_roles(self.agents_cfg)
         self.critic_role_prompt = self._load_critic_role_prompt()
 
-        if self.latest_model_path_file and self.latest_model_path_file.exists():
+        if (
+            self.apply_latest_model_override
+            and self.latest_model_path_file
+            and self.latest_model_path_file.exists()
+        ):
             self._apply_model_override_from_file(self.trainer_cfg)
 
         self.actor_adapters: Dict[int, AdapterSpec] = self._build_actor_specs(
@@ -671,11 +1246,43 @@ class MAPPOTrainer:
         self.gradient_accumulation_steps = max(
             1, int(trainer_cfg.get("gradient_accumulation_steps", 8))
         )
+        self.gradient_checkpointing = bool(
+            trainer_cfg.get("gradient_checkpointing", not self.collect_only)
+        )
         target_kl_cfg = trainer_cfg.get("target_kl", None)
         self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
+        self.kl_penalty_coef = float(trainer_cfg.get("kl_penalty_coef", 0.0) or 0.0)
         self.entropy_coef = trainer_cfg.get("entropy_coef", 0.01)
         self.value_coef = trainer_cfg.get("value_coef", 0.5)
         self.max_grad_norm = trainer_cfg.get("max_grad_norm", 0.5)
+        if self.train_only:
+            if "actor_lr" not in trainer_cfg:
+                raise ValueError("trainer.actor_lr must be set explicitly.")
+            if "critic_lr" not in trainer_cfg:
+                raise ValueError("trainer.critic_lr must be set explicitly.")
+            if "value_head_lr" not in trainer_cfg:
+                raise ValueError("trainer.value_head_lr must be set explicitly.")
+            loop_rounds_raw = os.getenv("RL_LOOP_ROUNDS", "").strip()
+            if not loop_rounds_raw:
+                raise ValueError(
+                    "RL_LOOP_ROUNDS must be set by cluster_run_rl.sh for lr scheduling."
+                )
+            self.actor_lr = float(trainer_cfg["actor_lr"])
+            self.critic_lr = float(trainer_cfg["critic_lr"])
+            self.value_head_lr = float(trainer_cfg["value_head_lr"])
+            self.total_updates = max(1, int(loop_rounds_raw))
+        else:
+            self.actor_lr = float(trainer_cfg.get("actor_lr", 0.0))
+            self.critic_lr = float(trainer_cfg.get("critic_lr", 0.0))
+            self.value_head_lr = float(trainer_cfg.get("value_head_lr", 0.0))
+            self.total_updates = 1
+        self.lr_scheduler_name = str(
+            trainer_cfg.get("lr_scheduler", trainer_cfg.get("scheduler", "none"))
+        ).strip().lower()
+        self.lr_warmup_updates = max(
+            0, int(trainer_cfg.get("lr_warmup_updates", trainer_cfg.get("warmup_updates", 0)))
+        )
+        self.lr_min_ratio = float(trainer_cfg.get("lr_min_ratio", 0.0))
         self.model_path = trainer_cfg["model_path"]
         self.lora_cfg = trainer_cfg.get("lora", {})
         self.lora_path = trainer_cfg.get("lora_path", None)
@@ -721,15 +1328,72 @@ class MAPPOTrainer:
             critic_adapter=self.critic_adapter,
             fix_mistral_regex=trainer_cfg.get("fix_mistral_regex", None),
         )
+        self.accelerator.print(
+            "[MAPPO] gradient_checkpointing="
+            f"{self.gradient_checkpointing} critic_adapter="
+            f"{self.critic_adapter.name if self.critic_adapter is not None else 'none'} "
+            f"critic_lora={self.critic_adapter.lora_config if self.critic_adapter is not None else None}"
+        )
+        if self.gradient_checkpointing and hasattr(
+            self.text_policy.model, "gradient_checkpointing_enable"
+        ):
+            self.text_policy.model.gradient_checkpointing_enable()
+            if hasattr(self.text_policy.model, "enable_input_require_grads"):
+                self.text_policy.model.enable_input_require_grads()
+            if hasattr(self.text_policy.model, "config"):
+                self.text_policy.model.config.use_cache = False
+        value_head_path = self.trainer_cfg.get("value_head_path")
+        if value_head_path:
+            resolved = Path(value_head_path)
+            if not resolved.is_absolute():
+                resolved = Path.cwd() / resolved
+            if resolved.exists():
+                payload = torch.load(resolved, map_location="cpu")
+                if isinstance(payload, dict) and "state_dict" in payload:
+                    payload = payload["state_dict"]
+                self.text_policy.value_head.load_state_dict(payload)
+                self.accelerator.print(f"[MAPPO] Loaded value head from {resolved}")
         self.policy_tokenizer = self.text_policy.tokenizer
-        # 仅优化可训练参数（LoRA + value head）
-        trainable_params = [p for p in self.text_policy.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
-            trainable_params, lr=trainer_cfg.get("lr", 1e-5)
-        )
-        self.text_policy, self.optimizer = self.accelerator.prepare(
-            self.text_policy, self.optimizer
-        )
+        self.lr_scheduler = None
+        if self.train_only:
+            optimizer_groups: List[Dict[str, Any]] = []
+            trainable_groups = self._trainable_param_groups()
+            actor_params: List[torch.nn.Parameter] = []
+            for name, params in trainable_groups.items():
+                if name.startswith("actor"):
+                    actor_params.extend(params)
+            actor_params = self._filter_trainable_params(actor_params)
+            critic_params = self._filter_trainable_params(
+                trainable_groups.get("critic_adapter", [])
+            )
+            value_head_params = self._filter_trainable_params(
+                trainable_groups.get("value_head", [])
+            )
+            if actor_params:
+                optimizer_groups.append(
+                    {"params": actor_params, "lr": self.actor_lr, "name": "actor"}
+                )
+            if critic_params:
+                optimizer_groups.append(
+                    {"params": critic_params, "lr": self.critic_lr, "name": "critic_adapter"}
+                )
+            if value_head_params:
+                optimizer_groups.append(
+                    {
+                        "params": value_head_params,
+                        "lr": self.value_head_lr,
+                        "name": "value_head",
+                    }
+                )
+            if not optimizer_groups:
+                raise ValueError("No trainable parameters found for MAPPO optimizer.")
+            self.optimizer = torch.optim.AdamW(optimizer_groups, lr=0.0)
+            self.text_policy, self.optimizer = self.accelerator.prepare(
+                self.text_policy, self.optimizer
+            )
+        else:
+            self.optimizer = None
+            self.text_policy = self.accelerator.prepare(self.text_policy)
         variant = convert_yaml_to_variant(full_config)
         variant["yaml_config"] = full_config
         if not self.train_only:
@@ -744,12 +1408,123 @@ class MAPPOTrainer:
         self._current_update_idx: Optional[int] = None
         self._episode_counter = 0
         self._episode_log_path: Optional[Path] = None
+        if (
+            self.train_only
+            and self.latest_model_path_file is not None
+            and self.latest_model_path_file.exists()
+            and not self.apply_latest_model_override
+        ):
+            self.accelerator.print(
+                f"[TrainOnly] Ignoring latest model override from {self.latest_model_path_file} "
+                "to keep PPO aligned with cached rollout log-probs."
+            )
 
         if self.output_dir:
             self._episode_log_path = (
                 self.output_dir
                 / f"episode_return_curve_rank{self.accelerator.process_index}.csv"
             )
+
+    def _current_train_round_idx(self) -> int:
+        if self._current_update_idx is not None and int(self._current_update_idx) > 0:
+            return int(self._current_update_idx)
+        return self._runtime_stage_round_idx()
+
+    def _lr_scheduler_multiplier(self, global_step: int, total_steps: int) -> float:
+        schedule = self.lr_scheduler_name
+        if schedule in ("", "none", "off", "disabled"):
+            return 1.0
+        total_steps = max(1, int(total_steps))
+        warmup_steps = min(max(0, int(self.lr_warmup_updates)), self.total_updates) * total_steps
+        min_ratio = float(self.lr_min_ratio)
+        step = max(0, int(global_step))
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(min_ratio, float(step + 1) / float(warmup_steps))
+        if self.total_updates <= self.lr_warmup_updates:
+            progress = 1.0
+        else:
+            decay_steps = max(1, (self.total_updates - self.lr_warmup_updates) * total_steps)
+            decay_step = max(0, step - warmup_steps)
+            progress = min(1.0, float(decay_step) / float(decay_steps))
+        if schedule == "linear":
+            return max(min_ratio, 1.0 - (1.0 - min_ratio) * progress)
+        if schedule == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_ratio, min_ratio + (1.0 - min_ratio) * cosine)
+        if schedule == "constant":
+            return 1.0
+        raise ValueError(
+            f"Unsupported lr_scheduler={self.lr_scheduler_name!r}; expected none|linear|cosine|constant."
+        )
+
+    def _build_lr_scheduler(
+        self, steps_per_update: int
+    ) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
+        if self.lr_scheduler_name in ("", "none", "off", "disabled"):
+            self.lr_scheduler = None
+            return None
+        steps_per_update = max(1, int(steps_per_update))
+        round_idx = self._current_train_round_idx()
+        completed_updates = max(0, round_idx - 1)
+        step_offset = completed_updates * steps_per_update
+        for group in self.optimizer.param_groups:
+            group.setdefault("initial_lr", group["lr"])
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda local_step: self._lr_scheduler_multiplier(
+                step_offset + int(local_step),
+                steps_per_update,
+            ),
+        )
+        for base_lr, group in zip(scheduler.base_lrs, self.optimizer.param_groups):
+            group["lr"] = float(base_lr) * self._lr_scheduler_multiplier(
+                step_offset, steps_per_update
+            )
+        self.lr_scheduler = scheduler
+        return scheduler
+
+    def _current_group_lrs(self) -> Dict[str, float]:
+        current = {
+            "actor_lr": 0.0,
+            "critic_adapter_lr": 0.0,
+            "value_head_lr": 0.0,
+        }
+        for group in self.optimizer.param_groups:
+            name = str(group.get("name", ""))
+            lr = float(group.get("lr", 0.0))
+            if name == "actor":
+                current["actor_lr"] = lr
+            elif name == "critic_adapter":
+                current["critic_adapter_lr"] = lr
+            elif name == "value_head":
+                current["value_head_lr"] = lr
+        return current
+
+    def _runtime_stage_round_idx(self) -> int:
+        raw = os.getenv("RL_STAGE_ROUND_IDX", "").strip()
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+        return 1
+
+    def _runtime_loop_round_idx(self) -> Optional[int]:
+        raw = os.getenv("RL_LOOP_ROUND_IDX", "").strip()
+        if raw:
+            try:
+                value = int(raw)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+        return None
+
+    def _runtime_stage_phase(self, default: str) -> str:
+        raw = os.getenv("RL_STAGE_PHASE", "").strip().lower()
+        return raw or default
 
     def _reset_rollout_stats(self):
         self._last_rollout_stats = {
@@ -1129,6 +1904,21 @@ class MAPPOTrainer:
         context: Dict[str, Any],
         output_text: str,
     ) -> str:
+        prefix, dynamic = self._build_critic_prompt_parts(
+            agent_index=agent_index,
+            messages=messages,
+            context=context,
+            output_text=output_text,
+        )
+        return prefix + dynamic
+
+    def _build_critic_prompt_parts(
+        self,
+        agent_index: int,
+        messages: List[Dict[str, str]],
+        context: Dict[str, Any],
+        output_text: str,
+    ) -> Tuple[str, str]:
         shared_traces = context.get("shared_agent_traces") or {}
         current_user = next(
             (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
@@ -1141,12 +1931,8 @@ class MAPPOTrainer:
         game_rules = self._build_game_rule_block()
         acting_actions = self._extract_action_space(role_name)
         teammate_actions = self._extract_action_space(teammate_name)
-        sections = [
+        prefix_sections = [
             self.critic_role_prompt,
-            "",
-            "[Global Observation]",
-            self._format_global_observation(context.get("global_observation")),
-            "",
             "[Game Rules]",
             game_rules or "[MISSING]",
             "",
@@ -1155,6 +1941,17 @@ class MAPPOTrainer:
             "",
             f"[{teammate_name} Action Space]",
             teammate_actions or "[MISSING]",
+            "",
+            "[Evaluation Focus]",
+            "Estimate the value of this transition for future cumulative return. "
+            "Focus on task progress, coordination quality, rule compliance, repeated communication, "
+            "format errors, validator errors, and whether the output is an effective embodied action "
+            "or an effective communication move under the stated constraints.",
+            "",
+        ]
+        dynamic_sections = [
+            "[Global Observation]",
+            self._format_global_observation(context.get("global_observation")),
             "",
             "[Current Transition]",
             f"acting_agent: {role_name} (index={agent_index})",
@@ -1174,14 +1971,27 @@ class MAPPOTrainer:
             + self._compact_text(
                 teammate_trace.get("response_excerpt", "[MISSING]"), limit=1000
             ),
-            "",
-            "[Evaluation Focus]",
-            "Estimate the value of this transition for future cumulative return. "
-            "Focus on task progress, coordination quality, rule compliance, repeated communication, "
-            "format errors, validator errors, and whether the output is an effective embodied action "
-            "or an effective communication move under the stated constraints.",
         ]
-        return "\n".join(sections)
+        return "\n".join(prefix_sections), "\n".join(dynamic_sections)
+
+    @staticmethod
+    def _split_actor_prompt_prefix(messages: List[Dict[str, str]], chat_prompt: str) -> str:
+        latest_user = next(
+            (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+            "",
+        )
+        marker = "<input>\n"
+        if marker not in latest_user:
+            return ""
+        fixed_user_prefix, dynamic_user_suffix = latest_user.split(marker, 1)
+        fixed_user_prefix += marker
+        if not dynamic_user_suffix:
+            return ""
+        split_pos = chat_prompt.find(fixed_user_prefix)
+        if split_pos == -1:
+            return ""
+        prefix_end = split_pos + len(fixed_user_prefix)
+        return chat_prompt[:prefix_end]
 
     def _load_snapshot_dataset(self, paths: List[Union[str, Path]]) -> List[SnapshotRecord]:
         dataset: List[SnapshotRecord] = []
@@ -1300,7 +2110,8 @@ class MAPPOTrainer:
           {
             "model_path": "...",
             "actor_adapters": {"0": {"adapter_name": "Chef", "lora_path": "..."}, ...},
-            "critic_adapter": {"adapter_name": "critic", "lora_path": "..."}
+            "critic_adapter": {"adapter_name": "critic", "lora_path": "..."},
+            "value_head_path": "..."
           }
         """
         if not self.latest_model_path_file:
@@ -1352,6 +2163,9 @@ class MAPPOTrainer:
                 lora_path = critic_override.get("lora_path")
                 if lora_path:
                     cfg["critic_adapter"]["lora_path"] = lora_path
+            value_head_path = override.get("value_head_path")
+            if value_head_path:
+                cfg["value_head_path"] = value_head_path
             return
         # fallback：纯字符串表示 model_path
         cfg["model_path"] = content
@@ -1376,13 +2190,18 @@ class MAPPOTrainer:
             f"{agent_index} prompt_chars={len(chat_prompt)}"
         )
         result = model.act(chat_prompt, agent_index=agent_index)
-        critic_prompt = self._build_critic_prompt(
+        critic_prefix, critic_dynamic = self._build_critic_prompt_parts(
             agent_index=agent_index,
             messages=messages,
             context=context,
             output_text=result.text,
         )
-        critic_input_ids, critic_value = model.evaluate_text_value(critic_prompt)
+        critic_prompt = critic_prefix + critic_dynamic
+        critic_input_ids, critic_value = model._evaluate_value_text_with_prefix(
+            critic_prefix,
+            critic_prompt,
+            adapter_name=model.critic_adapter_name,
+        )
         print(
             "[MAPPOTrainer] policy_call agent="
             f"{agent_index} generated_tokens={len(result.response_ids)}"
@@ -1390,7 +2209,9 @@ class MAPPOTrainer:
         metadata = {
             "prompt_ids": result.prompt_ids,
             "response_ids": result.response_ids,
+            "response_log_probs": result.response_log_probs,
             "log_prob": result.log_prob,
+            "policy_temperature": result.policy_temperature,
             "value": critic_value,
             "entropy": result.entropy,
             "token_count": len(result.response_ids),
@@ -1406,8 +2227,19 @@ class MAPPOTrainer:
         # Collect-only mode: just roll out and save to disk.
         if self.collect_only:
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
-            update_idx = 1
+            update_idx = self._runtime_stage_round_idx()
             self._current_update_idx = update_idx
+            if self.session is not None:
+                phase = self._runtime_stage_phase(
+                    "eval" if "eval" in str(self.output_dir).lower() else "collect"
+                )
+                self.session.set_logging_context(
+                    update_idx=update_idx,
+                    phase=phase,
+                    run_label=self.output_dir.name or self.rollout_dir.name,
+                    loop_round_idx=self._runtime_loop_round_idx(),
+                    rotate_session=True,
+                )
             self._reset_rollout_stats()
             reused_cache = False
             latest_exists = (
@@ -1436,7 +2268,8 @@ class MAPPOTrainer:
 
         # Train-only mode: load rollouts from disk and update policy.
         if self.train_only:
-            update_idx = 1
+            update_idx = self._runtime_stage_round_idx()
+            self._current_update_idx = update_idx
             transitions = self.load_rollouts()
             if not transitions:
                 self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
@@ -1454,8 +2287,16 @@ class MAPPOTrainer:
             self._maybe_export_latest(update_idx)
             return
 
-        update_idx = 1
+        update_idx = self._runtime_stage_round_idx()
         self._current_update_idx = update_idx
+        if self.session is not None:
+            self.session.set_logging_context(
+                update_idx=update_idx,
+                phase=self._runtime_stage_phase("run"),
+                run_label=self.output_dir.name or self.rollout_dir.name,
+                loop_round_idx=self._runtime_loop_round_idx(),
+                rotate_session=True,
+            )
         self._reset_rollout_stats()
         reused_cache = self._maybe_load_initial_cached_rollout(update_idx)
         if not reused_cache:
@@ -1522,6 +2363,7 @@ class MAPPOTrainer:
             self.buffer.add(
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
+                response_log_probs=meta.get("response_log_probs"),
                 log_prob=meta["log_prob"],
                 policy_temperature=meta.get("policy_temperature"),
                 value=meta["value"],
@@ -1685,6 +2527,159 @@ class MAPPOTrainer:
         returns = advantages + values
         return advantages, returns
 
+    def _trainable_param_groups(self) -> Dict[str, List[torch.nn.Parameter]]:
+        groups: Dict[str, List[torch.nn.Parameter]] = {"value_head": []}
+        for agent_idx in sorted(self.actor_adapters.keys()):
+            groups[f"actor{int(agent_idx)}"] = []
+        if self.critic_adapter is not None:
+            groups["critic_adapter"] = []
+
+        for name, param in self.text_policy.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("value_head.") or ".value_head." in name:
+                groups["value_head"].append(param)
+                continue
+            if "lora_" not in name:
+                continue
+            for agent_idx, spec in sorted(self.actor_adapters.items()):
+                if f".{spec.name}." in name:
+                    groups[f"actor{int(agent_idx)}"].append(param)
+            if self.critic_adapter is not None and f".{self.critic_adapter.name}." in name:
+                groups["critic_adapter"].append(param)
+        return groups
+
+    @staticmethod
+    def _param_group_grad_norm(params: List[torch.nn.Parameter]) -> float:
+        total = 0.0
+        for param in params:
+            if param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            total += float(torch.sum(grad * grad).item())
+        return math.sqrt(total) if total > 0.0 else 0.0
+
+    @staticmethod
+    def _snapshot_param_group(
+        params: List[torch.nn.Parameter],
+    ) -> List[torch.Tensor]:
+        return [param.detach().float().clone() for param in params]
+
+    @staticmethod
+    def _param_group_delta_norm(
+        params: List[torch.nn.Parameter],
+        before: List[torch.Tensor],
+    ) -> float:
+        total = 0.0
+        for param, prev in zip(params, before):
+            delta = param.detach().float() - prev
+            total += float(torch.sum(delta * delta).item())
+        return math.sqrt(total) if total > 0.0 else 0.0
+
+    @staticmethod
+    def _filter_trainable_params(
+        params: List[torch.nn.Parameter],
+    ) -> List[torch.nn.Parameter]:
+        seen: set[int] = set()
+        filtered: List[torch.nn.Parameter] = []
+        for param in params:
+            if not param.requires_grad:
+                continue
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            filtered.append(param)
+        return filtered
+
+    def _compute_fresh_value_metrics(
+        self,
+        transitions: List[TextTransition],
+        returns_cpu: torch.Tensor,
+        agent_indices: List[int],
+    ) -> Dict[str, float]:
+        if not transitions:
+            return {
+                "fresh_value_mean": 0.0,
+                "fresh_explained_var": 0.0,
+                "agent0_fresh_value_mean": 0.0,
+                "agent0_fresh_explained_var": 0.0,
+                "agent1_fresh_value_mean": 0.0,
+                "agent1_fresh_explained_var": 0.0,
+            }
+
+        prompt_tensors = [t.prompt_ids for t in transitions]
+        response_tensors = [t.response_ids for t in transitions]
+        old_token_log_probs_list: List[torch.Tensor] = []
+        critic_tensors = [t.critic_input_ids for t in transitions]
+        fresh_values_chunks: List[torch.Tensor] = []
+        batch_span = max(1, int(getattr(self.text_policy, "eval_batch_size", 1)))
+        was_training = self.text_policy.training
+        self.text_policy.eval()
+        try:
+            with torch.no_grad():
+                for start in range(0, len(transitions), batch_span):
+                    end = min(start + batch_span, len(transitions))
+                    fresh_values_chunks.append(
+                        self.text_policy.evaluate_values_batch(
+                            prompt_tensors[start:end],
+                            response_tensors[start:end],
+                            agent_indices[start:end],
+                            critic_tensors=critic_tensors[start:end],
+                        ).detach().float().cpu()
+                    )
+        finally:
+            if was_training:
+                self.text_policy.train()
+
+        fresh_values_cpu = (
+            torch.cat(fresh_values_chunks, dim=0)
+            if fresh_values_chunks
+            else torch.empty(0, dtype=torch.float32)
+        )
+        metrics: Dict[str, float] = {
+            "fresh_value_mean": 0.0,
+            "fresh_explained_var": 0.0,
+            "agent0_fresh_value_mean": 0.0,
+            "agent0_fresh_explained_var": 0.0,
+            "agent1_fresh_value_mean": 0.0,
+            "agent1_fresh_explained_var": 0.0,
+        }
+        if fresh_values_cpu.numel() != returns_cpu.numel():
+            return metrics
+
+        returns_var = float(torch.var(returns_cpu, unbiased=False).item())
+        if returns_var > 1e-8:
+            fresh_explained_var = 1.0 - float(
+                torch.var(returns_cpu - fresh_values_cpu, unbiased=False).item()
+            ) / returns_var
+        else:
+            fresh_explained_var = 0.0
+        metrics["fresh_value_mean"] = float(fresh_values_cpu.mean().item())
+        metrics["fresh_explained_var"] = float(fresh_explained_var)
+
+        agent_indices_cpu = torch.tensor(agent_indices, dtype=torch.long)
+        for agent_idx in range(2):
+            mask = agent_indices_cpu == agent_idx
+            if not bool(mask.any().item()):
+                continue
+            agent_returns = returns_cpu[mask]
+            agent_values = fresh_values_cpu[mask]
+            agent_returns_var = float(torch.var(agent_returns, unbiased=False).item())
+            if agent_returns_var > 1e-8:
+                agent_fresh_explained_var = 1.0 - float(
+                    torch.var(agent_returns - agent_values, unbiased=False).item()
+                ) / agent_returns_var
+            else:
+                agent_fresh_explained_var = 0.0
+            metrics[f"agent{agent_idx}_fresh_value_mean"] = float(
+                agent_values.mean().item()
+            )
+            metrics[f"agent{agent_idx}_fresh_explained_var"] = float(
+                agent_fresh_explained_var
+            )
+        return metrics
+
     # ------------------------------------------------------------------
     def update_policy(self, transitions: List[TextTransition]):
         assert self.text_policy is not None
@@ -1693,16 +2688,37 @@ class MAPPOTrainer:
         critic_tensors = [t.critic_input_ids for t in transitions]
         agent_indices = [t.agent_index for t in transitions]
         policy_temperatures = [t.policy_temperature for t in transitions]
+        old_token_log_probs_list: List[torch.Tensor] = []
         old_log_probs = torch.tensor(
             [t.log_prob for t in transitions], dtype=torch.float32, device=self.device
         )
+        for t in transitions:
+            if t.response_log_probs is not None:
+                old_token_log_probs_list.append(
+                    t.response_log_probs.to(self.device, dtype=torch.float32)
+                )
+                continue
+            resp_len = max(1, int(t.response_ids.numel()))
+            avg_lp = float(t.log_prob) / float(resp_len)
+            old_token_log_probs_list.append(
+                torch.full(
+                    (resp_len,),
+                    avg_lp,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            )
         old_values = torch.tensor(
             [t.value for t in transitions], dtype=torch.float32, device=self.device
         )
         advantages, returns = self.compute_advantages(transitions)
         raw_advantages = advantages.clone()
         returns_stats = returns.clone()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        if advantages.numel() > 1:
+            adv_std = advantages.std(unbiased=False).clamp(min=1e-6)
+            advantages = (advantages - advantages.mean()) / adv_std
+        else:
+            advantages = advantages - advantages.mean()
         advantages = advantages.to(self.device)
         returns = returns.to(self.device)
 
@@ -1710,17 +2726,38 @@ class MAPPOTrainer:
         num_transitions = len(transitions)
         num_minibatches = math.ceil(num_transitions / batch_size)
         total_optimization_steps = max(1, self.update_epochs * num_minibatches)
+        optimizer_steps_per_update = max(
+            1,
+            math.ceil(total_optimization_steps / float(self.gradient_accumulation_steps)),
+        )
+        scheduler = self._build_lr_scheduler(optimizer_steps_per_update)
         total_loss = 0.0
         total_policy = 0.0
         total_value = 0.0
         total_entropy = 0.0
         total_clipfrac = 0.0
         total_approx_kl = 0.0
+        total_kl_penalty = 0.0
         total_value_clipfrac = 0.0
+        total_policy_active_clipfrac = 0.0
+        total_policy_active_approx_kl = 0.0
+        total_policy_active_token_clipfrac = 0.0
+        total_policy_active_token_approx_kl = 0.0
+        param_groups = self._trainable_param_groups()
+        total_group_grad_norms: Dict[str, float] = {
+            name: 0.0 for name in param_groups.keys()
+        }
+        total_group_param_deltas: Dict[str, float] = {
+            name: 0.0 for name in param_groups.keys()
+        }
         metric_steps = 0
+        policy_active_metric_steps = 0
         actual_optimization_steps = 0
         accum_counter = 0
         stop_early = False
+        stop_policy_updates = False
+        accum_approx_kl_sum = 0.0
+        accum_approx_kl_count = 0
 
         self.optimizer.zero_grad()
         for _ in range(self.update_epochs):
@@ -1741,25 +2778,92 @@ class MAPPOTrainer:
                 batch_old_values = old_values[batch_indices]
                 batch_adv = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
-
-                log_probs, entropies, values = self.text_policy(
-                    batch_prompts,
-                    batch_responses,
-                    batch_agent_indices,
-                    critic_tensors=batch_critic,
-                    policy_temperatures=[policy_temperatures[i] for i in batch_indices],
+                batch_response_lengths = torch.tensor(
+                    [max(1, int(response_tensors[i].numel())) for i in batch_indices],
+                    dtype=torch.float32,
+                    device=self.device,
                 )
+
+                policy_forward_ctx = (
+                    nullcontext() if not stop_policy_updates else torch.no_grad()
+                )
+                with policy_forward_ctx:
+                    log_probs, entropies, token_log_probs = self.text_policy.evaluate_policy_batch(
+                        batch_prompts,
+                        batch_responses,
+                        batch_agent_indices,
+                        policy_temperatures=[
+                            policy_temperatures[i] for i in batch_indices
+                        ],
+                    )
                 log_probs = log_probs.to(self.device, dtype=torch.float32)
                 entropies = entropies.to(self.device, dtype=torch.float32)
-                values = values.to(self.device, dtype=torch.float32)
 
-                ratios = torch.exp(log_probs - batch_old_log_probs)
+                logratio = log_probs - batch_old_log_probs
+                ratios = torch.exp(logratio)
+                batch_old_token_log_probs = [
+                    old_token_log_probs_list[i] for i in batch_indices
+                ]
+                token_logratio_parts: List[torch.Tensor] = []
+                for new_lp, old_lp in zip(token_log_probs, batch_old_token_log_probs):
+                    if new_lp.numel() == 0:
+                        continue
+                    if old_lp.numel() != new_lp.numel():
+                        if old_lp.numel() == 0:
+                            old_lp = torch.zeros_like(new_lp)
+                        else:
+                            old_lp = old_lp[: new_lp.numel()]
+                            if old_lp.numel() < new_lp.numel():
+                                pad = old_lp.new_full(
+                                    (new_lp.numel() - old_lp.numel(),),
+                                    float(old_lp[-1].item()) if old_lp.numel() > 0 else 0.0,
+                                )
+                                old_lp = torch.cat([old_lp, pad], dim=0)
+                    token_logratio_parts.append(new_lp - old_lp)
+                token_logratio = (
+                    torch.cat(token_logratio_parts, dim=0)
+                    if token_logratio_parts
+                    else torch.empty(0, dtype=torch.float32, device=self.device)
+                )
+                token_ratios = torch.exp(token_logratio) if token_logratio.numel() > 0 else token_logratio
                 surr1 = ratios * batch_adv
                 clipped_ratios = torch.clamp(
                     ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef
                 )
                 surr2 = clipped_ratios * batch_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                policy_loss_raw = -torch.min(surr1, surr2).mean()
+                # PPO-style non-negative KL approximation under the rollout policy.
+                approx_kl = (
+                    ((token_ratios - 1.0) - token_logratio).mean().clamp_min(0.0)
+                    if token_logratio.numel() > 0
+                    else torch.zeros((), dtype=torch.float32, device=self.device)
+                )
+                token_approx_kl = approx_kl
+                kl_penalty_raw = approx_kl * self.kl_penalty_coef
+                entropy_loss_raw = -entropies.mean()
+                if stop_policy_updates:
+                    policy_loss = torch.zeros_like(policy_loss_raw)
+                    entropy_loss = torch.zeros_like(entropy_loss_raw)
+                    kl_penalty = torch.zeros_like(kl_penalty_raw)
+                else:
+                    policy_loss = policy_loss_raw
+                    entropy_loss = entropy_loss_raw
+                    kl_penalty = kl_penalty_raw
+                if not stop_policy_updates:
+                    policy_objective = (
+                        policy_loss_raw
+                        + self.entropy_coef * entropy_loss_raw
+                        + kl_penalty_raw
+                    )
+                    self.accelerator.backward(
+                        policy_objective / float(self.gradient_accumulation_steps)
+                    )
+                values = self.text_policy.evaluate_values_batch_train(
+                    batch_prompts,
+                    batch_responses,
+                    batch_agent_indices,
+                    critic_tensors=batch_critic,
+                ).to(self.device, dtype=torch.float32)
                 value_pred_clipped = torch.clamp(
                     values,
                     batch_old_values - self.value_clip_coef,
@@ -1768,51 +2872,92 @@ class MAPPOTrainer:
                 value_losses = (values - batch_returns) ** 2
                 value_losses_clipped = (value_pred_clipped - batch_returns) ** 2
                 value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
-                entropy_loss = -entropies.mean()
                 loss = (
                     policy_loss
                     + self.value_coef * value_loss
                     + self.entropy_coef * entropy_loss
+                    + kl_penalty
                 )
-
                 self.accelerator.backward(
-                    loss / float(self.gradient_accumulation_steps)
+                    (self.value_coef * value_loss)
+                    / float(self.gradient_accumulation_steps)
                 )
                 accum_counter += 1
+                accum_approx_kl_sum += float(approx_kl.item())
+                accum_approx_kl_count += 1
                 should_step = (
                     accum_counter >= self.gradient_accumulation_steps
                     or end >= num_transitions
                 )
+                step_approx_kl = (
+                    accum_approx_kl_sum / float(accum_approx_kl_count)
+                    if accum_approx_kl_count > 0
+                    else float(approx_kl.item())
+                )
                 if should_step:
+                    group_snapshots = {
+                        name: self._snapshot_param_group(params)
+                        for name, params in param_groups.items()
+                    }
+                    for name, params in param_groups.items():
+                        total_group_grad_norms[name] += self._param_group_grad_norm(
+                            params
+                        )
                     self.accelerator.clip_grad_norm_(
                         self.text_policy.parameters(), self.max_grad_norm
                     )
                     self.optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    self.accelerator.unwrap_model(self.text_policy).clear_prefix_cache()
+                    for name, params in param_groups.items():
+                        total_group_param_deltas[name] += self._param_group_delta_norm(
+                            params, group_snapshots[name]
+                        )
                     self.optimizer.zero_grad()
                     actual_optimization_steps += 1
                     accum_counter = 0
+                    accum_approx_kl_sum = 0.0
+                    accum_approx_kl_count = 0
 
                 total_loss += loss.item()
-                total_policy += policy_loss.item()
+                total_policy += policy_loss_raw.item()
                 total_value += value_loss.item()
                 total_entropy += entropies.mean().item()
                 total_clipfrac += (
-                    ((ratios - 1.0).abs() > self.clip_coef).float().mean().item()
+                    ((token_ratios - 1.0).abs() > self.clip_coef).float().mean().item()
+                    if token_ratios.numel() > 0
+                    else 0.0
                 )
-                total_approx_kl += (batch_old_log_probs - log_probs).mean().item()
+                total_approx_kl += approx_kl.item()
+                total_kl_penalty += kl_penalty_raw.item()
                 total_value_clipfrac += (
                     (value_losses_clipped > value_losses).float().mean().item()
                 )
                 metric_steps += 1
+                if not stop_policy_updates:
+                    total_policy_active_clipfrac += (
+                        ((token_ratios - 1.0).abs() > self.clip_coef).float().mean().item()
+                        if token_ratios.numel() > 0
+                        else 0.0
+                    )
+                    total_policy_active_approx_kl += approx_kl.item()
+                    total_policy_active_token_clipfrac += (
+                        ((token_ratios - 1.0).abs() > self.clip_coef)
+                        .float()
+                        .mean()
+                        .item()
+                    )
+                    total_policy_active_token_approx_kl += token_approx_kl.item()
+                    policy_active_metric_steps += 1
                 if (
-                    should_step
+                    (not stop_policy_updates)
+                    and should_step
                     and self.target_kl is not None
-                    and abs((batch_old_log_probs - log_probs).mean().item()) > self.target_kl
+                    and step_approx_kl > self.target_kl
                 ):
                     stop_early = True
-                    break
-            if stop_early:
-                break
+                    stop_policy_updates = True
 
         metric_denom = metric_steps if metric_steps > 0 else 1
         avg_loss = total_loss / metric_denom if metric_denom > 0 else 0.0
@@ -1821,8 +2966,32 @@ class MAPPOTrainer:
         avg_entropy = total_entropy / metric_denom if metric_denom > 0 else 0.0
         avg_clipfrac = total_clipfrac / metric_denom if metric_denom > 0 else 0.0
         avg_approx_kl = total_approx_kl / metric_denom if metric_denom > 0 else 0.0
+        avg_kl_penalty = total_kl_penalty / metric_denom if metric_denom > 0 else 0.0
         avg_value_clipfrac = (
             total_value_clipfrac / metric_denom if metric_denom > 0 else 0.0
+        )
+        policy_metric_denom = (
+            policy_active_metric_steps if policy_active_metric_steps > 0 else 1
+        )
+        avg_policy_active_clipfrac = (
+            total_policy_active_clipfrac / policy_metric_denom
+            if policy_active_metric_steps > 0
+            else 0.0
+        )
+        avg_policy_active_approx_kl = (
+            total_policy_active_approx_kl / policy_metric_denom
+            if policy_active_metric_steps > 0
+            else 0.0
+        )
+        avg_policy_active_token_clipfrac = (
+            total_policy_active_token_clipfrac / policy_metric_denom
+            if policy_active_metric_steps > 0
+            else 0.0
+        )
+        avg_policy_active_token_approx_kl = (
+            total_policy_active_token_approx_kl / policy_metric_denom
+            if policy_active_metric_steps > 0
+            else 0.0
         )
         reward_mean = (
             float(sum(float(t.reward) for t in transitions)) / float(len(transitions))
@@ -1838,8 +3007,40 @@ class MAPPOTrainer:
             ) / returns_var
         else:
             explained_var = 0.0
+        per_agent_metrics: Dict[int, Dict[str, float]] = {}
+        if transitions:
+            agent_indices_cpu = torch.tensor(agent_indices, dtype=torch.long)
+            for agent_idx in sorted({int(idx) for idx in agent_indices}):
+                mask = agent_indices_cpu == int(agent_idx)
+                if not bool(mask.any().item()):
+                    continue
+                agent_adv = raw_advantages[mask]
+                agent_returns = returns_cpu[mask]
+                agent_values = old_values_cpu[mask]
+                agent_returns_var = float(
+                    torch.var(agent_returns, unbiased=False).item()
+                )
+                if agent_returns_var > 1e-8:
+                    agent_explained_var = 1.0 - float(
+                        torch.var(
+                            agent_returns - agent_values, unbiased=False
+                        ).item()
+                    ) / agent_returns_var
+                else:
+                    agent_explained_var = 0.0
+                per_agent_metrics[int(agent_idx)] = {
+                    "adv_mean": float(agent_adv.mean().item()),
+                    "return_mean": float(agent_returns.mean().item()),
+                    "value_mean": float(agent_values.mean().item()),
+                    "explained_var": agent_explained_var,
+                }
+        fresh_value_metrics = self._compute_fresh_value_metrics(
+            transitions=transitions,
+            returns_cpu=returns_cpu,
+            agent_indices=agent_indices,
+        )
 
-        return {
+        result = {
             "loss": avg_loss,
             "policy": avg_policy,
             "value": avg_value,
@@ -1849,12 +3050,52 @@ class MAPPOTrainer:
             "return_mean": float(returns_cpu.mean().item()),
             "value_mean": float(old_values_cpu.mean().item()),
             "explained_var": explained_var,
+            "fresh_value_mean": float(fresh_value_metrics.get("fresh_value_mean", 0.0)),
+            "fresh_explained_var": float(
+                fresh_value_metrics.get("fresh_explained_var", 0.0)
+            ),
             "clipfrac": avg_clipfrac,
             "approx_kl": avg_approx_kl,
+            "policy_active_clipfrac": avg_policy_active_clipfrac,
+            "policy_active_approx_kl": avg_policy_active_approx_kl,
+            "policy_active_token_clipfrac": avg_policy_active_token_clipfrac,
+            "policy_active_token_approx_kl": avg_policy_active_token_approx_kl,
+            "kl_penalty": avg_kl_penalty,
+            "kl_penalty_coef": float(self.kl_penalty_coef),
             "value_clipfrac": avg_value_clipfrac,
             "optimizer_steps": float(actual_optimization_steps),
             "stopped_early": 1.0 if stop_early else 0.0,
         }
+        step_denom = (
+            float(actual_optimization_steps) if actual_optimization_steps > 0 else 1.0
+        )
+        for name in sorted(param_groups.keys()):
+            result[f"{name}_grad_norm"] = total_group_grad_norms[name] / step_denom
+            result[f"{name}_param_delta"] = total_group_param_deltas[name] / step_denom
+        for agent_idx in range(2):
+            agent_metrics = per_agent_metrics.get(agent_idx, {})
+            result[f"agent{agent_idx}_adv_mean"] = float(
+                agent_metrics.get("adv_mean", 0.0)
+            )
+            result[f"agent{agent_idx}_return_mean"] = float(
+                agent_metrics.get("return_mean", 0.0)
+            )
+            result[f"agent{agent_idx}_value_mean"] = float(
+                agent_metrics.get("value_mean", 0.0)
+            )
+            result[f"agent{agent_idx}_explained_var"] = float(
+                agent_metrics.get("explained_var", 0.0)
+            )
+            result[f"agent{agent_idx}_fresh_value_mean"] = float(
+                fresh_value_metrics.get(f"agent{agent_idx}_fresh_value_mean", 0.0)
+            )
+            result[f"agent{agent_idx}_fresh_explained_var"] = float(
+                fresh_value_metrics.get(
+                    f"agent{agent_idx}_fresh_explained_var", 0.0
+                )
+            )
+        result.update(self._current_group_lrs())
+        return result
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
         if not self.accelerator.is_main_process:
@@ -1972,8 +3213,17 @@ class MAPPOTrainer:
         path = self.output_dir / "train_curve.csv"
         header = (
             "row_idx,update_idx,num_transitions,loss,policy_loss,value_loss,entropy,"
-            "reward_mean,adv_mean,return_mean,value_mean,explained_var,"
-            "clipfrac,approx_kl,value_clipfrac,optimizer_steps,stopped_early"
+            "reward_mean,adv_mean,return_mean,value_mean,explained_var,fresh_value_mean,fresh_explained_var,"
+            "agent0_adv_mean,agent0_return_mean,agent0_value_mean,agent0_explained_var,agent0_fresh_value_mean,agent0_fresh_explained_var,"
+            "agent1_adv_mean,agent1_return_mean,agent1_value_mean,agent1_explained_var,agent1_fresh_value_mean,agent1_fresh_explained_var,"
+            "clipfrac,approx_kl,policy_active_clipfrac,policy_active_approx_kl,"
+            "policy_active_token_clipfrac,policy_active_token_approx_kl,"
+            "kl_penalty,kl_penalty_coef,value_clipfrac,optimizer_steps,stopped_early,"
+            "actor_lr,critic_adapter_lr,value_head_lr,"
+            "actor0_grad_norm,actor0_param_delta,"
+            "actor1_grad_norm,actor1_param_delta,"
+            "critic_adapter_grad_norm,critic_adapter_param_delta,"
+            "value_head_grad_norm,value_head_param_delta"
         )
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as handle:
@@ -1983,10 +3233,25 @@ class MAPPOTrainer:
                 f"{loss_dict.get('value', 0.0)},{loss_dict.get('entropy', 0.0)},"
                 f"{loss_dict.get('reward_mean', 0.0)},{loss_dict.get('adv_mean', 0.0)},"
                 f"{loss_dict.get('return_mean', 0.0)},{loss_dict.get('value_mean', 0.0)},"
-                f"{loss_dict.get('explained_var', 0.0)},"
+                f"{loss_dict.get('explained_var', 0.0)},{loss_dict.get('fresh_value_mean', 0.0)},"
+                f"{loss_dict.get('fresh_explained_var', 0.0)},"
+                f"{loss_dict.get('agent0_adv_mean', 0.0)},{loss_dict.get('agent0_return_mean', 0.0)},"
+                f"{loss_dict.get('agent0_value_mean', 0.0)},{loss_dict.get('agent0_explained_var', 0.0)},"
+                f"{loss_dict.get('agent0_fresh_value_mean', 0.0)},{loss_dict.get('agent0_fresh_explained_var', 0.0)},"
+                f"{loss_dict.get('agent1_adv_mean', 0.0)},{loss_dict.get('agent1_return_mean', 0.0)},"
+                f"{loss_dict.get('agent1_value_mean', 0.0)},{loss_dict.get('agent1_explained_var', 0.0)},"
+                f"{loss_dict.get('agent1_fresh_value_mean', 0.0)},{loss_dict.get('agent1_fresh_explained_var', 0.0)},"
                 f"{loss_dict.get('clipfrac', 0.0)},{loss_dict.get('approx_kl', 0.0)},"
+                f"{loss_dict.get('policy_active_clipfrac', 0.0)},{loss_dict.get('policy_active_approx_kl', 0.0)},"
+                f"{loss_dict.get('policy_active_token_clipfrac', 0.0)},{loss_dict.get('policy_active_token_approx_kl', 0.0)},"
+                f"{loss_dict.get('kl_penalty', 0.0)},{loss_dict.get('kl_penalty_coef', 0.0)},"
                 f"{loss_dict.get('value_clipfrac', 0.0)},{loss_dict.get('optimizer_steps', 0.0)},"
-                f"{loss_dict.get('stopped_early', 0.0)}\n"
+                f"{loss_dict.get('stopped_early', 0.0)},"
+                f"{loss_dict.get('actor_lr', 0.0)},{loss_dict.get('critic_adapter_lr', 0.0)},{loss_dict.get('value_head_lr', 0.0)},"
+                f"{loss_dict.get('actor0_grad_norm', 0.0)},{loss_dict.get('actor0_param_delta', 0.0)},"
+                f"{loss_dict.get('actor1_grad_norm', 0.0)},{loss_dict.get('actor1_param_delta', 0.0)},"
+                f"{loss_dict.get('critic_adapter_grad_norm', 0.0)},{loss_dict.get('critic_adapter_param_delta', 0.0)},"
+                f"{loss_dict.get('value_head_grad_norm', 0.0)},{loss_dict.get('value_head_param_delta', 0.0)}\n"
             )
 
     def log_performance(self, update_idx: int):
@@ -2142,6 +3407,8 @@ class MAPPOTrainer:
             return cleaned.strip("_") or "adapter"
 
         def _save_adapter_snapshot(adapter_name: str, out_dir: Path) -> None:
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             if isinstance(hf_model, PeftModel):
                 # Prefer saving only the selected adapter when supported (multi-adapter safe).
@@ -2170,11 +3437,21 @@ class MAPPOTrainer:
             "update_idx": update_idx,
         }
 
+        value_head_path = self.export_latest_dir / "value_head.pt"
+        torch.save(
+            {
+                "state_dict": unwrapped.value_head.state_dict(),
+                "dtype": str(unwrapped.value_head.weight.dtype),
+            },
+            value_head_path,
+        )
+        payload["value_head_path"] = str(value_head_path)
+
         if unwrapped.is_lora:
             # Export per-agent adapters so the sampler can load different models for each agent.
             exported_actor: Dict[str, Dict[str, Any]] = {}
             for idx, spec in sorted(self.actor_adapters.items()):
-                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}_u{update_idx:05d}"
+                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}"
                 self.accelerator.print(
                     f"[Export] Saving adapter[{idx}:{spec.name}] -> {adapter_dir}"
                 )
@@ -2188,7 +3465,7 @@ class MAPPOTrainer:
 
             if self.critic_adapter is not None:
                 spec = self.critic_adapter
-                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}_u{update_idx:05d}"
+                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}"
                 self.accelerator.print(
                     f"[Export] Saving adapter[critic:{spec.name}] -> {adapter_dir}"
                 )
@@ -2200,7 +3477,7 @@ class MAPPOTrainer:
 
             # Backward-compat: if this is a single-adapter run, keep legacy lora_path field.
             if not self.actor_adapters and self.critic_adapter is None:
-                adapter_dir = self.export_latest_dir / f"adapter_u{update_idx:05d}"
+                adapter_dir = self.export_latest_dir / "adapter"
                 self.accelerator.print(f"[Export] Saving adapter -> {adapter_dir}")
                 active = getattr(hf_model, "active_adapter", "default")
                 if isinstance(active, (list, tuple)):
@@ -2210,8 +3487,10 @@ class MAPPOTrainer:
                 _save_adapter_snapshot(active_name, adapter_dir)
                 payload["lora_path"] = str(adapter_dir)
         else:
-            model_dir = self.export_latest_dir / f"model_u{update_idx:05d}"
+            model_dir = self.export_latest_dir / "model"
             self.accelerator.print(f"[Export] Saving full model -> {model_dir}")
+            if model_dir.exists():
+                shutil.rmtree(model_dir)
             model_dir.mkdir(parents=True, exist_ok=True)
             hf_model.save_pretrained(model_dir)
             tokenizer.save_pretrained(model_dir)
@@ -2229,6 +3508,7 @@ class MAPPOTrainer:
         return {
             "prompt_ids": _cpu(t.prompt_ids),
             "response_ids": _cpu(t.response_ids),
+            "response_log_probs": _cpu(t.response_log_probs),
             "critic_input_ids": _cpu(t.critic_input_ids),
             "log_prob": t.log_prob,
             "policy_temperature": t.policy_temperature,
@@ -2250,6 +3530,7 @@ class MAPPOTrainer:
         return TextTransition(
             prompt_ids=d["prompt_ids"],
             response_ids=d["response_ids"],
+            response_log_probs=d.get("response_log_probs"),
             critic_input_ids=d.get("critic_input_ids"),
             log_prob=float(d["log_prob"]),
             policy_temperature=(
