@@ -35,13 +35,19 @@ class ProcessRewardTracker:
         self.communication_penalty_value = -abs(
             self.settings.get("communication_penalty", 0.1)
         )
+        self.forced_communication_penalty_value = -abs(
+            self.settings.get(
+                "forced_communication_penalty",
+                abs(self.communication_penalty_value),
+            )
+        )
         self.enable_collab_reward = bool(self.settings.get("collab_reward_enabled", False))
 
         self.references = self._load_references()
         self.sequence_histories: List[List[str]] = [[], []]
         self.sequence_scores: List[float] = [0.0, 0.0]
         self.collab_sequence_scores: List[float] = [0.0, 0.0]
-        self.last_comm_actions: List[Optional[str]] = [None, None]
+        self.last_action_signatures: List[Optional[str]] = [None, None]
 
         self.recipe_lookup = self._build_recipe_lookup()
         self.intermediate_targets = self._resolve_recipe_targets(self.order)
@@ -69,7 +75,7 @@ class ProcessRewardTracker:
         self.sequence_histories = [[], []]
         self.sequence_scores = [0.0, 0.0]
         self.collab_sequence_scores = [0.0, 0.0]
-        self.last_comm_actions = [None, None]
+        self.last_action_signatures = [None, None]
         self.observed_targets.clear()
         self.call_events.clear()
         self.step_call_records.clear()
@@ -82,7 +88,7 @@ class ProcessRewardTracker:
             "sequence_histories": copy.deepcopy(self.sequence_histories),
             "sequence_scores": list(self.sequence_scores),
             "collab_sequence_scores": list(self.collab_sequence_scores),
-            "last_comm_actions": list(self.last_comm_actions),
+            "last_action_signatures": list(self.last_action_signatures),
             "observed_targets": list(self.observed_targets),
             "penalty_queue": copy.deepcopy(self.penalty_queue),
         }
@@ -105,9 +111,12 @@ class ProcessRewardTracker:
         )
         if len(self.collab_sequence_scores) < 2:
             self.collab_sequence_scores = [0.0, 0.0]
-        self.last_comm_actions = list(data.get("last_comm_actions", [None, None]))
-        if len(self.last_comm_actions) < 2:
-            self.last_comm_actions = [None, None]
+        restored_signatures = data.get("last_action_signatures")
+        if restored_signatures is None:
+            restored_signatures = data.get("last_comm_actions", [None, None])
+        self.last_action_signatures = list(restored_signatures)
+        if len(self.last_action_signatures) < 2:
+            self.last_action_signatures = [None, None]
         observed = data.get("observed_targets", [])
         self.observed_targets = set(observed) if observed else set()
         penalty_state = data.get("penalty_queue")
@@ -131,6 +140,7 @@ class ProcessRewardTracker:
         agent_name: Optional[str] = None,
         call_index: Optional[int] = None,
         call_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         """Record a single LLM call regardless of success / failure."""
         if agent_index is None:
@@ -141,12 +151,20 @@ class ProcessRewardTracker:
         similarity_before = self.sequence_scores[agent_index]
         similarity_after = similarity_before
         similarity_delta = 0.0
-        communication_reward = 0.0
+        meta = metadata or {}
+        suppress_repeat_penalty = bool(meta.get("suppress_repeat_penalty", False))
+        force_communication_penalty = bool(
+            meta.get("force_communication_penalty", False)
+        )
+        communication_reward = self._process_communication_reward(
+            agent_index,
+            normalized_action,
+            suppress_penalty=suppress_repeat_penalty,
+        )
+        if force_communication_penalty:
+            communication_reward += self.forced_communication_penalty_value
         if is_collab:
             seq_reward = 0.0
-            communication_reward = self._process_communication_reward(
-                agent_index, normalized_action
-            )
         else:
             (
                 seq_reward,
@@ -305,15 +323,58 @@ class ProcessRewardTracker:
                 reward += delta * self.sequence_weight
         return reward
 
-    def _process_communication_reward(self, agent_index: int, action: str) -> float:
-        normalized = self._normalize_action(action)
-        if not normalized:
+    def _process_communication_reward(
+        self, agent_index: int, action: str, *, suppress_penalty: bool = False
+    ) -> float:
+        signature = self._build_action_signature(action)
+        if not signature:
             return 0.0
-        previous = self.last_comm_actions[agent_index]
-        self.last_comm_actions[agent_index] = normalized
-        if previous and previous == normalized:
+        previous = self.last_action_signatures[agent_index]
+        self.last_action_signatures[agent_index] = signature
+        if suppress_penalty:
+            return 0.0
+        if previous and previous == signature:
             return self.communication_penalty_value
         return 0.0
+
+    def _build_action_signature(self, action: str) -> str:
+        normalized = self._normalize_action(action)
+        if not normalized:
+            return ""
+        if not self._is_collab_action(normalized):
+            return f"embodied:{normalized}"
+
+        body = self._unwrap_function_body(normalized)
+        collab_body = body if normalized.lower().startswith("collab(") and body is not None else normalized
+        segments = self._split_top_level_segments(collab_body)
+        if not segments:
+            segments = [collab_body]
+
+        parts: List[str] = []
+        for segment in segments:
+            primitive, payload = self._parse_collab_signature_segment(segment)
+            if primitive:
+                parts.append(f"{primitive}:{payload}")
+        if not parts:
+            return f"collab:{normalized}"
+        return "collab:" + ";".join(parts)
+
+    def _parse_collab_signature_segment(self, text: str) -> Tuple[str, str]:
+        stripped = (text or "").strip()
+        if not stripped:
+            return "", ""
+        lowered = stripped.lower()
+        for primitive in ("request", "seek", "ack", "deny"):
+            prefix = primitive + "("
+            if lowered.startswith(prefix):
+                body = self._unwrap_function_body(stripped)
+                if body is None:
+                    return primitive, stripped
+                target_raw, payload_raw = self._split_first_argument(body)
+                target_norm = self._normalize_action(target_raw)
+                payload_norm = self._normalize_action(payload_raw)
+                return primitive, f"{target_norm}|{payload_norm}"
+        return "raw", self._normalize_action(stripped)
 
     def _lcs_ratio(self, seq_a: List[str], seq_b: List[str]) -> float:
         if not seq_a or not seq_b:

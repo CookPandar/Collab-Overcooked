@@ -1021,12 +1021,24 @@ class LLMAgents(LLMPair):
             return
         timestamp = getattr(self, "current_timestep", None)
         normalized = (action_text or "").strip()
+        suppress_repeat_penalty = False
+        if self.pending_llm_logs:
+            entry = self.pending_llm_logs[-1]
+            metadata = entry.get("metadata") or {}
+            suppress_repeat_penalty = (
+                metadata.get("forced_action_reason") == "communication_turn_limit"
+            )
+            force_communication_penalty = suppress_repeat_penalty
+        else:
+            force_communication_penalty = False
         self._last_reward_entry = None
         self._pending_reward_event = {
             "action": normalized,
             "call_index": call_index,
             "call_type": call_type,
             "timestamp": timestamp,
+            "suppress_repeat_penalty": suppress_repeat_penalty,
+            "force_communication_penalty": force_communication_penalty,
         }
 
     def _apply_penalty_to_last_entry(self, penalty_type: str, detail: str) -> bool:
@@ -1116,6 +1128,14 @@ class LLMAgents(LLMPair):
             agent_name=self.name,
             call_index=event.get("call_index"),
             call_type=event.get("call_type"),
+            metadata={
+                "suppress_repeat_penalty": bool(
+                    event.get("suppress_repeat_penalty", False)
+                ),
+                "force_communication_penalty": bool(
+                    event.get("force_communication_penalty", False)
+                ),
+            },
         )
         self._last_reward_entry = entry
         self._pending_reward_event = None
@@ -1145,8 +1165,6 @@ class LLMAgents(LLMPair):
             "forced_action_reason": reason,
         }
         call_index = self._relabel_last_llm_call("planner_main", metadata)
-        if self.reward_tracker and self.agent_index is not None:
-            self.reward_tracker.register_format_error(self.agent_index, reason)
         return call_index
 
     def _reset_comm_turn_counter(self):
@@ -1824,10 +1842,6 @@ class LLMAgents(LLMPair):
                 forced_index = self._mark_last_call_as_action(
                     forced_action, "communication_turn_limit"
                 )
-                if self.reward_tracker and self.agent_index is not None:
-                    self.reward_tracker.register_format_error(
-                        self.agent_index, "communication_turn_limit"
-                    )
                 if forced_index is not None:
                     self._forced_action_override = {
                         "call_index": forced_index,
@@ -2473,10 +2487,6 @@ class LLMAgents(LLMPair):
                     forced_idx = self._mark_last_call_as_action(
                         forced_action, "communication_turn_limit"
                     )
-                    if self.reward_tracker and self.agent_index is not None:
-                        self.reward_tracker.register_format_error(
-                            self.agent_index, "communication_turn_limit"
-                        )
                     if forced_idx is not None:
                         self._forced_action_override = {
                             "call_index": forced_idx,

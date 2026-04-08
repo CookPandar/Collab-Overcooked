@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -338,6 +340,7 @@ class CollabMainSession:
 
         self.agents = self._build_agents()
         self.team = AgentGroup(*self.agents)
+        self._runtime_log_context: Dict[str, Any] = {}
         self._init_policy_record_logging(len(self.agents))
         self._shared_agent_traces: Dict[int, Dict[str, Any]] = {}
         self.rl_modules: List[RLPlannerProxy] = []
@@ -375,6 +378,28 @@ class CollabMainSession:
         for proxy in self.rl_modules:
             proxy.consume_records()
         return self._build_observation(self.env.state)
+
+    def set_logging_context(
+        self,
+        *,
+        update_idx: Optional[int] = None,
+        phase: Optional[str] = None,
+        run_label: Optional[str] = None,
+        loop_round_idx: Optional[int] = None,
+        rotate_session: bool = False,
+    ) -> None:
+        context = dict(getattr(self, "_runtime_log_context", {}))
+        if update_idx is not None:
+            context["update_idx"] = int(update_idx)
+        if phase:
+            context["phase"] = str(phase)
+        if run_label:
+            context["run_label"] = str(run_label)
+        if loop_round_idx is not None:
+            context["loop_round_idx"] = int(loop_round_idx)
+        self._runtime_log_context = context
+        if rotate_session:
+            self._init_policy_record_logging(len(self.agents))
 
     def capture_snapshot(self) -> Dict[str, Any]:
         """Capture a serializable snapshot of the current session state."""
@@ -462,14 +487,116 @@ class CollabMainSession:
             or self.variant.get("log_dir")
             or self.variant.get("trainer", {}).get("record_log_dir")
         )
+        record_mode, run_label, update_tag, session_meta = self._policy_record_log_context()
         base_dir = Path(raw_dir) if raw_dir else Path("runs") / "rl_policy_records"
-        session_dir = base_dir / f"session_{int(time.time())}_{abs(id(self))}"
+        session_dir = (
+            base_dir
+            / record_mode
+            / run_label
+            / update_tag
+            / f"session_{int(time.time())}_{abs(id(self))}"
+        )
         session_dir.mkdir(parents=True, exist_ok=True)
+        self._policy_record_session_dir = session_dir
+        self._policy_record_session_meta = dict(session_meta)
+        self._policy_record_session_meta["session_dir"] = str(session_dir)
         self._policy_record_paths: List[Path] = []
         for idx in range(agent_count):
             path = session_dir / f"agent_{idx}.jsonl"
             path.touch(exist_ok=True)
             self._policy_record_paths.append(path)
+        try:
+            (session_dir / "session_meta.json").write_text(
+                json.dumps(self._policy_record_session_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _sanitize_log_component(value: Optional[str], fallback: str) -> str:
+        text = (value or "").strip()
+        if not text:
+            text = fallback
+        text = text.replace("\\", "/")
+        text = text.split("/")[-1]
+        text = re.sub(r"[^0-9A-Za-z._-]+", "_", text).strip("._-")
+        return text or fallback
+
+    def _policy_record_log_context(self) -> Tuple[str, str, str, Dict[str, Any]]:
+        yaml_config = self.variant.get("yaml_config") or {}
+        trainer_cfg = yaml_config.get("trainer") if isinstance(yaml_config, dict) else {}
+        if not isinstance(trainer_cfg, dict):
+            trainer_cfg = {}
+        runtime_ctx = getattr(self, "_runtime_log_context", {}) or {}
+
+        train_only = bool(trainer_cfg.get("train_only", False))
+        collect_only = bool(trainer_cfg.get("collect_only", False))
+        output_dir = str(trainer_cfg.get("output_dir", "") or "")
+        rollout_dir = str(trainer_cfg.get("rollout_dir", "") or "")
+        explicit_mode = str(
+            self.variant.get("record_log_mode")
+            or trainer_cfg.get("record_log_mode")
+            or ""
+        ).strip().lower()
+
+        if runtime_ctx.get("phase"):
+            record_mode = self._sanitize_log_component(str(runtime_ctx["phase"]), "run")
+        elif explicit_mode:
+            record_mode = self._sanitize_log_component(explicit_mode, "run")
+        elif train_only:
+            record_mode = "train"
+        elif collect_only:
+            output_hint = output_dir.lower()
+            rollout_hint = rollout_dir.lower()
+            if "eval" in output_hint or "eval" in rollout_hint:
+                record_mode = "eval"
+            else:
+                record_mode = "collect"
+        else:
+            record_mode = "run"
+
+        explicit_label = str(
+            self.variant.get("record_log_name")
+            or trainer_cfg.get("record_log_name")
+            or ""
+        ).strip()
+        default_label = (
+            Path(output_dir).name
+            if output_dir
+            else (Path(rollout_dir).name if rollout_dir else self.variant.get("order", "default"))
+        )
+        runtime_run_label = runtime_ctx.get("run_label")
+        run_label = self._sanitize_log_component(
+            str(runtime_run_label) if runtime_run_label else (explicit_label or default_label),
+            "default",
+        )
+        update_idx = runtime_ctx.get("update_idx")
+        update_tag = (
+            f"update_u{int(update_idx):05d}"
+            if update_idx is not None
+            else "update_unknown"
+        )
+
+        session_meta = {
+            "log_mode": record_mode,
+            "log_run_label": run_label,
+            "update_idx": int(update_idx) if update_idx is not None else None,
+            "update_tag": update_tag,
+            "loop_round_idx": (
+                int(runtime_ctx["loop_round_idx"])
+                if runtime_ctx.get("loop_round_idx") is not None
+                else None
+            ),
+            "order": self.variant.get("order"),
+            "layout": self.variant.get("layout"),
+            "horizon": self.variant.get("horizon"),
+            "trainer_collect_only": collect_only,
+            "trainer_train_only": train_only,
+            "trainer_output_dir": output_dir,
+            "trainer_rollout_dir": rollout_dir,
+        }
+        return record_mode, run_label, update_tag, session_meta
 
     def _build_observation(self, state: OvercookedState) -> Dict[str, Any]:
         counters = self.mdp.get_counter_objects_dict(
@@ -608,12 +735,18 @@ class CollabMainSession:
                 "timestep": record.timestep,
                 "agent_index": agent_idx,
                 "call_type": (record.context or {}).get("call_type"),
+                "log_mode": getattr(self, "_policy_record_session_meta", {}).get("log_mode"),
+                "log_run_label": getattr(self, "_policy_record_session_meta", {}).get("log_run_label"),
+                "update_idx": getattr(self, "_policy_record_session_meta", {}).get("update_idx"),
+                "update_tag": getattr(self, "_policy_record_session_meta", {}).get("update_tag"),
+                "loop_round_idx": getattr(self, "_policy_record_session_meta", {}).get("loop_round_idx"),
                 "reward": record.reward,
                 "done": record.done,
                 "prompt": record.prompt,
                 "response": record.response,
                 "messages": record.messages,
                 "metadata": self._metadata_snapshot(record.metadata),
+                "session_meta": getattr(self, "_policy_record_session_meta", {}),
             }
             try:
                 with log_path.open("a", encoding="utf-8") as handle:

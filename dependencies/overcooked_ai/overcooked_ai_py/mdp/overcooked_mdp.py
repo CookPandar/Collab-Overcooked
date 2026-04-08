@@ -1282,12 +1282,12 @@ class OvercookedGridworld(object):
         if current_order == 'any' or soup_type == current_order:
             if (soup_type in self.Recipe.recipe_need_dish) and soup_obj.catagory == 'with_dish':
                 state.order_list = state.order_list[1:]
-                if len(state.order_list) <= state.k_order:
+                if (not self.one_task_mode) and len(state.order_list) <= state.k_order:
                     state.order_list = self.add_elements_based_on_probability(state.order_list, self.order_probability)
                 return state, self.delivery_reward
             elif soup_type not in self.Recipe.recipe_need_dish and soup_obj.catagory != 'with_dish':
                 state.order_list = state.order_list[1:]
-                if len(state.order_list) <= state.k_order:
+                if (not self.one_task_mode) and len(state.order_list) <= state.k_order:
                     state.order_list = self.add_elements_based_on_probability(state.order_list, self.order_probability)
                 return state, self.delivery_reward
 
