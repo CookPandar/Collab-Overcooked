@@ -261,7 +261,7 @@ run_stage_workers() {
         echo "[cluster-rl] starting worker stage=$stage_name rank=$rank log=$log_file"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
             CUDA_VISIBLE_DEVICES="$rank" \
-            LOCAL_RANK="$rank" \
+            RL_WORKER_RANK="$rank" \
             RL_STAGE_PHASE="$stage_name" \
             RL_STAGE_ROUND_IDX="$i" \
             RL_LOOP_ROUND_IDX="$i" \

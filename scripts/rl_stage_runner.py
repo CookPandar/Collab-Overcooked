@@ -12,6 +12,19 @@ from pathlib import Path
 import yaml
 
 
+def _runtime_worker_rank() -> int:
+    raw = (
+        os.environ.get("RL_WORKER_RANK")
+        or os.environ.get("LOCAL_RANK")
+        or os.environ.get("RANK")
+        or "0"
+    )
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
 def _resolve_agent_index(key):
     if isinstance(key, int):
         return key
@@ -75,7 +88,7 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
 
 
 def build_rank_bound_config(src_cfg: Path, stage: str) -> Path:
-    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    rank = _runtime_worker_rank()
     host = os.environ["RL_VLLM_HOST"]
     start_port = int(os.environ["RL_VLLM_START_PORT"])
     port = start_port + rank

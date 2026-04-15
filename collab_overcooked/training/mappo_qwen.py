@@ -2296,7 +2296,16 @@ class MAPPOTrainer:
         messages: List[Dict[str, str]],
         temperature: Optional[float],
     ) -> Tuple[str, Dict[str, Any]]:
-        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        rank_raw = (
+            os.environ.get("RL_WORKER_RANK")
+            or os.environ.get("LOCAL_RANK")
+            or os.environ.get("RANK")
+            or "0"
+        )
+        try:
+            rank = int(rank_raw)
+        except ValueError:
+            rank = 0
         host = os.environ["RL_VLLM_HOST"]
         start_port = int(os.environ["RL_VLLM_START_PORT"])
         api_key = os.environ.get("RL_VLLM_API_KEY", "YOUR_API_KEY")
