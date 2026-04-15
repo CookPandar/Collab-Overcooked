@@ -132,10 +132,28 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval_kl" "$REPO_ROOT/logs/rl_vllm"
 
 VLLM_PIDS=()
+VLLM_PORTS=()
+VLLM_ENGINE_PORTS=()
 cleanup() {
     stop_vllm_servers
 }
 trap cleanup EXIT
+
+kill_port_listener() {
+    local port="$1"
+    if command -v lsof >/dev/null 2>&1; then
+        local pids=()
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] && pids+=("$pid")
+        done < <(lsof -tiTCP:"$port" -sTCP:LISTEN -Pn 2>/dev/null || true)
+        if [[ "${#pids[@]}" -gt 0 ]]; then
+            echo "[cluster-rl] clearing listener on port=$port pid=${pids[*]}"
+            kill "${pids[@]}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${pids[@]}" 2>/dev/null || true
+        fi
+    fi
+}
 
 stop_vllm_servers() {
     for pid in "${VLLM_PIDS[@]:-}"; do
@@ -144,7 +162,15 @@ stop_vllm_servers() {
             wait "$pid" || true
         fi
     done
+    for port in "${VLLM_PORTS[@]:-}"; do
+        [[ -n "$port" ]] && kill_port_listener "$port"
+    done
+    for port in "${VLLM_ENGINE_PORTS[@]:-}"; do
+        [[ -n "$port" ]] && kill_port_listener "$port"
+    done
     VLLM_PIDS=()
+    VLLM_PORTS=()
+    VLLM_ENGINE_PORTS=()
 }
 
 wait_for_port() {
@@ -186,9 +212,13 @@ start_vllm_servers() {
     local stage_name="$3"
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
+        local engine_port=$((VLLM_START_PORT + 100 + gpu))
+        VLLM_PORTS+=("$port")
+        VLLM_ENGINE_PORTS+=("$engine_port")
+        kill_port_listener "$port"
+        kill_port_listener "$engine_port"
         local log_file="$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
         echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port"
-        local engine_port=$((VLLM_START_PORT + 100 + gpu))
         "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
             --gpu "$gpu" \
             --port "$port" \
@@ -218,6 +248,39 @@ ensure_vllm_servers() {
     start_vllm_servers "$NUM_PROCS" "$cfg_path" "$stage_name"
 }
 
+run_stage_workers() {
+    local stage_name="$1"
+    local cfg_path="$2"
+    local worker_pids=()
+    local worker_logs=()
+    local status=0
+    mkdir -p "$REPO_ROOT/logs/rl_workers"
+    for ((rank=0; rank<NUM_PROCS; rank++)); do
+        local log_file="$REPO_ROOT/logs/rl_workers/${stage_name}_rank${rank}.log"
+        worker_logs+=("$log_file")
+        echo "[cluster-rl] starting worker stage=$stage_name rank=$rank log=$log_file"
+        env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
+            CUDA_VISIBLE_DEVICES="$rank" \
+            LOCAL_RANK="$rank" \
+            RL_STAGE_PHASE="$stage_name" \
+            RL_STAGE_ROUND_IDX="$i" \
+            RL_LOOP_ROUND_IDX="$i" \
+            "$PY_BIN" -u "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}" \
+            >"$log_file" 2>&1 &
+        worker_pids+=("$!")
+    done
+
+    for idx in "${!worker_pids[@]}"; do
+        local pid="${worker_pids[$idx]}"
+        if ! wait "$pid"; then
+            status=1
+            echo "[cluster-rl] worker failed stage=$stage_name rank=$idx log=${worker_logs[$idx]}" >&2
+            tail -n 80 "${worker_logs[$idx]}" >&2 || true
+        fi
+    done
+    return "$status"
+}
+
 run_stage() {
     local stage_name="$1"
     local cfg_path="$2"
@@ -230,13 +293,17 @@ run_stage() {
         stop_vllm_servers
     fi
     echo "[cluster-rl] stage=$stage_name cfg=$cfg_path procs=$NUM_PROCS"
-    env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
-    RL_STAGE_PHASE="$stage_name" \
-    RL_STAGE_ROUND_IDX="$i" \
-    RL_LOOP_ROUND_IDX="$i" \
-    MASTER_PORT="$MASTER_PORT" \
-    "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
-        "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}"
+    if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+        run_stage_workers "$stage_name" "$cfg_path"
+    else
+        env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
+        RL_STAGE_PHASE="$stage_name" \
+        RL_STAGE_ROUND_IDX="$i" \
+        RL_LOOP_ROUND_IDX="$i" \
+        MASTER_PORT="$MASTER_PORT" \
+        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
+            "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}"
+    fi
 }
 
 STATUS=0
