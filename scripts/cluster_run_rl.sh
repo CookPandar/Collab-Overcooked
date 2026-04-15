@@ -70,9 +70,10 @@ GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
 MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
 MAX_LORAS="${RL_VLLM_MAX_LORAS:-2}"
 MAX_LORA_RANK="${RL_VLLM_MAX_LORA_RANK:-0}"
-ENFORCE_EAGER="${RL_VLLM_ENFORCE_EAGER:-0}"
+ENFORCE_EAGER="${RL_VLLM_ENFORCE_EAGER:-1}"
 SERVED_MODEL_NAME="${RL_VLLM_SERVED_MODEL_NAME:-qwen2.5-7B-instruct}"
 API_KEY="${RL_VLLM_API_KEY:-YOUR_API_KEY}"
+VLLM_MODE="${RL_VLLM_MODE:-balanced}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
 RUN_ARGS=()
 
@@ -126,11 +127,43 @@ export RL_VLLM_MODEL_PATH="$VLLM_MODEL_PATH"
 export RL_NUM_PROCS="$NUM_PROCS"
 export RL_LATEST_MODEL_FILE="${RL_LATEST_MODEL_FILE:-$REPO_ROOT/runs/rl/latest_model_kl.json}"
 export RL_PY_BIN="$PY_BIN"
-export VLLM_COMPILE_BACKEND=inductor
-export VLLM_USE_TORCH_COMPILE=1
-export VLLM_TORCH_COMPILE=1
-export TORCHINDUCTOR_FREEZING=1
 export TOKENIZERS_PARALLELISM=false
+
+case "$VLLM_MODE" in
+    safe)
+        export VLLM_COMPILE_BACKEND=none
+        export VLLM_USE_TORCH_COMPILE=0
+        export VLLM_TORCH_COMPILE=0
+        export TORCH_COMPILE_DISABLE=1
+        export TORCHDYNAMO_DISABLE=1
+        export TORCHINDUCTOR_DISABLE=1
+        export TORCHINDUCTOR_FREEZING=0
+        ENFORCE_EAGER=1
+        ;;
+    fast)
+        export VLLM_COMPILE_BACKEND=inductor
+        export VLLM_USE_TORCH_COMPILE=1
+        export VLLM_TORCH_COMPILE=1
+        export TORCH_COMPILE_DISABLE=0
+        export TORCHDYNAMO_DISABLE=0
+        export TORCHINDUCTOR_DISABLE=0
+        export TORCHINDUCTOR_FREEZING=1
+        ;;
+    balanced)
+        export VLLM_COMPILE_BACKEND=none
+        export VLLM_USE_TORCH_COMPILE=0
+        export VLLM_TORCH_COMPILE=0
+        export TORCH_COMPILE_DISABLE=1
+        export TORCHDYNAMO_DISABLE=1
+        export TORCHINDUCTOR_DISABLE=1
+        export TORCHINDUCTOR_FREEZING=0
+        ENFORCE_EAGER=1
+        ;;
+    *)
+        echo "[cluster-rl] invalid RL_VLLM_MODE=$VLLM_MODE (expected safe|balanced|fast)" >&2
+        exit 1
+        ;;
+esac
 
 mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval_kl" "$REPO_ROOT/logs/rl_vllm"
 find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
