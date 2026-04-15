@@ -66,6 +66,8 @@ VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
 MASTER_PORT="${RL_MASTER_PORT:-29540}"
 GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
 MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
+MAX_LORAS="${RL_VLLM_MAX_LORAS:-2}"
+MAX_LORA_RANK="${RL_VLLM_MAX_LORA_RANK:-0}"
 SERVED_MODEL_NAME="${RL_VLLM_SERVED_MODEL_NAME:-qwen2.5-7B-instruct}"
 API_KEY="${RL_VLLM_API_KEY:-YOUR_API_KEY}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
@@ -117,6 +119,7 @@ export RL_REPO_ROOT="$REPO_ROOT"
 export RL_VLLM_HOST="$VLLM_HOST"
 export RL_VLLM_START_PORT="$VLLM_START_PORT"
 export RL_VLLM_API_KEY="$API_KEY"
+export RL_VLLM_MODEL_PATH="$VLLM_MODEL_PATH"
 export RL_NUM_PROCS="$NUM_PROCS"
 export RL_LATEST_MODEL_FILE="${RL_LATEST_MODEL_FILE:-$REPO_ROOT/runs/rl/latest_model_kl.json}"
 export RL_PY_BIN="$PY_BIN"
@@ -130,14 +133,19 @@ mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval
 
 VLLM_PIDS=()
 cleanup() {
+    stop_vllm_servers
+}
+trap cleanup EXIT
+
+stop_vllm_servers() {
     for pid in "${VLLM_PIDS[@]:-}"; do
         if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
             kill "$pid" || true
             wait "$pid" || true
         fi
     done
+    VLLM_PIDS=()
 }
-trap cleanup EXIT
 
 wait_for_port() {
     local host="$1"
@@ -174,28 +182,40 @@ PY
 
 start_vllm_servers() {
     local count="$1"
+    local cfg_path="$2"
+    local stage_name="$3"
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
-        local log_file="$REPO_ROOT/logs/rl_vllm/vllm_gpu${gpu}.log"
-        echo "[cluster-rl] starting vLLM gpu=$gpu port=$port"
+        local log_file="$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
+        echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port"
         local engine_port=$((VLLM_START_PORT + 100 + gpu))
         "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
             --gpu "$gpu" \
             --port "$port" \
             --engine-port "$engine_port" \
             --model "$VLLM_MODEL_PATH" \
+            --config "$cfg_path" \
             --served-model-name "$SERVED_MODEL_NAME" \
             --gpu-memory-utilization "$GPU_MEM" \
             --max-model-len "$MAX_MODEL_LEN" \
             --api-key "$API_KEY" \
+            --max-loras "$MAX_LORAS" \
+            --max-lora-rank "$MAX_LORA_RANK" \
             >"$log_file" 2>&1 &
         VLLM_PIDS+=("$!")
     done
 
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
-        wait_for_port "$VLLM_HOST" "$port" "${VLLM_PIDS[$gpu]}" "$REPO_ROOT/logs/rl_vllm/vllm_gpu${gpu}.log"
+        wait_for_port "$VLLM_HOST" "$port" "${VLLM_PIDS[$gpu]}" "$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
     done
+}
+
+ensure_vllm_servers() {
+    local cfg_path="$1"
+    local stage_name="$2"
+    stop_vllm_servers
+    start_vllm_servers "$NUM_PROCS" "$cfg_path" "$stage_name"
 }
 
 run_stage() {
@@ -203,6 +223,11 @@ run_stage() {
     local cfg_path="$2"
     if [[ -z "$cfg_path" ]]; then
         return 0
+    fi
+    if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+        ensure_vllm_servers "$cfg_path" "$stage_name"
+    else
+        stop_vllm_servers
     fi
     echo "[cluster-rl] stage=$stage_name cfg=$cfg_path procs=$NUM_PROCS"
     env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
@@ -213,8 +238,6 @@ run_stage() {
     "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
         "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}"
 }
-
-start_vllm_servers "$NUM_PROCS"
 
 STATUS=0
 for ((i=1; i<=LOOP_ROUNDS; i++)); do

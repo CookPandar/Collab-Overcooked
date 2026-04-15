@@ -1202,7 +1202,6 @@ class MAPPOTrainer:
         self.runtime_stage_phase = self._runtime_stage_phase(
             "train" if self.train_only and not self.collect_only else "collect"
         )
-        self.load_policy_model = self.train_only or self.runtime_stage_phase != "eval"
         apply_latest_default = not self.train_only
         self.apply_latest_model_override = bool(
             self.trainer_cfg.get("apply_latest_model_override", apply_latest_default)
@@ -1270,6 +1269,9 @@ class MAPPOTrainer:
         )
         self.compute_values_in_collect = bool(
             trainer_cfg.get("compute_values_in_collect", False)
+        )
+        self.load_policy_model = self.train_only or (
+            self.collect_only and self.compute_values_in_collect
         )
         target_kl_cfg = trainer_cfg.get("target_kl", None)
         self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
@@ -1380,8 +1382,23 @@ class MAPPOTrainer:
                     self.accelerator.print(f"[MAPPO] Loaded value head from {resolved}")
             self.policy_tokenizer = self.text_policy.tokenizer
         else:
+            tokenizer_kwargs: Dict[str, Any] = {
+                "trust_remote_code": True,
+            }
+            if trainer_cfg.get("fix_mistral_regex", None) is True or (
+                trainer_cfg.get("fix_mistral_regex", None) is None
+                and "mistral" in str(self.model_path).lower()
+            ):
+                tokenizer_kwargs["fix_mistral_regex"] = True
+            self.policy_tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                **tokenizer_kwargs,
+            )
+            if self.policy_tokenizer.pad_token_id is None:
+                self.policy_tokenizer.pad_token_id = self.policy_tokenizer.eos_token_id
             self.accelerator.print(
-                f"[MAPPO] load_policy_model=false stage={self.runtime_stage_phase}; eval uses pure vLLM inference."
+                "[MAPPO] load_policy_model=false stage="
+                f"{self.runtime_stage_phase}; collect/eval use vLLM actor with tokenizer-only local state."
             )
         self.lr_scheduler = None
         if self.train_only:
@@ -2213,7 +2230,64 @@ class MAPPOTrainer:
         )
 
     def _policy_call_without_local_model(self, agent_index: int, messages, context):
-        raise RuntimeError("Eval-only vLLM policy path is not implemented for RLPlannerProxy.")
+        from ..agents.utils import convert_messages_to_prompt
+
+        assert self.policy_tokenizer is not None
+        response_text, actor_metadata = self._query_vllm_actor(
+            agent_index=agent_index,
+            messages=messages,
+            temperature=(context or {}).get("temperature"),
+        )
+        prompt_text = convert_messages_to_prompt(messages)
+        tokenizer = self.policy_tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+            chat_prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            chat_prompt = prompt_text
+        prompt_ids = tokenizer(
+            chat_prompt,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].squeeze(0).cpu()
+        response_ids = tokenizer(
+            response_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].squeeze(0).cpu()
+        critic_prefix, critic_dynamic = self._build_critic_prompt_parts(
+            agent_index=agent_index,
+            messages=messages,
+            context=context,
+            output_text=response_text,
+        )
+        critic_prompt = critic_prefix + critic_dynamic
+        critic_input_ids = tokenizer(
+            critic_prompt,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].squeeze(0).cpu()
+        response_log_probs = actor_metadata.get("response_log_probs") or []
+        response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
+        total_log_prob = actor_metadata.get("log_prob")
+        if total_log_prob is None:
+            total_log_prob = (
+                float(response_log_probs_tensor.sum().item()) if response_log_probs else 0.0
+            )
+        metadata = {
+            "prompt_ids": prompt_ids,
+            "response_ids": response_ids,
+            "response_log_probs": response_log_probs_tensor,
+            "log_prob": float(total_log_prob),
+            "policy_temperature": context.get("temperature"),
+            "value": 0.0,
+            "entropy": 0.0,
+            "token_count": int(actor_metadata.get("token_count", len(response_ids))),
+            "critic_input_ids": critic_input_ids,
+            "response_tokens": actor_metadata.get("response_tokens"),
+        }
+        return response_text, metadata
 
     def _query_vllm_actor(
         self,
