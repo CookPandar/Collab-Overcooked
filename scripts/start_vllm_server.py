@@ -151,6 +151,7 @@ def main() -> int:
     parser.add_argument('--api-key', required=True)
     parser.add_argument('--max-loras', type=int, default=2)
     parser.add_argument('--max-lora-rank', type=int, default=0)
+    parser.add_argument('--enforce-eager', action='store_true')
     args = parser.parse_args()
 
     env = os.environ.copy()
@@ -195,8 +196,9 @@ def main() -> int:
         '--enable-prefix-caching',
         '--enable-chunked-prefill',
         '--disable-log-stats',
-        '--enforce-eager',
     ]
+    if args.enforce_eager:
+        cmd.append('--enforce-eager')
     if lora_modules:
         cmd.extend([
             '--enable-lora',

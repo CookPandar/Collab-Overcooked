@@ -55,6 +55,8 @@ if [[ ! -x "$VLLM_PY" ]]; then
     exit 1
 fi
 NUM_PROCS="${RL_NUM_PROCS:-$(visible_gpu_count)}"
+COLLECT_WORKERS="${RL_COLLECT_WORKERS:-$((NUM_PROCS * 4))}"
+EVAL_WORKERS="${RL_EVAL_WORKERS:-$((NUM_PROCS * 4))}"
 LOOP_ROUNDS="${RL_LOOP_ROUNDS:-1}"
 EVAL_EVERY="${RL_EVAL_EVERY:-1}"
 COLLECT_CFG="${RL_COLLECT_CONFIG:-$REPO_ROOT/configs/rl_qwen_collect_snapshot_kl.yaml}"
@@ -68,6 +70,7 @@ GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
 MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
 MAX_LORAS="${RL_VLLM_MAX_LORAS:-2}"
 MAX_LORA_RANK="${RL_VLLM_MAX_LORA_RANK:-0}"
+ENFORCE_EAGER="${RL_VLLM_ENFORCE_EAGER:-0}"
 SERVED_MODEL_NAME="${RL_VLLM_SERVED_MODEL_NAME:-qwen2.5-7B-instruct}"
 API_KEY="${RL_VLLM_API_KEY:-YOUR_API_KEY}"
 IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
@@ -231,6 +234,7 @@ start_vllm_servers() {
             --api-key "$API_KEY" \
             --max-loras "$MAX_LORAS" \
             --max-lora-rank "$MAX_LORA_RANK" \
+            $([[ "$ENFORCE_EAGER" == "1" ]] && echo "--enforce-eager") \
             >"$log_file" 2>&1 &
         VLLM_PIDS+=("$!")
     done
@@ -251,17 +255,20 @@ ensure_vllm_servers() {
 run_stage_workers() {
     local stage_name="$1"
     local cfg_path="$2"
+    local total_workers="$3"
     local worker_pids=()
     local worker_logs=()
     local status=0
     mkdir -p "$REPO_ROOT/logs/rl_workers"
-    for ((rank=0; rank<NUM_PROCS; rank++)); do
-        local log_file="$REPO_ROOT/logs/rl_workers/${stage_name}_rank${rank}.log"
+    for ((worker_id=0; worker_id<total_workers; worker_id++)); do
+        local rank=$((worker_id % NUM_PROCS))
+        local log_file="$REPO_ROOT/logs/rl_workers/${stage_name}_worker${worker_id}_gpu${rank}.log"
         worker_logs+=("$log_file")
-        echo "[cluster-rl] starting worker stage=$stage_name rank=$rank log=$log_file"
+        echo "[cluster-rl] starting worker stage=$stage_name worker=$worker_id gpu=$rank log=$log_file"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
             CUDA_VISIBLE_DEVICES="$rank" \
             RL_WORKER_RANK="$rank" \
+            RL_WORKER_ID="$worker_id" \
             RL_STAGE_PHASE="$stage_name" \
             RL_STAGE_ROUND_IDX="$i" \
             RL_LOOP_ROUND_IDX="$i" \
@@ -274,7 +281,7 @@ run_stage_workers() {
         local pid="${worker_pids[$idx]}"
         if ! wait "$pid"; then
             status=1
-            echo "[cluster-rl] worker failed stage=$stage_name rank=$idx log=${worker_logs[$idx]}" >&2
+            echo "[cluster-rl] worker failed stage=$stage_name worker=$idx log=${worker_logs[$idx]}" >&2
             tail -n 80 "${worker_logs[$idx]}" >&2 || true
         fi
     done
@@ -294,15 +301,23 @@ run_stage() {
     fi
     echo "[cluster-rl] stage=$stage_name cfg=$cfg_path procs=$NUM_PROCS"
     if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
-        run_stage_workers "$stage_name" "$cfg_path"
+        local total_workers="$COLLECT_WORKERS"
+        if [[ "$stage_name" == "eval" ]]; then
+            total_workers="$EVAL_WORKERS"
+        fi
+        run_stage_workers "$stage_name" "$cfg_path" "$total_workers"
     else
+        mkdir -p "$REPO_ROOT/logs/rl_workers"
+        local train_log="$REPO_ROOT/logs/rl_workers/${stage_name}_accelerate.log"
+        echo "[cluster-rl] accelerate log=$train_log"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
         RL_STAGE_PHASE="$stage_name" \
         RL_STAGE_ROUND_IDX="$i" \
         RL_LOOP_ROUND_IDX="$i" \
         MASTER_PORT="$MASTER_PORT" \
         "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
-            "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}"
+            "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}" \
+            2>&1 | tee "$train_log"
     fi
 }
 

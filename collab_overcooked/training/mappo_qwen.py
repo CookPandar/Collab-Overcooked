@@ -1188,9 +1188,24 @@ class MAPPOTrainer:
                     sock.close()
             except ValueError:
                 pass
+        print(
+            "[MAPPO] before Accelerator init "
+            f"stage={os.getenv('RL_STAGE_PHASE', '')} "
+            f"master_addr={os.getenv('MASTER_ADDR', '')} "
+            f"master_port={os.getenv('MASTER_PORT', '')} "
+            f"rank={os.getenv('RANK', '')} local_rank={os.getenv('LOCAL_RANK', '')}",
+            flush=True,
+        )
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=ddp_find_unused)
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
         self.device = self.accelerator.device
+        print(
+            "[MAPPO] after Accelerator init "
+            f"process_index={self.accelerator.process_index} "
+            f"num_processes={self.accelerator.num_processes} "
+            f"device={self.device}",
+            flush=True,
+        )
 
         env_latest_file = os.getenv("RL_LATEST_MODEL_FILE", "").strip()
         cfg_latest_file = self.trainer_cfg.get("latest_model_path_file", "")
@@ -1471,7 +1486,7 @@ class MAPPOTrainer:
         if self.output_dir:
             self._episode_log_path = (
                 self.output_dir
-                / f"episode_return_curve_rank{self.accelerator.process_index}.csv"
+                / f"episode_return_curve_rank{self._runtime_worker_id()}.csv"
             )
 
     def _current_train_round_idx(self) -> int:
@@ -1559,6 +1574,21 @@ class MAPPOTrainer:
             except ValueError:
                 pass
         return 1
+
+    def _runtime_worker_id(self) -> int:
+        raw = (
+            os.getenv("RL_WORKER_ID")
+            or os.getenv("RL_WORKER_RANK")
+            or os.getenv("LOCAL_RANK")
+            or os.getenv("RANK")
+            or ""
+        ).strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        return int(self.accelerator.process_index)
 
     def _runtime_loop_round_idx(self) -> Optional[int]:
         raw = os.getenv("RL_LOOP_ROUND_IDX", "").strip()
@@ -1653,7 +1683,7 @@ class MAPPOTrainer:
         )
         row_idx, _ = self._prepare_csv_log(self._episode_log_path, header)
         update_idx = self._current_update_idx if self._current_update_idx is not None else -1
-        rank = self.accelerator.process_index
+        rank = self._runtime_worker_id()
         self._episode_counter += 1
         with self._episode_log_path.open("a", encoding="utf-8") as f:
             f.write(
@@ -2422,6 +2452,12 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------------
     def train(self):
+        print(
+            "[MAPPO] train() enter "
+            f"stage={self._runtime_stage_phase('unknown')} "
+            f"collect_only={self.collect_only} train_only={self.train_only}",
+            flush=True,
+        )
         if self.collect_only or self.train_only:
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3786,12 +3822,12 @@ class MAPPOTrainer:
     def save_rollout(self, transitions: List[TextTransition], update_idx: int):
         if not transitions:
             return
-        path = self.rollout_dir / f"rollout_rank{self.accelerator.process_index}_u{update_idx:05d}.pt"
+        path = self.rollout_dir / f"rollout_rank{self._runtime_worker_id()}_u{update_idx:05d}.pt"
         payload = [self._transition_to_dict(t) for t in transitions]
         torch.save(payload, path)
 
     def _initial_cache_path(self, update_idx: int, rank: Optional[int] = None) -> Path:
-        use_rank = self.accelerator.process_index if rank is None else int(rank)
+        use_rank = self._runtime_worker_id() if rank is None else int(rank)
         return (
             self.initial_rollout_cache_dir
             / f"rollout_rank{use_rank}_u{int(update_idx):05d}.pt"
