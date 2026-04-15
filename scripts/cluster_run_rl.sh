@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # Usage:
-#   bash scripts/cluster_run_rl.sh  /mnt/volumes/ss-sai-bd-ga/zhangshuwen/collab-overcooked --config configs/examples/rl_qwen_baked_bell_pepper.yaml
+#   bash scripts/cluster_run_rl.sh /path/to/collab_env [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--loop-rounds N] [-- main_rl args...]
 #
-# 环境变量：
-#   RL_ACCELERATE_ARGS     (可选) 额外 accelerate 参数（空格分隔，三阶段共用）
-#   RL_NUM_PROCS           (可选) 兼容旧用法：当未使用三阶段配置时作为 --num_processes
-#   ACCELERATE_BIN         (默认 accelerate)
+# Default behavior:
+#   - start one vLLM server per GPU on ports 9000+
+#   - bind each accelerate rank to one dedicated vLLM port
+#   - synchronize collect/train/eval between rounds
 
 set -euo pipefail
 
@@ -19,53 +19,73 @@ abs_path() {
     python -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
+visible_gpu_count() {
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a ids <<< "${CUDA_VISIBLE_DEVICES}"
+        echo "${#ids[@]}"
+        return
+    fi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local n
+        n="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
+        if [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -gt 0 ]]; then
+            echo "$n"
+            return
+        fi
+    fi
+    echo 1
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COLLAB_ENV="$(abs_path "$1")"
 shift || true
 
+ACCEL_BIN="${ACCELERATE_BIN:-$COLLAB_ENV/bin/accelerate}"
+PY_BIN="$COLLAB_ENV/bin/python"
+VLLM_ENV="${RL_VLLM_ENV:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/vllm018}"
+VLLM_PY="$VLLM_ENV/bin/python"
+
 if [[ ! -x "$COLLAB_ENV/bin/python" ]]; then
-    echo "[cluster-rl] 未在 $COLLAB_ENV 找到有效的 conda 环境，请先运行 cluster_env_setup.sh" >&2
+    echo "[cluster-rl] invalid env: $COLLAB_ENV/bin/python not found" >&2
     exit 1
 fi
-
-ACCEL_BIN="${ACCELERATE_BIN:-$COLLAB_ENV/bin/accelerate}"
-IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
-COLLECT_CFG="${RL_COLLECT_CONFIG:-}"
-TRAIN_CFG="${RL_TRAIN_CONFIG:-}"
-EVAL_CFG="${RL_EVAL_CONFIG:-}"
+if [[ ! -x "$VLLM_PY" ]]; then
+    echo "[cluster-rl] invalid vLLM env: $VLLM_PY not found" >&2
+    exit 1
+fi
+NUM_PROCS="${RL_NUM_PROCS:-$(visible_gpu_count)}"
 LOOP_ROUNDS="${RL_LOOP_ROUNDS:-1}"
-EVAL_EVERY="${RL_EVAL_EVERY:-5}"
+EVAL_EVERY="${RL_EVAL_EVERY:-1}"
+COLLECT_CFG="${RL_COLLECT_CONFIG:-$REPO_ROOT/configs/rl_qwen_collect_snapshot_kl.yaml}"
+TRAIN_CFG="${RL_TRAIN_CONFIG:-$REPO_ROOT/configs/rl_qwen_train_kl.yaml}"
+EVAL_CFG="${RL_EVAL_CONFIG:-$REPO_ROOT/configs/rl_qwen_eval_kl.yaml}"
+VLLM_MODEL_PATH="${RL_VLLM_MODEL_PATH:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b}"
+VLLM_HOST="${RL_VLLM_HOST:-127.0.0.1}"
+VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
+MASTER_PORT="${RL_MASTER_PORT:-29540}"
+GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
+MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
+SERVED_MODEL_NAME="${RL_VLLM_SERVED_MODEL_NAME:-qwen2.5-7B-instruct}"
+API_KEY="${RL_VLLM_API_KEY:-YOUR_API_KEY}"
+IFS=' ' read -r -a EXTRA_ACCEL <<< "${RL_ACCELERATE_ARGS:-}"
 RUN_ARGS=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --collect-config)
-            if [[ $# -lt 2 ]]; then
-                echo "[cluster-rl] --collect-config requires a path" >&2
-                exit 1
-            fi
-            COLLECT_CFG="$2"
+            COLLECT_CFG="$(abs_path "$2")"
             shift 2
             ;;
         --train-config)
-            if [[ $# -lt 2 ]]; then
-                echo "[cluster-rl] --train-config requires a path" >&2
-                exit 1
-            fi
-            TRAIN_CFG="$2"
+            TRAIN_CFG="$(abs_path "$2")"
             shift 2
             ;;
         --eval-config)
-            if [[ $# -lt 2 ]]; then
-                echo "[cluster-rl] --eval-config requires a path" >&2
-                exit 1
-            fi
-            EVAL_CFG="$2"
+            EVAL_CFG="$(abs_path "$2")"
             shift 2
             ;;
         --loop-rounds)
-            if [[ $# -lt 2 ]]; then
-                echo "[cluster-rl] --loop-rounds requires a value" >&2
-                exit 1
-            fi
             LOOP_ROUNDS="$2"
             shift 2
             ;;
@@ -81,169 +101,153 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-CONDA_BASE="$(conda info --base)"
-# shellcheck source=/dev/null
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+for cfg in "$COLLECT_CFG" "$TRAIN_CFG" "$EVAL_CFG"; do
+    if [[ -n "$cfg" && ! -f "$cfg" ]]; then
+        echo "[cluster-rl] config not found: $cfg" >&2
+        exit 1
+    fi
+done
+if [[ ! -d "$VLLM_MODEL_PATH" ]]; then
+    echo "[cluster-rl] vLLM model path not found: $VLLM_MODEL_PATH" >&2
+    exit 1
+fi
 
-conda activate "$COLLAB_ENV"
+export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+export RL_REPO_ROOT="$REPO_ROOT"
+export RL_VLLM_HOST="$VLLM_HOST"
+export RL_VLLM_START_PORT="$VLLM_START_PORT"
+export RL_VLLM_API_KEY="$API_KEY"
+export RL_NUM_PROCS="$NUM_PROCS"
+export RL_LATEST_MODEL_FILE="${RL_LATEST_MODEL_FILE:-$REPO_ROOT/runs/rl/latest_model_kl.json}"
+export RL_PY_BIN="$PY_BIN"
+export VLLM_COMPILE_BACKEND=inductor
+export VLLM_USE_TORCH_COMPILE=1
+export VLLM_TORCH_COMPILE=1
+export TORCHINDUCTOR_FREEZING=1
+export TOKENIZERS_PARALLELISM=false
 
-# 共享最新模型标记文件的默认路径，可在外部 export RL_LATEST_MODEL_FILE 自定义
-: "${RL_LATEST_MODEL_FILE:=$(pwd)/runs/rl/latest_model.json}"
+mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval_kl" "$REPO_ROOT/logs/rl_vllm"
 
-#
-# 三阶段资源分配默认策略：
-#   - collect: 默认使用“当前可见 GPU 数量”的进程数（通常等于卡数）
-#   - train:   1 卡（1 进程）
-#   - eval:    1 卡（1 进程）
-#
-gpu_count() {
-    # Prefer CUDA_VISIBLE_DEVICES if set (common in schedulers).
-    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-        # Strip spaces; handle formats like "0,1,2,3" or "0"
-        local cleaned="${CUDA_VISIBLE_DEVICES// /}"
-        if [[ "$cleaned" == *","* ]]; then
-            # Count commas + 1
-            local commas="${cleaned//[^,]/}"
-            echo $(( ${#commas} + 1 ))
+VLLM_PIDS=()
+cleanup() {
+    for pid in "${VLLM_PIDS[@]:-}"; do
+        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+            kill "$pid" || true
+            wait "$pid" || true
+        fi
+    done
+}
+trap cleanup EXIT
+
+wait_for_port() {
+    local host="$1"
+    local port="$2"
+    local pid="$3"
+    local log_file="$4"
+    for _ in $(seq 1 180); do
+        if ! ps -p "$pid" >/dev/null 2>&1; then
+            echo "[cluster-rl] vLLM exited early on $host:$port; log=$log_file" >&2
+            tail -n 100 "$log_file" >&2 || true
+            return 1
+        fi
+        if python - <<PY
+import socket, sys
+sock = socket.socket()
+sock.settimeout(1)
+try:
+    sock.connect(("$host", int("$port")))
+except OSError:
+    sys.exit(1)
+else:
+    sock.close()
+    sys.exit(0)
+PY
+        then
             return 0
         fi
-        echo 1
-        return 0
-    fi
-    # Fallback: if nvidia-smi exists, count GPUs.
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        local n
-        n="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
-        if [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -gt 0 ]]; then
-            echo "$n"
-            return 0
-        fi
-    fi
-    # Conservative default.
-    echo 1
+        sleep 1
+    done
+    echo "[cluster-rl] timeout waiting for $host:$port; log=$log_file" >&2
+    tail -n 100 "$log_file" >&2 || true
+    return 1
 }
 
-COLLECT_NUM_PROCS="$(gpu_count)"
-TRAIN_NUM_PROCS=1
-EVAL_NUM_PROCS=1
+start_vllm_servers() {
+    local count="$1"
+    for ((gpu=0; gpu<count; gpu++)); do
+        local port=$((VLLM_START_PORT + gpu))
+        local log_file="$REPO_ROOT/logs/rl_vllm/vllm_gpu${gpu}.log"
+        echo "[cluster-rl] starting vLLM gpu=$gpu port=$port"
+        local engine_port=$((VLLM_START_PORT + 100 + gpu))
+        "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
+            --gpu "$gpu" \
+            --port "$port" \
+            --engine-port "$engine_port" \
+            --model "$VLLM_MODEL_PATH" \
+            --served-model-name "$SERVED_MODEL_NAME" \
+            --gpu-memory-utilization "$GPU_MEM" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --api-key "$API_KEY" \
+            >"$log_file" 2>&1 &
+        VLLM_PIDS+=("$!")
+    done
 
-# Allow explicit overrides from the job wrapper (useful when CUDA_VISIBLE_DEVICES is
-# manipulated outside and we want to prevent launching more ranks than visible GPUs).
-: "${RL_COLLECT_NUM_PROCS:=}"
-: "${RL_TRAIN_NUM_PROCS:=}"
-: "${RL_EVAL_NUM_PROCS:=}"
-if [[ -n "$RL_COLLECT_NUM_PROCS" ]]; then
-    COLLECT_NUM_PROCS="$RL_COLLECT_NUM_PROCS"
-fi
-if [[ -n "$RL_TRAIN_NUM_PROCS" ]]; then
-    TRAIN_NUM_PROCS="$RL_TRAIN_NUM_PROCS"
-fi
-if [[ -n "$RL_EVAL_NUM_PROCS" ]]; then
-    EVAL_NUM_PROCS="$RL_EVAL_NUM_PROCS"
-fi
+    for ((gpu=0; gpu<count; gpu++)); do
+        local port=$((VLLM_START_PORT + gpu))
+        wait_for_port "$VLLM_HOST" "$port" "${VLLM_PIDS[$gpu]}" "$REPO_ROOT/logs/rl_vllm/vllm_gpu${gpu}.log"
+    done
+}
 
 run_stage() {
     local stage_name="$1"
-    local stage_cfg="$2"
-    local stage_num_procs="$3"
-    local stage_phase="$4"
-    local stage_round_idx="$5"
-    local loop_round_idx="$6"
-
-    if [[ -z "$stage_cfg" ]]; then
+    local cfg_path="$2"
+    if [[ -z "$cfg_path" ]]; then
         return 0
     fi
-
-    # Resolve relative paths to absolute (prevents CWD differences in cluster jobs).
-    if [[ -f "$stage_cfg" ]]; then
-        stage_cfg="$(abs_path "$stage_cfg")"
-    fi
-
-    echo "[cluster-rl] ${stage_name} -> ${stage_cfg} (num_procs=${stage_num_procs}, stage_round=${stage_round_idx}, loop_round=${loop_round_idx})"
-    set +e
-    # 集群作业环境有时会预设 WORLD_SIZE/RANK/MASTER_* 等分布式变量（例如 8 卡作业），
-    # 这会导致单进程（num_procs=1）启动时依然尝试 init_process_group，最终 rendezvous timeout。
-    # 对 train/eval 的单进程阶段，显式清理这些环境变量，保证真正按单进程运行。
-    if [[ "$stage_num_procs" == "1" ]]; then
-        env \
-            -u WORLD_SIZE -u RANK -u LOCAL_RANK -u LOCAL_WORLD_SIZE \
-            -u MASTER_ADDR -u MASTER_PORT \
-            -u NODE_RANK -u GROUP_RANK -u ROLE_RANK \
-            -u TORCHELASTIC_RUN_ID -u TORCHELASTIC_RESTART_COUNT -u TORCHELASTIC_MAX_RESTARTS \
-            -u PET_RANK -u PET_NNODES -u PET_NODE_RANK -u PET_MASTER_ADDR -u PET_MASTER_PORT \
-            RL_STAGE_PHASE="$stage_phase" \
-            RL_STAGE_ROUND_IDX="$stage_round_idx" \
-            RL_LOOP_ROUND_IDX="$loop_round_idx" \
-            RL_LOOP_ROUNDS="$LOOP_ROUNDS" \
-            "$ACCEL_BIN" launch --num_processes "$stage_num_procs" "${EXTRA_ACCEL[@]}" \
-            -m collab_overcooked.main_rl --config "$stage_cfg" "${RUN_ARGS[@]}"
-    else
-        env \
-            RL_STAGE_PHASE="$stage_phase" \
-            RL_STAGE_ROUND_IDX="$stage_round_idx" \
-            RL_LOOP_ROUND_IDX="$loop_round_idx" \
-            RL_LOOP_ROUNDS="$LOOP_ROUNDS" \
-            "$ACCEL_BIN" launch --num_processes "$stage_num_procs" "${EXTRA_ACCEL[@]}" \
-            -m collab_overcooked.main_rl --config "$stage_cfg" "${RUN_ARGS[@]}"
-    fi
-    local stage_status=$?
-    set -e
-    return "$stage_status"
+    echo "[cluster-rl] stage=$stage_name cfg=$cfg_path procs=$NUM_PROCS"
+    env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
+    RL_STAGE_PHASE="$stage_name" \
+    RL_STAGE_ROUND_IDX="$i" \
+    RL_LOOP_ROUND_IDX="$i" \
+    MASTER_PORT="$MASTER_PORT" \
+    "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
+        "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}"
 }
 
-# 三阶段模式：任意一个阶段配置存在，就按 Round 循环执行 collect -> train，
-# eval 默认每 5 轮执行一次（可用 RL_EVAL_EVERY 覆盖；设为 1 表示每轮都 eval）。
-if [[ -n "$COLLECT_CFG" || -n "$TRAIN_CFG" || -n "$EVAL_CFG" ]]; then
-    STATUS=0
-    COLLECT_ROUND=0
-    TRAIN_ROUND=0
-    EVAL_ROUND=0
-    for ((i=1; i<=LOOP_ROUNDS; i++)); do
-        if [[ -n "$COLLECT_CFG" ]]; then
-            COLLECT_ROUND=$((COLLECT_ROUND + 1))
-            run_stage "Round ${i} collect" "$COLLECT_CFG" "$COLLECT_NUM_PROCS" "collect" "$COLLECT_ROUND" "$i"
-            STATUS=$?
-            if [[ $STATUS -ne 0 ]]; then
-                echo "[cluster-rl] Collect failed (round $i), abort." >&2
-                break
-            fi
-        fi
+start_vllm_servers "$NUM_PROCS"
 
-        if [[ -n "$TRAIN_CFG" ]]; then
-            # 训练阶段也用 accelerate 启动，避免在集群环境中仅启动单进程却继承 WORLD_SIZE/RANK
-            # 等分布式环境变量导致 init_process_group 等待其它 rank 最终 timeout。
-            TRAIN_ROUND=$((TRAIN_ROUND + 1))
-            run_stage "Round ${i} train" "$TRAIN_CFG" "$TRAIN_NUM_PROCS" "train" "$TRAIN_ROUND" "$i"
-            STATUS=$?
-            if [[ $STATUS -ne 0 ]]; then
-                echo "[cluster-rl] Train failed (round $i), abort." >&2
-                break
-            fi
-        fi
+STATUS=0
+for ((i=1; i<=LOOP_ROUNDS; i++)); do
+    echo "[cluster-rl] round $i / $LOOP_ROUNDS"
 
-        if [[ -n "$EVAL_CFG" ]]; then
-            if (( EVAL_EVERY > 0 )) && (( i % EVAL_EVERY == 0 )); then
-                EVAL_ROUND=$((EVAL_ROUND + 1))
-                run_stage "Round ${i} eval" "$EVAL_CFG" "$EVAL_NUM_PROCS" "eval" "$EVAL_ROUND" "$i"
-                STATUS=$?
-                if [[ $STATUS -ne 0 ]]; then
-                    echo "[cluster-rl] Eval failed (round $i), abort." >&2
-                    break
-                fi
-            else
-                echo "[cluster-rl] Round ${i} skip eval (eval_every=${EVAL_EVERY})"
-            fi
-        fi
-    done
-else
-    # 兼容旧用法：把剩余参数原样透传给 main_rl（用户可能自己传 --config）
-    LEGACY_NUM_PROCS="${RL_NUM_PROCS:-1}"
     set +e
-    "$ACCEL_BIN" launch --num_processes "$LEGACY_NUM_PROCS" "${EXTRA_ACCEL[@]}" -m collab_overcooked.main_rl "${RUN_ARGS[@]}"
+    run_stage collect "$COLLECT_CFG"
     STATUS=$?
     set -e
-fi
+    if [[ $STATUS -ne 0 ]]; then
+        echo "[cluster-rl] collect failed in round $i" >&2
+        break
+    fi
 
-conda deactivate
+    set +e
+    run_stage train "$TRAIN_CFG"
+    STATUS=$?
+    set -e
+    if [[ $STATUS -ne 0 ]]; then
+        echo "[cluster-rl] train failed in round $i" >&2
+        break
+    fi
+
+    if [[ -n "$EVAL_CFG" ]] && (( EVAL_EVERY > 0 )) && (( i % EVAL_EVERY == 0 )); then
+        set +e
+        run_stage eval "$EVAL_CFG"
+        STATUS=$?
+        set -e
+        if [[ $STATUS -ne 0 ]]; then
+            echo "[cluster-rl] eval failed in round $i" >&2
+            break
+        fi
+    fi
+done
 
 exit $STATUS

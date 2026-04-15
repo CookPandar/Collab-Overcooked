@@ -338,10 +338,14 @@ class CollabMainSession:
         except Exception:
             self.reward_tracker = None
 
+        print("[CollabMainSession] before _build_agents")
         self.agents = self._build_agents()
+        print("[CollabMainSession] after _build_agents")
         self.team = AgentGroup(*self.agents)
+        print("[CollabMainSession] after AgentGroup")
         self._runtime_log_context: Dict[str, Any] = {}
         self._init_policy_record_logging(len(self.agents))
+        print("[CollabMainSession] after _init_policy_record_logging")
         self._shared_agent_traces: Dict[int, Dict[str, Any]] = {}
         self.rl_modules: List[RLPlannerProxy] = []
         for idx, agent in enumerate(self.team.agents):
@@ -359,7 +363,9 @@ class CollabMainSession:
                     "[CollabMainSession] Attached RLPlannerProxy to agent "
                     f"{idx} ({getattr(agent, 'name', 'unknown')})"
                 )
+        print("[CollabMainSession] before reset")
         self.reset()
+        print("[CollabMainSession] after reset")
 
     @classmethod
     def from_yaml(cls, config_path: str, policy_fn: RLPolicyFn) -> "CollabMainSession":
@@ -417,6 +423,9 @@ class CollabMainSession:
             setattr(proxy, "_rl_global_observation", current_observation)
         print(f"[CollabMainSession] Beginning step at timestep {state.timestep}")
         joint_action, pickup_parm = self.team.joint_action(state)
+        print(
+            f"[CollabMainSession] joint_action={joint_action} pickup_parm={pickup_parm}"
+        )
         obs, reward, done, env_info = self.env.step(joint_action, pickup_parm)
 
         process_reward = None

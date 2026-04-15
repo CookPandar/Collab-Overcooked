@@ -207,6 +207,7 @@ class Module:
         trace=True,
         rethink=False,
         map="",
+        return_metadata: bool = False,
     ):
         """
         Query LLM with simplified model handling
@@ -222,6 +223,7 @@ class Module:
             messages[-1]["content"] += " Based on the failure explanation and scene description, analyze and plan again."
 
         response = None
+        response_metadata = {}
         retry_count = 0
         max_retries = 3
 
@@ -254,7 +256,11 @@ class Module:
 
         response_text = self.parse_response(response)
         token_count = self._count_tokens(response_text, encoder_name)
-        
+        response_metadata = self._extract_response_metadata(response)
+        response_metadata.setdefault("token_count", token_count)
+
+        if return_metadata:
+            return response_text, token_count, response_metadata
         return response_text, token_count
 
     def _handle_human_interface(self, messages, map):
@@ -317,9 +323,38 @@ class Module:
             model=model_name,
             messages=messages,
             temperature=temperature,
+            logprobs=True,
+            top_logprobs=1,
         )
         time.sleep(0.5)  # Rate limiting
         return response
+
+    def _extract_response_metadata(self, response):
+        metadata = {}
+        try:
+            choice = response.choices[0]
+        except Exception:
+            return metadata
+
+        logprobs = getattr(choice, "logprobs", None)
+        content_logprobs = getattr(logprobs, "content", None) if logprobs is not None else None
+        if not content_logprobs:
+            return metadata
+
+        token_logprobs = []
+        tokens = []
+        for item in content_logprobs:
+            logprob = getattr(item, "logprob", None)
+            token = getattr(item, "token", None)
+            if logprob is None:
+                continue
+            token_logprobs.append(float(logprob))
+            tokens.append(token if token is not None else "")
+        if token_logprobs:
+            metadata["response_log_probs"] = token_logprobs
+            metadata["response_tokens"] = tokens
+            metadata["log_prob"] = float(sum(token_logprobs))
+        return metadata
 
     def _get_encoder_name(self):
         """Get encoder name for token counting"""

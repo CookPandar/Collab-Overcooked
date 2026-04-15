@@ -12,12 +12,14 @@ from pathlib import Path
 import re
 import shutil
 from typing import Any, Dict, List, Optional, Tuple, Union
+import socket
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from openai import OpenAI
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1172,6 +1174,19 @@ class MAPPOTrainer:
                 "ddp_find_unused_parameters", ddp_find_unused_default
             )
         )
+        master_port = os.environ.get("MASTER_PORT", "").strip()
+        if master_port:
+            try:
+                port = int(master_port)
+                sock = socket.socket()
+                try:
+                    sock.bind(("127.0.0.1", port))
+                except OSError:
+                    os.environ["MASTER_PORT"] = "0"
+                finally:
+                    sock.close()
+            except ValueError:
+                pass
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=ddp_find_unused)
         self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
         self.device = self.accelerator.device
@@ -1184,6 +1199,10 @@ class MAPPOTrainer:
         self.export_interval = max(1, int(self.trainer_cfg.get("export_interval", 1)))
         self.collect_only = bool(trainer_cfg.get("collect_only", False))
         self.train_only = bool(trainer_cfg.get("train_only", False))
+        self.runtime_stage_phase = self._runtime_stage_phase(
+            "train" if self.train_only and not self.collect_only else "collect"
+        )
+        self.load_policy_model = self.train_only or self.runtime_stage_phase != "eval"
         apply_latest_default = not self.train_only
         self.apply_latest_model_override = bool(
             self.trainer_cfg.get("apply_latest_model_override", apply_latest_default)
@@ -1248,6 +1267,9 @@ class MAPPOTrainer:
         )
         self.gradient_checkpointing = bool(
             trainer_cfg.get("gradient_checkpointing", not self.collect_only)
+        )
+        self.compute_values_in_collect = bool(
+            trainer_cfg.get("compute_values_in_collect", False)
         )
         target_kl_cfg = trainer_cfg.get("target_kl", None)
         self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
@@ -1316,44 +1338,51 @@ class MAPPOTrainer:
         )
         self.checkpoint_interval = int(interval) if interval else 0
 
-        self.text_policy = QwenLMActorCritic(
-            model_path=self.model_path,
-            device=self.device,
-            max_new_tokens=trainer_cfg.get("max_new_tokens", 512),
-            temperature=trainer_cfg.get("generation_temperature", 0.7),
-            eval_batch_size=trainer_cfg.get("evaluation_batch_size", 4),
-            lora_cfg=self.lora_cfg,
-            lora_path=self.lora_path,
-            actor_adapters=self.actor_adapters,
-            critic_adapter=self.critic_adapter,
-            fix_mistral_regex=trainer_cfg.get("fix_mistral_regex", None),
-        )
-        self.accelerator.print(
-            "[MAPPO] gradient_checkpointing="
-            f"{self.gradient_checkpointing} critic_adapter="
-            f"{self.critic_adapter.name if self.critic_adapter is not None else 'none'} "
-            f"critic_lora={self.critic_adapter.lora_config if self.critic_adapter is not None else None}"
-        )
-        if self.gradient_checkpointing and hasattr(
-            self.text_policy.model, "gradient_checkpointing_enable"
-        ):
-            self.text_policy.model.gradient_checkpointing_enable()
-            if hasattr(self.text_policy.model, "enable_input_require_grads"):
-                self.text_policy.model.enable_input_require_grads()
-            if hasattr(self.text_policy.model, "config"):
-                self.text_policy.model.config.use_cache = False
-        value_head_path = self.trainer_cfg.get("value_head_path")
-        if value_head_path:
-            resolved = Path(value_head_path)
-            if not resolved.is_absolute():
-                resolved = Path.cwd() / resolved
-            if resolved.exists():
-                payload = torch.load(resolved, map_location="cpu")
-                if isinstance(payload, dict) and "state_dict" in payload:
-                    payload = payload["state_dict"]
-                self.text_policy.value_head.load_state_dict(payload)
-                self.accelerator.print(f"[MAPPO] Loaded value head from {resolved}")
-        self.policy_tokenizer = self.text_policy.tokenizer
+        self.text_policy = None
+        self.policy_tokenizer = None
+        if self.load_policy_model:
+            self.text_policy = QwenLMActorCritic(
+                model_path=self.model_path,
+                device=self.device,
+                max_new_tokens=trainer_cfg.get("max_new_tokens", 512),
+                temperature=trainer_cfg.get("generation_temperature", 0.7),
+                eval_batch_size=trainer_cfg.get("evaluation_batch_size", 4),
+                lora_cfg=self.lora_cfg,
+                lora_path=self.lora_path,
+                actor_adapters=self.actor_adapters,
+                critic_adapter=self.critic_adapter,
+                fix_mistral_regex=trainer_cfg.get("fix_mistral_regex", None),
+            )
+            self.accelerator.print(
+                "[MAPPO] load_policy_model=true stage="
+                f"{self.runtime_stage_phase} gradient_checkpointing={self.gradient_checkpointing} "
+                f"critic_adapter={self.critic_adapter.name if self.critic_adapter is not None else 'none'} "
+                f"critic_lora={self.critic_adapter.lora_config if self.critic_adapter is not None else None}"
+            )
+            if self.gradient_checkpointing and hasattr(
+                self.text_policy.model, "gradient_checkpointing_enable"
+            ):
+                self.text_policy.model.gradient_checkpointing_enable()
+                if hasattr(self.text_policy.model, "enable_input_require_grads"):
+                    self.text_policy.model.enable_input_require_grads()
+                if hasattr(self.text_policy.model, "config"):
+                    self.text_policy.model.config.use_cache = False
+            value_head_path = self.trainer_cfg.get("value_head_path")
+            if value_head_path:
+                resolved = Path(value_head_path)
+                if not resolved.is_absolute():
+                    resolved = Path.cwd() / resolved
+                if resolved.exists():
+                    payload = torch.load(resolved, map_location="cpu")
+                    if isinstance(payload, dict) and "state_dict" in payload:
+                        payload = payload["state_dict"]
+                    self.text_policy.value_head.load_state_dict(payload)
+                    self.accelerator.print(f"[MAPPO] Loaded value head from {resolved}")
+            self.policy_tokenizer = self.text_policy.tokenizer
+        else:
+            self.accelerator.print(
+                f"[MAPPO] load_policy_model=false stage={self.runtime_stage_phase}; eval uses pure vLLM inference."
+            )
         self.lr_scheduler = None
         if self.train_only:
             optimizer_groups: List[Dict[str, Any]] = []
@@ -1388,12 +1417,14 @@ class MAPPOTrainer:
             if not optimizer_groups:
                 raise ValueError("No trainable parameters found for MAPPO optimizer.")
             self.optimizer = torch.optim.AdamW(optimizer_groups, lr=0.0)
+            assert self.text_policy is not None
             self.text_policy, self.optimizer = self.accelerator.prepare(
                 self.text_policy, self.optimizer
             )
         else:
             self.optimizer = None
-            self.text_policy = self.accelerator.prepare(self.text_policy)
+            if self.text_policy is not None:
+                self.text_policy = self.accelerator.prepare(self.text_policy)
         variant = convert_yaml_to_variant(full_config)
         variant["yaml_config"] = full_config
         if not self.train_only:
@@ -2173,9 +2204,67 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------------
     def _policy_call(self, agent_index: int, messages, context):
+        if self.text_policy is None:
+            return self._policy_call_without_local_model(agent_index, messages, context)
+        return self._policy_call_vllm_actor_local_critic(
+            agent_index=agent_index,
+            messages=messages,
+            context=context,
+        )
+
+    def _policy_call_without_local_model(self, agent_index: int, messages, context):
+        raise RuntimeError("Eval-only vLLM policy path is not implemented for RLPlannerProxy.")
+
+    def _query_vllm_actor(
+        self,
+        agent_index: int,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float],
+    ) -> Tuple[str, Dict[str, Any]]:
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+        host = os.environ["RL_VLLM_HOST"]
+        start_port = int(os.environ["RL_VLLM_START_PORT"])
+        api_key = os.environ.get("RL_VLLM_API_KEY", "YOUR_API_KEY")
+        base_url = f"http://{host}:{start_port + rank}/v1"
+        model_name = self.agents_cfg.get(f"agent_{agent_index}", {}).get(
+            "model", "qwen2.5-7B-instruct"
+        )
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=float(temperature if temperature is not None else 0.0),
+            max_tokens=int(self.trainer_cfg.get("max_new_tokens", 512)),
+            logprobs=True,
+            top_logprobs=1,
+        )
+        response_text = response.choices[0].message.content or ""
+        content_logprobs = (
+            getattr(getattr(response.choices[0], "logprobs", None), "content", None)
+            or []
+        )
+        token_logprobs = [
+            float(getattr(item, "logprob", 0.0))
+            for item in content_logprobs
+            if getattr(item, "logprob", None) is not None
+        ]
+        response_tokens = [getattr(item, "token", "") for item in content_logprobs]
+        return response_text, {
+            "response_log_probs": token_logprobs,
+            "response_tokens": response_tokens,
+            "log_prob": float(sum(token_logprobs)) if token_logprobs else 0.0,
+            "token_count": len(token_logprobs),
+        }
+
+    def _policy_call_vllm_actor_local_critic(self, agent_index: int, messages, context):
         assert self.text_policy is not None
         from ..agents.utils import convert_messages_to_prompt
 
+        response_text, actor_metadata = self._query_vllm_actor(
+            agent_index=agent_index,
+            messages=messages,
+            temperature=(context or {}).get("temperature"),
+        )
         prompt_text = convert_messages_to_prompt(messages)
         tokenizer = self.policy_tokenizer
         if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
@@ -2184,40 +2273,51 @@ class MAPPOTrainer:
             )
         else:
             chat_prompt = prompt_text
+
         model = self.accelerator.unwrap_model(self.text_policy)
-        print(
-            "[MAPPOTrainer] policy_call agent="
-            f"{agent_index} prompt_chars={len(chat_prompt)}"
-        )
-        result = model.act(chat_prompt, agent_index=agent_index)
+        prompt_ids = tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
+        response_ids = tokenizer(response_text, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
+
         critic_prefix, critic_dynamic = self._build_critic_prompt_parts(
             agent_index=agent_index,
             messages=messages,
             context=context,
-            output_text=result.text,
+            output_text=response_text,
         )
         critic_prompt = critic_prefix + critic_dynamic
-        critic_input_ids, critic_value = model._evaluate_value_text_with_prefix(
-            critic_prefix,
-            critic_prompt,
-            adapter_name=model.critic_adapter_name,
-        )
+        critic_input_ids = tokenizer(critic_prompt, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
+        critic_value = 0.0
+        if self.compute_values_in_collect:
+            _, critic_value = model._evaluate_value_text_with_prefix(
+                critic_prefix,
+                critic_prompt,
+                adapter_name=model.critic_adapter_name,
+            )
+
+        response_log_probs = actor_metadata.get("response_log_probs") or []
+        response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
+        total_log_prob = actor_metadata.get("log_prob")
+        if total_log_prob is None:
+            total_log_prob = float(response_log_probs_tensor.sum().item()) if response_log_probs else 0.0
         print(
-            "[MAPPOTrainer] policy_call agent="
-            f"{agent_index} generated_tokens={len(result.response_ids)}"
+            "[MAPPOTrainer] vllm actor agent="
+            f"{agent_index} response_chars={len(response_text)} response_ids={int(response_ids.numel())} "
+            f"logprob_tokens={len(response_log_probs)} total_log_prob={float(total_log_prob):.6f}"
         )
+
         metadata = {
-            "prompt_ids": result.prompt_ids,
-            "response_ids": result.response_ids,
-            "response_log_probs": result.response_log_probs,
-            "log_prob": result.log_prob,
-            "policy_temperature": result.policy_temperature,
+            "prompt_ids": prompt_ids,
+            "response_ids": response_ids,
+            "response_log_probs": response_log_probs_tensor,
+            "log_prob": float(total_log_prob),
+            "policy_temperature": context.get("temperature"),
             "value": critic_value,
-            "entropy": result.entropy,
-            "token_count": len(result.response_ids),
+            "entropy": 0.0,
+            "token_count": int(actor_metadata.get("token_count", len(response_ids))),
             "critic_input_ids": critic_input_ids,
+            "response_tokens": actor_metadata.get("response_tokens"),
         }
-        return result.text, metadata
+        return response_text, metadata
 
     # ------------------------------------------------------------------
     def train(self):
@@ -2274,6 +2374,7 @@ class MAPPOTrainer:
             if not transitions:
                 self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
                 return
+            self._materialize_transition_values(transitions)
             loss_dict = self.update_policy(transitions)
             self.log_rewards(update_idx, transitions)
             self.log_train_metrics(update_idx, loss_dict, transitions)
@@ -2679,6 +2780,30 @@ class MAPPOTrainer:
                 agent_fresh_explained_var
             )
         return metrics
+
+    def _materialize_transition_values(self, transitions: List[TextTransition]) -> None:
+        assert self.text_policy is not None
+        missing = [idx for idx, t in enumerate(transitions) if t.critic_input_ids is not None and float(t.value) == 0.0]
+        if not missing:
+            return
+        critic_tensors = [transitions[idx].critic_input_ids for idx in missing]
+        batch_span = max(1, int(getattr(self.text_policy, "eval_batch_size", 1)))
+        was_training = self.text_policy.training
+        self.text_policy.eval()
+        try:
+            with torch.no_grad():
+                for start in range(0, len(missing), batch_span):
+                    end = min(start + batch_span, len(missing))
+                    batch_indices = missing[start:end]
+                    values = self.text_policy._evaluate_value_inputs(
+                        [transitions[idx].critic_input_ids.to(self.device) for idx in batch_indices],
+                        use_critic_adapter=True,
+                    ).detach().float().cpu()
+                    for local_idx, global_idx in enumerate(batch_indices):
+                        transitions[global_idx].value = float(values[local_idx].item())
+        finally:
+            if was_training:
+                self.text_policy.train()
 
     # ------------------------------------------------------------------
     def update_policy(self, transitions: List[TextTransition]):

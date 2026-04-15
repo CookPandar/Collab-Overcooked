@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+
+def build_rank_bound_config(src_cfg: Path, stage: str) -> Path:
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    host = os.environ["RL_VLLM_HOST"]
+    start_port = int(os.environ["RL_VLLM_START_PORT"])
+    port = start_port + rank
+    base_url = f"http://{host}:{port}/v1"
+    api_key = os.environ.get("RL_VLLM_API_KEY", "YOUR_API_KEY")
+    repo_root = Path(os.environ["RL_REPO_ROOT"])
+    model_root = os.environ.get(
+        "RL_VLLM_MODEL_PATH",
+        "/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b",
+    )
+
+    data = yaml.safe_load(src_cfg.read_text(encoding="utf-8"))
+    trainer = data.setdefault("trainer", {})
+    for key in [
+        "rollout_dir",
+        "output_dir",
+        "export_latest_dir",
+        "latest_model_path_file",
+        "initial_rollout_cache_dir",
+    ]:
+        value = trainer.get(key)
+        if isinstance(value, str) and value and not value.startswith("/"):
+            trainer[key] = str(repo_root / value)
+
+    model_path = trainer.get("model_path")
+    if not isinstance(model_path, str) or not model_path.startswith("/"):
+        trainer["model_path"] = model_root
+
+    if stage == "collect":
+        trainer["collect_only"] = True
+        trainer["train_only"] = False
+    elif stage == "train":
+        trainer["collect_only"] = False
+        trainer["train_only"] = True
+    elif stage == "eval":
+        trainer["collect_only"] = True
+        trainer["train_only"] = False
+
+    for agent_key, agent in (data.get("agents") or {}).items():
+        if not isinstance(agent, dict) or not agent_key.startswith("agent_"):
+            continue
+        agent["type"] = "vllm"
+        agent["api_key"] = api_key
+        agent["base_url"] = base_url
+        agent["local_model_path"] = trainer["model_path"]
+        agent["cuda_visible_devices"] = [rank]
+        agent["data_parallel_size"] = 1
+        agent.pop("model_dirname", None)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".tmp_{stage}_rank{rank}_", suffix=".yaml", dir=repo_root
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    tmp_path.write_text(yaml.safe_dump(data, allow_unicode=False, sort_keys=False), encoding="utf-8")
+    return tmp_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--stage", required=True, choices=["collect", "train", "eval"])
+    parser.add_argument("remainder", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    src_cfg = Path(args.config).resolve()
+    py_bin = os.environ.get("RL_PY_BIN") or sys.executable
+    tmp_cfg = build_rank_bound_config(src_cfg, args.stage)
+    try:
+        cmd = [py_bin, "-m", "collab_overcooked.main_rl", "--config", str(tmp_cfg)]
+        remainder = list(args.remainder)
+        if remainder and remainder[0] == "--":
+            remainder = remainder[1:]
+        cmd.extend(remainder)
+        return subprocess.call(cmd)
+    finally:
+        tmp_cfg.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2416,6 +2416,10 @@ class LLMAgents(LLMPair):
             if recent_goal_text == "":
                 format_issues.append("missing_recent_goal")
             action_text_block = self.parse_response(response, "action")
+            print(
+                f"[LLMAgents] agent={self.agent_index} parsed think_len={len(think_text)} "
+                f"talk={communicate_response!r} action_block={action_text_block!r}"
+            )
             if action_text_block == "":
                 format_issues.append("missing_action")
             elif action_info["mode"] == "mixed":
@@ -2517,6 +2521,10 @@ class LLMAgents(LLMPair):
             else:
                 # No action and no communication content, wait
                 ml_action == "wait(1)"
+            print(
+                f"[LLMAgents] agent={self.agent_index} selected ml_action={ml_action!r} "
+                f"planner_call_index={planner_call_index}"
+            )
         else:
             temp_list = []
             while not self.action_wait_parse.empty():
