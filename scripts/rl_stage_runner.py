@@ -87,7 +87,7 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
                 actor_cfg[agent_key]["adapter_name"] = str(adapter_name)
 
 
-def build_rank_bound_config(src_cfg: Path, stage: str) -> Path:
+def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     rank = _runtime_worker_rank()
     host = os.environ["RL_VLLM_HOST"]
     start_port = int(os.environ["RL_VLLM_START_PORT"])
@@ -148,7 +148,7 @@ def build_rank_bound_config(src_cfg: Path, stage: str) -> Path:
         agent.pop("model_dirname", None)
 
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".tmp_{stage}_rank{rank}_", suffix=".yaml", dir=repo_root
+        prefix=f"rl_stage_{stage}_rank{rank}_", suffix=".yaml", dir=str(tmp_dir)
     )
     os.close(fd)
     tmp_path = Path(tmp_name)
@@ -165,16 +165,14 @@ def main() -> int:
 
     src_cfg = Path(args.config).resolve()
     py_bin = os.environ.get("RL_PY_BIN") or sys.executable
-    tmp_cfg = build_rank_bound_config(src_cfg, args.stage)
-    try:
+    with tempfile.TemporaryDirectory(prefix="collab_overcooked_rl_") as tmp_dir_name:
+        tmp_cfg = build_rank_bound_config(src_cfg, args.stage, Path(tmp_dir_name))
         cmd = [py_bin, "-m", "collab_overcooked.main_rl", "--config", str(tmp_cfg)]
         remainder = list(args.remainder)
         if remainder and remainder[0] == "--":
             remainder = remainder[1:]
         cmd.extend(remainder)
         return subprocess.call(cmd)
-    finally:
-        tmp_cfg.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

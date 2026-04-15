@@ -29,7 +29,6 @@ trainer:
       dropout: 0.05
   rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/rollouts_kl
   output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/train_kl
-  initial_rollout_cache_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/train_kl/initial_rollout_cache
   save_interval: 10
   checkpoint_interval: 0
   export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/export_latest_kl

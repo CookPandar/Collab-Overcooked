@@ -10,7 +10,6 @@ trainer:
   off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/snapshots/one_episode.jsonl
   steps_per_update: 256
   rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/rollouts_kl
-  initial_rollout_cache_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/train_kl/initial_rollout_cache
   model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
   lora_path: null
   actor_adapters:

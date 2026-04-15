@@ -1335,10 +1335,10 @@ class MAPPOTrainer:
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.initial_rollout_cache_updates = int(
-            trainer_cfg.get("initial_rollout_cache_updates", 3)
+            trainer_cfg.get("initial_rollout_cache_updates", 0)
         )
         self.reuse_initial_rollout_cache = bool(
-            trainer_cfg.get("reuse_initial_rollout_cache", True)
+            trainer_cfg.get("reuse_initial_rollout_cache", False)
         )
         cache_dir_cfg = trainer_cfg.get("initial_rollout_cache_dir")
         self.initial_rollout_cache_dir = (
@@ -2478,24 +2478,8 @@ class MAPPOTrainer:
                     rotate_session=True,
                 )
             self._reset_rollout_stats()
-            reused_cache = False
-            latest_exists = (
-                self.latest_model_path_file is not None
-                and self.latest_model_path_file.exists()
-            )
-            # In 3-stage mode each collect process starts with local update_idx=1.
-            # Reuse the initial cache only before the first train/export has produced
-            # a latest-model marker; later rounds must collect fresh on-policy data.
-            if not latest_exists:
-                reused_cache = self._maybe_load_initial_cached_rollout(update_idx)
-            if not reused_cache:
-                self.collect_rollout()
-                self._maybe_save_initial_cached_rollout(update_idx, self.buffer.storage)
-                self.log_performance(update_idx)
-            else:
-                self.accelerator.print(
-                    f"[Collect] Reusing cached initial rollout for update {update_idx}."
-                )
+            self.collect_rollout()
+            self.log_performance(update_idx)
             self.log_rewards(update_idx, self.buffer.storage)
             self.save_rollout(self.buffer.storage, update_idx)
             self.buffer.clear()

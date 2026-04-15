@@ -37,7 +37,6 @@ trainer:
   # 训练输出 & rollouts 读取
   rollout_dir: "./rollouts"
   output_dir: "runs/rl/train"
-  initial_rollout_cache_dir: runs/rl/train/initial_rollout_cache
   save_interval: 10
   checkpoint_interval: 0
 

@@ -133,6 +133,7 @@ export TORCHINDUCTOR_FREEZING=1
 export TOKENIZERS_PARALLELISM=false
 
 mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval_kl" "$REPO_ROOT/logs/rl_vllm"
+find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
 
 VLLM_PIDS=()
 VLLM_PORTS=()
