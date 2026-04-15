@@ -157,6 +157,20 @@ def main() -> int:
     env['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     env['VLLM_DP_RANK'] = '0'
     env['VLLM_DP_SIZE'] = '1'
+    env['VLLM_DP_MASTER_IP'] = '127.0.0.1'
+    env['VLLM_DP_MASTER_PORT'] = str(args.engine_port)
+    for key in (
+        'MASTER_ADDR',
+        'MASTER_PORT',
+        'WORLD_SIZE',
+        'RANK',
+        'LOCAL_RANK',
+        'NODE_RANK',
+        'GROUP_RANK',
+        'ROLE_RANK',
+        'ROLE_NAME',
+    ):
+        env.pop(key, None)
 
     model_path = args.model
     lora_modules: List[Tuple[str, str]] = []

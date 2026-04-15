@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import socket
 
@@ -2303,7 +2304,18 @@ class MAPPOTrainer:
         model_name = self.agents_cfg.get(f"agent_{agent_index}", {}).get(
             "model", "qwen2.5-7B-instruct"
         )
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        timeout = float(
+            self.agents_cfg.get(f"agent_{agent_index}", {}).get(
+                "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
+            )
+        )
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        request_started = time.time()
+        print(
+            "[MAPPOTrainer] vllm request start "
+            f"rank={rank} agent={agent_index} model={model_name} "
+            f"base_url={base_url} timeout={timeout} messages={len(messages)}"
+        )
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
@@ -2312,6 +2324,7 @@ class MAPPOTrainer:
             logprobs=True,
             top_logprobs=1,
         )
+        elapsed = time.time() - request_started
         response_text = response.choices[0].message.content or ""
         content_logprobs = (
             getattr(getattr(response.choices[0], "logprobs", None), "content", None)
@@ -2323,6 +2336,11 @@ class MAPPOTrainer:
             if getattr(item, "logprob", None) is not None
         ]
         response_tokens = [getattr(item, "token", "") for item in content_logprobs]
+        print(
+            "[MAPPOTrainer] vllm request done "
+            f"rank={rank} agent={agent_index} model={model_name} "
+            f"elapsed={elapsed:.2f}s response_tokens={len(response_tokens)}"
+        )
         return response_text, {
             "response_log_probs": token_logprobs,
             "response_tokens": response_tokens,
