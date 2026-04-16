@@ -1175,19 +1175,6 @@ class MAPPOTrainer:
                 "ddp_find_unused_parameters", ddp_find_unused_default
             )
         )
-        master_port = os.environ.get("MASTER_PORT", "").strip()
-        if master_port:
-            try:
-                port = int(master_port)
-                sock = socket.socket()
-                try:
-                    sock.bind(("127.0.0.1", port))
-                except OSError:
-                    os.environ["MASTER_PORT"] = "0"
-                finally:
-                    sock.close()
-            except ValueError:
-                pass
         print(
             "[MAPPO] before Accelerator init "
             f"stage={os.getenv('RL_STAGE_PHASE', '')} "
