@@ -51,6 +51,7 @@ trainer:
   update_epochs: 1
   gradient_checkpointing: true
   gradient_accumulation_steps: 1
+  enable_fresh_value_metrics: false
   target_kl: 0.01
   kl_penalty_coef: 0.05
   clip_coef: 0.15

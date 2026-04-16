@@ -1273,6 +1273,9 @@ class MAPPOTrainer:
         self.compute_values_in_collect = bool(
             trainer_cfg.get("compute_values_in_collect", False)
         )
+        self.enable_fresh_value_metrics = bool(
+            trainer_cfg.get("enable_fresh_value_metrics", False)
+        )
         self.load_policy_model = self.train_only or (
             self.collect_only and self.compute_values_in_collect
         )
@@ -3522,21 +3525,31 @@ class MAPPOTrainer:
                     "value_mean": float(agent_values.mean().item()),
                     "explained_var": agent_explained_var,
                 }
-        print(
-            "[MAPPO] update_policy before fresh_value_metrics "
-            f"rank={rank}",
-            flush=True,
-        )
-        fresh_value_metrics = self._compute_fresh_value_metrics(
-            transitions=transitions,
-            returns_cpu=returns_cpu,
-            agent_indices=agent_indices,
-        )
-        print(
-            "[MAPPO] update_policy after fresh_value_metrics "
-            f"rank={rank}",
-            flush=True,
-        )
+        if self.enable_fresh_value_metrics:
+            print(
+                "[MAPPO] update_policy before fresh_value_metrics "
+                f"rank={rank}",
+                flush=True,
+            )
+            fresh_value_metrics = self._compute_fresh_value_metrics(
+                transitions=transitions,
+                returns_cpu=returns_cpu,
+                agent_indices=agent_indices,
+            )
+            print(
+                "[MAPPO] update_policy after fresh_value_metrics "
+                f"rank={rank}",
+                flush=True,
+            )
+        else:
+            fresh_value_metrics = {
+                "fresh_value_mean": 0.0,
+                "fresh_explained_var": 0.0,
+                "agent0_fresh_value_mean": 0.0,
+                "agent0_fresh_explained_var": 0.0,
+                "agent1_fresh_value_mean": 0.0,
+                "agent1_fresh_explained_var": 0.0,
+            }
 
         result = {
             "loss": avg_loss,
@@ -3933,6 +3946,17 @@ class MAPPOTrainer:
             else:
                 # Unexpected: is_lora=True but model is not a PeftModel.
                 hf_model.save_pretrained(out_dir)
+            nested_dir = out_dir / adapter_name
+            if nested_dir.is_dir() and (nested_dir / "adapter_config.json").exists():
+                for child in nested_dir.iterdir():
+                    target = out_dir / child.name
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                    shutil.move(str(child), str(target))
+                shutil.rmtree(nested_dir)
             tokenizer.save_pretrained(out_dir)
 
         payload: Dict[str, Any] = {

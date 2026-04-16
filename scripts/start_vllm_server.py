@@ -24,6 +24,23 @@ def _resolve_path(raw: Optional[str], base_dir: Path) -> Optional[str]:
     return str(path)
 
 
+def _resolve_lora_dir(raw: Optional[str], base_dir: Path) -> Optional[str]:
+    resolved = _resolve_path(raw, base_dir)
+    if not resolved:
+        return None
+    path = Path(resolved)
+    if (path / "adapter_config.json").exists():
+        return str(path)
+    child_dirs = [item for item in path.iterdir()] if path.is_dir() else []
+    nested_candidates = [
+        item for item in child_dirs
+        if item.is_dir() and (item / "adapter_config.json").exists()
+    ]
+    if len(nested_candidates) == 1:
+        return str(nested_candidates[0])
+    return str(path)
+
+
 def _resolve_agent_index(key: Any) -> Optional[int]:
     if isinstance(key, int):
         return key
@@ -77,7 +94,9 @@ def _apply_latest_override(
                     continue
                 lora_path = value.get("lora_path")
                 if lora_path:
-                    actor_cfg[agent_key]["lora_path"] = _resolve_path(str(lora_path), base_dir)
+                    actor_cfg[agent_key]["lora_path"] = _resolve_lora_dir(
+                        str(lora_path), base_dir
+                    )
                 adapter_name = value.get("adapter_name")
                 if adapter_name:
                     actor_cfg[agent_key]["adapter_name"] = str(adapter_name)
@@ -120,7 +139,7 @@ def _build_lora_modules(config_path: Path) -> Tuple[str, List[Tuple[str, str]], 
         for key, value in sorted(actor_adapters.items()):
             if not isinstance(value, dict):
                 continue
-            lora_path = _resolve_path(value.get("lora_path"), repo_root)
+            lora_path = _resolve_lora_dir(value.get("lora_path"), repo_root)
             if not lora_path:
                 continue
             adapter_name = str(

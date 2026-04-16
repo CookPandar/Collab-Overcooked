@@ -46,6 +46,20 @@ def _resolve_path(raw: str, base_dir: Path) -> str:
     return str(path)
 
 
+def _resolve_lora_dir(raw: str, base_dir: Path) -> str:
+    path = Path(_resolve_path(raw, base_dir))
+    if (path / "adapter_config.json").exists():
+        return str(path)
+    if path.is_dir():
+        nested_candidates = [
+            item for item in path.iterdir()
+            if item.is_dir() and (item / "adapter_config.json").exists()
+        ]
+        if len(nested_candidates) == 1:
+            return str(nested_candidates[0])
+    return str(path)
+
+
 def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
     latest_file = trainer.get("latest_model_path_file")
     if not latest_file:
@@ -81,7 +95,9 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
                 continue
             lora_path = value.get("lora_path")
             if lora_path:
-                actor_cfg[agent_key]["lora_path"] = _resolve_path(str(lora_path), base_dir)
+                actor_cfg[agent_key]["lora_path"] = _resolve_lora_dir(
+                    str(lora_path), base_dir
+                )
             adapter_name = value.get("adapter_name")
             if adapter_name:
                 actor_cfg[agent_key]["adapter_name"] = str(adapter_name)
