@@ -171,6 +171,8 @@ find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
 VLLM_PIDS=()
 VLLM_PORTS=()
 VLLM_ENGINE_PORTS=()
+VLLM_INTERNAL_PORT_BASES=()
+VLLM_INTERNAL_PORT_SPAN="${RL_VLLM_INTERNAL_PORT_SPAN:-20}"
 cleanup() {
     stop_vllm_servers
 }
@@ -243,21 +245,34 @@ reserve_vllm_port_block() {
     local count="${2:-$NUM_PROCS}"
     local max_tries=200
     local try_idx=0
+    local per_gpu_internal_span="$VLLM_INTERNAL_PORT_SPAN"
+    local block_span=$((200 + count * per_gpu_internal_span))
     while (( try_idx < max_tries )); do
-        local candidate=$((base_port + try_idx * count))
+        local candidate=$((base_port + try_idx * block_span))
         local ok=1
         for ((gpu=0; gpu<count; gpu++)); do
             local api_port=$((candidate + gpu))
             local engine_port=$((candidate + 100 + gpu))
+            local internal_base=$((candidate + 200 + gpu * per_gpu_internal_span))
             if port_is_listening "$api_port" || port_is_listening "$engine_port"; then
                 ok=0
+                break
+            fi
+            for ((offset=0; offset<per_gpu_internal_span; offset++)); do
+                local internal_port=$((internal_base + offset))
+                if port_is_listening "$internal_port"; then
+                    ok=0
+                    break
+                fi
+            done
+            if (( ok == 0 )); then
                 break
             fi
         done
         if (( ok == 1 )); then
             VLLM_START_PORT="$candidate"
             export RL_VLLM_START_PORT="$VLLM_START_PORT"
-            echo "[cluster-rl] reserved vLLM port block start=$VLLM_START_PORT count=$count"
+            echo "[cluster-rl] reserved vLLM port block start=$VLLM_START_PORT count=$count internal_span=$per_gpu_internal_span"
             return 0
         fi
         try_idx=$((try_idx + 1))
@@ -279,9 +294,17 @@ stop_vllm_servers() {
     for port in "${VLLM_ENGINE_PORTS[@]:-}"; do
         [[ -n "$port" ]] && kill_port_listener "$port"
     done
+    for base in "${VLLM_INTERNAL_PORT_BASES[@]:-}"; do
+        if [[ -n "$base" ]]; then
+            for ((offset=0; offset<VLLM_INTERNAL_PORT_SPAN; offset++)); do
+                kill_port_listener "$((base + offset))"
+            done
+        fi
+    done
     VLLM_PIDS=()
     VLLM_PORTS=()
     VLLM_ENGINE_PORTS=()
+    VLLM_INTERNAL_PORT_BASES=()
 }
 
 wait_for_port() {
@@ -324,16 +347,22 @@ start_vllm_servers() {
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
         local engine_port=$((VLLM_START_PORT + 100 + gpu))
+        local internal_port_base=$((VLLM_START_PORT + 200 + gpu * VLLM_INTERNAL_PORT_SPAN))
         VLLM_PORTS+=("$port")
         VLLM_ENGINE_PORTS+=("$engine_port")
+        VLLM_INTERNAL_PORT_BASES+=("$internal_port_base")
         kill_port_listener "$port"
         kill_port_listener "$engine_port"
+        for ((offset=0; offset<VLLM_INTERNAL_PORT_SPAN; offset++)); do
+            kill_port_listener "$((internal_port_base + offset))"
+        done
         local log_file="$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
-        echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port"
+        echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port engine_port=$engine_port internal_port_base=$internal_port_base"
         "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
             --gpu "$gpu" \
             --port "$port" \
             --engine-port "$engine_port" \
+            --internal-port-base "$internal_port_base" \
             --model "$VLLM_MODEL_PATH" \
             --config "$cfg_path" \
             --served-model-name "$SERVED_MODEL_NAME" \

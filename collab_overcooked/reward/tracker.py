@@ -42,6 +42,24 @@ class ProcessRewardTracker:
             )
         )
         self.enable_collab_reward = bool(self.settings.get("collab_reward_enabled", False))
+        self.enable_paired_comm_reward = bool(
+            self.settings.get("paired_comm_reward_enabled", False)
+        )
+        self.paired_comm_request_positive_reward = float(
+            self.settings.get("paired_comm_request_positive_reward", 0.5)
+        )
+        self.paired_comm_request_negative_reward = -abs(
+            self.settings.get("paired_comm_request_negative_reward", 0.1)
+        )
+        self.paired_comm_response_positive_reward = float(
+            self.settings.get("paired_comm_response_positive_reward", 0.5)
+        )
+        self.paired_comm_response_negative_reward = -abs(
+            self.settings.get("paired_comm_response_negative_reward", 0.1)
+        )
+        self.paired_comm_deny_reward = float(
+            self.settings.get("paired_comm_deny_reward", 1.0)
+        )
 
         self.references = self._load_references()
         self.sequence_histories: List[List[str]] = [[], []]
@@ -56,6 +74,7 @@ class ProcessRewardTracker:
         self.penalty_queue: List[List[Dict[str, str]]] = [[], []]
         self.call_events: List[Dict] = []
         self.step_call_records: Dict[int, List[List[Dict]]] = {}
+        self.pending_paired_comm_requests: List[List[Dict[str, Any]]] = [[], []]
 
     # ------------------------------------------------------------------
     # Public API
@@ -79,6 +98,7 @@ class ProcessRewardTracker:
         self.observed_targets.clear()
         self.call_events.clear()
         self.step_call_records.clear()
+        self.pending_paired_comm_requests = [[], []]
         for queue in self.penalty_queue:
             queue.clear()
 
@@ -91,6 +111,9 @@ class ProcessRewardTracker:
             "last_action_signatures": list(self.last_action_signatures),
             "observed_targets": list(self.observed_targets),
             "penalty_queue": copy.deepcopy(self.penalty_queue),
+            "pending_paired_comm_requests": copy.deepcopy(
+                self.pending_paired_comm_requests
+            ),
         }
 
     def import_state(self, data: Optional[Dict[str, Any]]):
@@ -128,6 +151,14 @@ class ProcessRewardTracker:
         else:
             for queue in self.penalty_queue:
                 queue.clear()
+        pending_pairs = data.get("pending_paired_comm_requests")
+        if isinstance(pending_pairs, list) and len(pending_pairs) == 2:
+            self.pending_paired_comm_requests = [
+                list(queue) if isinstance(queue, list) else []
+                for queue in pending_pairs
+            ]
+        else:
+            self.pending_paired_comm_requests = [[], []]
         self.call_events.clear()
         self.step_call_records.clear()
 
@@ -161,6 +192,11 @@ class ProcessRewardTracker:
             normalized_action,
             suppress_penalty=suppress_repeat_penalty,
         )
+        paired_comm_reward, paired_comm_meta = self._process_paired_comm_reward(
+            agent_index,
+            ts=-1 if timestamp is None else int(timestamp),
+            action=normalized_action,
+        )
         if force_communication_penalty:
             communication_reward += self.forced_communication_penalty_value
         if is_collab:
@@ -175,7 +211,7 @@ class ProcessRewardTracker:
         penalty_total, penalty_details = self._consume_penalties(agent_index)
         format_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "format")
         validator_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "validator")
-        total = seq_reward + communication_reward + penalty_total
+        total = seq_reward + communication_reward + paired_comm_reward + penalty_total
 
         ts = -1 if timestamp is None else int(timestamp)
         entry = {
@@ -188,6 +224,12 @@ class ProcessRewardTracker:
             "sequence_reward": seq_reward,
             "progress_reward": seq_reward,
             "communication_reward": communication_reward,
+            "paired_comm_reward": paired_comm_reward,
+            "paired_comm_role": paired_comm_meta.get("role"),
+            "paired_comm_result": paired_comm_meta.get("result"),
+            "paired_comm_target": paired_comm_meta.get("target_agent"),
+            "paired_comm_request_action": paired_comm_meta.get("request_action"),
+            "paired_comm_request_helpful": paired_comm_meta.get("request_helpful"),
             "format_reward": format_reward,
             "validator_reward": validator_reward,
             "similarity_before": similarity_before,
@@ -219,8 +261,13 @@ class ProcessRewardTracker:
             communication_reward = sum(
                 entry.get("communication_reward", 0.0) for entry in call_entries
             )
+            paired_comm_reward = sum(
+                entry.get("paired_comm_reward", 0.0) for entry in call_entries
+            )
             agent_total = sum(entry["total"] for entry in call_entries)
-            penalty_total = agent_total - seq_reward - communication_reward
+            penalty_total = (
+                agent_total - seq_reward - communication_reward - paired_comm_reward
+            )
             penalty_details = []
             for entry in call_entries:
                 penalty_details.extend(entry["penalties"])
@@ -228,6 +275,7 @@ class ProcessRewardTracker:
                 {
                     "sequence_reward": seq_reward,
                     "communication_reward": communication_reward,
+                    "paired_comm_reward": paired_comm_reward,
                     "penalty_total": penalty_total,
                     "penalties": penalty_details,
                     "similarity": self.sequence_scores[agent_idx],
@@ -336,6 +384,175 @@ class ProcessRewardTracker:
         if previous and previous == signature:
             return self.communication_penalty_value
         return 0.0
+
+    def _process_paired_comm_reward(
+        self, agent_index: int, ts: int, action: str
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not self.enable_paired_comm_reward or not action:
+            return 0.0, {}
+
+        total_reward = 0.0
+        meta: Dict[str, Any] = {}
+
+        response_reward, response_meta = self._resolve_paired_comm_response(
+            agent_index, action
+        )
+        if response_meta:
+            total_reward += response_reward
+            meta = response_meta
+
+        request_reward, request_meta = self._register_paired_comm_requests(
+            agent_index, ts, action
+        )
+        if request_meta:
+            total_reward += request_reward
+            meta = request_meta
+
+        return total_reward, meta
+
+    def _resolve_paired_comm_response(
+        self, agent_index: int, action: str
+    ) -> Tuple[float, Dict[str, Any]]:
+        pending_queue = self.pending_paired_comm_requests[agent_index]
+        if not pending_queue:
+            return 0.0, {}
+
+        response_kind, response_payload = self._classify_paired_comm_response(action)
+        if response_kind is None:
+            return 0.0, {}
+
+        pair = pending_queue.pop(0)
+        request_helpful = bool(pair.get("request_helpful", False))
+        request_action = str(pair.get("request_action") or "")
+        target_agent = pair.get("initiator_agent")
+
+        if request_helpful:
+            accepted = response_kind == "ack" or (
+                response_kind == "embodied"
+                and response_payload == self._normalize_action(request_action)
+            )
+            reward = (
+                self.paired_comm_response_positive_reward
+                if accepted
+                else self.paired_comm_response_negative_reward
+            )
+            result = (
+                "helpful_request_accepted"
+                if accepted
+                else "helpful_request_rejected_or_missed"
+            )
+        else:
+            denied = response_kind == "deny"
+            reward = (
+                self.paired_comm_deny_reward
+                if denied
+                else self.paired_comm_response_negative_reward
+            )
+            result = "bad_request_denied" if denied else "bad_request_followed"
+
+        return reward, {
+            "role": "responder",
+            "result": result,
+            "target_agent": target_agent,
+            "request_action": request_action,
+            "request_helpful": request_helpful,
+        }
+
+    def _register_paired_comm_requests(
+        self, agent_index: int, ts: int, action: str
+    ) -> Tuple[float, Dict[str, Any]]:
+        requests = self._extract_collab_requests(action)
+        if not requests:
+            return 0.0, {}
+
+        total_reward = 0.0
+        request_results: List[str] = []
+        target_agent: Optional[int] = None
+        request_action: Optional[str] = None
+        request_helpful: Optional[bool] = None
+
+        for target_idx, actions in requests:
+            if target_idx == agent_index or target_idx not in (0, 1) or not actions:
+                continue
+            action_text = self._normalize_action(actions[0])
+            helpful, baseline_score, new_score = self._evaluate_request_helpfulness(
+                target_idx, actions
+            )
+            reward = (
+                self.paired_comm_request_positive_reward
+                if helpful
+                else self.paired_comm_request_negative_reward
+            )
+            total_reward += reward
+            request_results.append(
+                "request_helpful" if helpful else "request_not_helpful"
+            )
+            self.pending_paired_comm_requests[target_idx].append(
+                {
+                    "timestamp": ts,
+                    "initiator_agent": agent_index,
+                    "responder_agent": target_idx,
+                    "request_action": action_text,
+                    "request_helpful": helpful,
+                    "baseline_score": baseline_score,
+                    "new_score": new_score,
+                }
+            )
+            target_agent = target_idx
+            request_action = action_text
+            request_helpful = helpful
+
+        if not request_results:
+            return 0.0, {}
+
+        result = request_results[0] if len(request_results) == 1 else "multi_request"
+        return total_reward, {
+            "role": "initiator",
+            "result": result,
+            "target_agent": target_agent,
+            "request_action": request_action,
+            "request_helpful": request_helpful,
+        }
+
+    def _evaluate_request_helpfulness(
+        self, target_idx: int, actions: List[str]
+    ) -> Tuple[bool, float, float]:
+        history = list(self.sequence_histories[target_idx])
+        history.extend(self._normalize_action(action) for action in actions if action)
+        new_score = self._best_sequence_score_from_history(target_idx, history)
+        baseline = max(
+            float(self.sequence_scores[target_idx]),
+            float(self.collab_sequence_scores[target_idx]),
+        )
+        helpful = new_score > baseline
+        if helpful:
+            self.collab_sequence_scores[target_idx] = max(
+                self.collab_sequence_scores[target_idx], new_score
+            )
+        return helpful, baseline, new_score
+
+    def _classify_paired_comm_response(
+        self, action: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        normalized = self._normalize_action(action or "")
+        if not normalized or normalized.lower().startswith("wait"):
+            return None, None
+        if not self._is_collab_action(normalized):
+            return "embodied", normalized
+
+        body = self._unwrap_function_body(normalized)
+        collab_body = (
+            body if normalized.lower().startswith("collab(") and body is not None else normalized
+        )
+        segments = self._split_top_level_segments(collab_body)
+        if not segments:
+            return None, None
+        primitive, payload = self._parse_collab_signature_segment(segments[0])
+        if primitive in {"ack", "deny"}:
+            return primitive, payload
+        if primitive in {"request", "seek", "raw"}:
+            return "other_collab", payload
+        return None, None
 
     def _build_action_signature(self, action: str) -> str:
         normalized = self._normalize_action(action)

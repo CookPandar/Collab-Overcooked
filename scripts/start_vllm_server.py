@@ -162,6 +162,7 @@ def main() -> int:
     parser.add_argument('--gpu', type=int, required=True)
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--engine-port', type=int, required=True)
+    parser.add_argument('--internal-port-base', type=int, required=False)
     parser.add_argument('--model', required=True)
     parser.add_argument('--config', required=False)
     parser.add_argument('--served-model-name', required=True)
@@ -179,6 +180,8 @@ def main() -> int:
     env['VLLM_DP_SIZE'] = '1'
     env['VLLM_DP_MASTER_IP'] = '127.0.0.1'
     env['VLLM_DP_MASTER_PORT'] = str(args.engine_port)
+    if args.internal_port_base is not None:
+        env['VLLM_PORT'] = str(args.internal_port_base)
     for key in (
         'MASTER_ADDR',
         'MASTER_PORT',

@@ -680,14 +680,22 @@ class CollabMainSession:
                 communication_reward = float(
                     reward_entry.get("communication_reward", 0.0)
                 )
+                paired_comm_reward = float(
+                    reward_entry.get("paired_comm_reward", 0.0)
+                )
                 record.reward = (
-                    seq_reward + fmt_reward + validator_reward + communication_reward
+                    seq_reward
+                    + fmt_reward
+                    + validator_reward
+                    + communication_reward
+                    + paired_comm_reward
                 )
                 breakdown = {
                     "sequence_reward": seq_reward,
                     "format_reward": fmt_reward,
                     "validator_reward": validator_reward,
                     "communication_reward": communication_reward,
+                    "paired_comm_reward": paired_comm_reward,
                     "call_type": reward_entry.get("call_type"),
                     "raw": reward_entry,
                 }

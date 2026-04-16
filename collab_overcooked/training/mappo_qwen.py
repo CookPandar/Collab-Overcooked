@@ -59,6 +59,7 @@ class TextTransition:
     # NOTE: `reward` is still the scalar used for RL updates; these fields are only for logging/analysis.
     sequence_reward: float = 0.0
     communication_reward: float = 0.0
+    paired_comm_reward: float = 0.0
     breakdown_total_reward: float = 0.0
 
 
@@ -1787,13 +1788,17 @@ class MAPPOTrainer:
             fmt = sum(float(call.get("format_reward", 0.0) or 0.0) for call in calls)
             validator = sum(float(call.get("validator_reward", 0.0) or 0.0) for call in calls)
             comm = sum(float(call.get("communication_reward", 0.0) or 0.0) for call in calls)
-            total = seq + fmt + validator + comm
+            paired_comm = sum(
+                float(call.get("paired_comm_reward", 0.0) or 0.0) for call in calls
+            )
+            total = seq + fmt + validator + comm + paired_comm
             prefix = f"agent{agent_idx}"
             stats[f"{prefix}_total"] = total
             stats[f"{prefix}_sequence"] = seq
             stats[f"{prefix}_format"] = fmt
             stats[f"{prefix}_validator"] = validator
             stats[f"{prefix}_comm"] = comm
+            stats[f"{prefix}_paired_comm"] = paired_comm
             stats["team_total"] += total
         return stats
 
@@ -2752,12 +2757,23 @@ class MAPPOTrainer:
                 breakdown.get("sequence_reward", raw_entry.get("sequence_reward", 0.0) or 0.0)
             )
             communication_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
+            paired_comm_reward = float(breakdown.get("paired_comm_reward", 0.0) or 0.0)
             breakdown_total_reward = float(
                 raw_entry.get(
                     "total",
-                    seq_reward + fmt_reward + validator_reward + communication_reward,
+                    seq_reward
+                    + fmt_reward
+                    + validator_reward
+                    + communication_reward
+                    + paired_comm_reward,
                 )
-                or (seq_reward + fmt_reward + validator_reward + communication_reward)
+                or (
+                    seq_reward
+                    + fmt_reward
+                    + validator_reward
+                    + communication_reward
+                    + paired_comm_reward
+                )
             )
             process_reward = seq_reward
             self.buffer.add(
@@ -2778,6 +2794,7 @@ class MAPPOTrainer:
                 process_reward=process_reward,
                 sequence_reward=seq_reward,
                 communication_reward=communication_reward,
+                paired_comm_reward=paired_comm_reward,
                 breakdown_total_reward=breakdown_total_reward,
             )
             added += 1
@@ -3709,6 +3726,7 @@ class MAPPOTrainer:
                     "validator": 0.0,
                     "sequence": 0.0,
                     "comm": 0.0,
+                    "paired_comm": 0.0,
                     "breakdown_total": 0.0,
                     "legacy_process": 0.0,
                     "rl_nonzero": 0.0,
@@ -3716,6 +3734,7 @@ class MAPPOTrainer:
                     "validator_nonzero": 0.0,
                     "sequence_nonzero": 0.0,
                     "comm_nonzero": 0.0,
+                    "paired_comm_nonzero": 0.0,
                     "breakdown_total_nonzero": 0.0,
                     "legacy_process_nonzero": 0.0,
                 },
@@ -3726,6 +3745,7 @@ class MAPPOTrainer:
             validator_value = float(getattr(t, "validator_reward", 0.0))
             sequence_value = float(getattr(t, "sequence_reward", 0.0))
             comm_value = float(getattr(t, "communication_reward", 0.0))
+            paired_comm_value = float(getattr(t, "paired_comm_reward", 0.0))
             breakdown_total_value = float(getattr(t, "breakdown_total_reward", 0.0))
             legacy_process_value = float(
                 getattr(t, "process_reward", getattr(t, "reward", 0.0))
@@ -3735,6 +3755,7 @@ class MAPPOTrainer:
             stats["validator"] += validator_value
             stats["sequence"] += sequence_value
             stats["comm"] += comm_value
+            stats["paired_comm"] += paired_comm_value
             stats["breakdown_total"] += breakdown_total_value
             stats["legacy_process"] += legacy_process_value
             stats["rl_nonzero"] += 1.0 if rl_value != 0.0 else 0.0
@@ -3742,6 +3763,9 @@ class MAPPOTrainer:
             stats["validator_nonzero"] += 1.0 if validator_value != 0.0 else 0.0
             stats["sequence_nonzero"] += 1.0 if sequence_value != 0.0 else 0.0
             stats["comm_nonzero"] += 1.0 if comm_value != 0.0 else 0.0
+            stats["paired_comm_nonzero"] += (
+                1.0 if paired_comm_value != 0.0 else 0.0
+            )
             stats["breakdown_total_nonzero"] += (
                 1.0 if breakdown_total_value != 0.0 else 0.0
             )
@@ -3756,6 +3780,7 @@ class MAPPOTrainer:
                 "validator": 0.0,
                 "sequence": 0.0,
                 "comm": 0.0,
+                "paired_comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
                 "rl_nonzero": 0.0,
@@ -3763,6 +3788,7 @@ class MAPPOTrainer:
                 "validator_nonzero": 0.0,
                 "sequence_nonzero": 0.0,
                 "comm_nonzero": 0.0,
+                "paired_comm_nonzero": 0.0,
                 "breakdown_total_nonzero": 0.0,
                 "legacy_process_nonzero": 0.0,
             },
@@ -3775,6 +3801,7 @@ class MAPPOTrainer:
                 "validator": 0.0,
                 "sequence": 0.0,
                 "comm": 0.0,
+                "paired_comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
                 "rl_nonzero": 0.0,
@@ -3782,6 +3809,7 @@ class MAPPOTrainer:
                 "validator_nonzero": 0.0,
                 "sequence_nonzero": 0.0,
                 "comm_nonzero": 0.0,
+                "paired_comm_nonzero": 0.0,
                 "breakdown_total_nonzero": 0.0,
                 "legacy_process_nonzero": 0.0,
             },
@@ -3796,6 +3824,7 @@ class MAPPOTrainer:
                 a0_stats["validator"],
                 a0_stats["sequence"],
                 a0_stats["comm"],
+                a0_stats["paired_comm"],
                 a0_stats["breakdown_total"],
                 a0_stats["legacy_process"],
                 a0_stats["rl_nonzero"],
@@ -3803,6 +3832,7 @@ class MAPPOTrainer:
                 a0_stats["validator_nonzero"],
                 a0_stats["sequence_nonzero"],
                 a0_stats["comm_nonzero"],
+                a0_stats["paired_comm_nonzero"],
                 a0_stats["breakdown_total_nonzero"],
                 a0_stats["legacy_process_nonzero"],
                 a1_stats["rl"],
@@ -3810,6 +3840,7 @@ class MAPPOTrainer:
                 a1_stats["validator"],
                 a1_stats["sequence"],
                 a1_stats["comm"],
+                a1_stats["paired_comm"],
                 a1_stats["breakdown_total"],
                 a1_stats["legacy_process"],
                 a1_stats["rl_nonzero"],
@@ -3817,6 +3848,7 @@ class MAPPOTrainer:
                 a1_stats["validator_nonzero"],
                 a1_stats["sequence_nonzero"],
                 a1_stats["comm_nonzero"],
+                a1_stats["paired_comm_nonzero"],
                 a1_stats["breakdown_total_nonzero"],
                 a1_stats["legacy_process_nonzero"],
             ],
@@ -3852,6 +3884,7 @@ class MAPPOTrainer:
             a0_validator_sum,
             a0_sequence_sum,
             a0_comm_sum,
+            a0_paired_comm_sum,
             a0_breakdown_total_sum,
             a0_legacy_process_sum,
             a0_rl_nonzero,
@@ -3859,6 +3892,7 @@ class MAPPOTrainer:
             a0_validator_nonzero,
             a0_sequence_nonzero,
             a0_comm_nonzero,
+            a0_paired_comm_nonzero,
             a0_breakdown_total_nonzero,
             a0_legacy_process_nonzero,
             a1_rl_sum,
@@ -3866,6 +3900,7 @@ class MAPPOTrainer:
             a1_validator_sum,
             a1_sequence_sum,
             a1_comm_sum,
+            a1_paired_comm_sum,
             a1_breakdown_total_sum,
             a1_legacy_process_sum,
             a1_rl_nonzero,
@@ -3873,6 +3908,7 @@ class MAPPOTrainer:
             a1_validator_nonzero,
             a1_sequence_nonzero,
             a1_comm_nonzero,
+            a1_paired_comm_nonzero,
             a1_breakdown_total_nonzero,
             a1_legacy_process_nonzero,
         ) = [float(x) for x in summed.tolist()]
@@ -3892,6 +3928,8 @@ class MAPPOTrainer:
             "agent0_sequence_nonzero_count,agent0_sequence_nonzero_ratio,"
             "agent0_comm_sum,agent0_comm_mean,"
             "agent0_comm_nonzero_count,agent0_comm_nonzero_ratio,"
+            "agent0_paired_comm_sum,agent0_paired_comm_mean,"
+            "agent0_paired_comm_nonzero_count,agent0_paired_comm_nonzero_ratio,"
             "agent0_breakdown_total_sum,agent0_breakdown_total_mean,"
             "agent0_breakdown_total_nonzero_count,agent0_breakdown_total_nonzero_ratio,"
             "agent0_legacy_process_sum,agent0_legacy_process_mean,"
@@ -3906,6 +3944,8 @@ class MAPPOTrainer:
             "agent1_sequence_nonzero_count,agent1_sequence_nonzero_ratio,"
             "agent1_comm_sum,agent1_comm_mean,"
             "agent1_comm_nonzero_count,agent1_comm_nonzero_ratio,"
+            "agent1_paired_comm_sum,agent1_paired_comm_mean,"
+            "agent1_paired_comm_nonzero_count,agent1_paired_comm_nonzero_ratio,"
             "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
             "agent1_breakdown_total_nonzero_count,agent1_breakdown_total_nonzero_ratio,"
             "agent1_legacy_process_sum,agent1_legacy_process_mean"
@@ -3940,6 +3980,8 @@ class MAPPOTrainer:
                 f"{a0_sequence_nonzero},{_mean(a0_sequence_nonzero, a0_n)},"
                 f"{a0_comm_sum},{_mean(a0_comm_sum, a0_n)},"
                 f"{a0_comm_nonzero},{_mean(a0_comm_nonzero, a0_n)},"
+                f"{a0_paired_comm_sum},{_mean(a0_paired_comm_sum, a0_n)},"
+                f"{a0_paired_comm_nonzero},{_mean(a0_paired_comm_nonzero, a0_n)},"
                 f"{a0_breakdown_total_sum},{_mean(a0_breakdown_total_sum, a0_n)},"
                 f"{a0_breakdown_total_nonzero},{_mean(a0_breakdown_total_nonzero, a0_n)},"
                 f"{a0_legacy_process_sum},{_mean(a0_legacy_process_sum, a0_n)},"
@@ -3954,6 +3996,8 @@ class MAPPOTrainer:
                 f"{a1_sequence_nonzero},{_mean(a1_sequence_nonzero, a1_n)},"
                 f"{a1_comm_sum},{_mean(a1_comm_sum, a1_n)},"
                 f"{a1_comm_nonzero},{_mean(a1_comm_nonzero, a1_n)},"
+                f"{a1_paired_comm_sum},{_mean(a1_paired_comm_sum, a1_n)},"
+                f"{a1_paired_comm_nonzero},{_mean(a1_paired_comm_nonzero, a1_n)},"
                 f"{a1_breakdown_total_sum},{_mean(a1_breakdown_total_sum, a1_n)},"
                 f"{a1_breakdown_total_nonzero},{_mean(a1_breakdown_total_nonzero, a1_n)},"
                 f"{a1_legacy_process_sum},{_mean(a1_legacy_process_sum, a1_n)},"
@@ -4370,6 +4414,7 @@ class MAPPOTrainer:
             "process_reward": t.process_reward,
             "sequence_reward": t.sequence_reward,
             "communication_reward": t.communication_reward,
+            "paired_comm_reward": t.paired_comm_reward,
             "breakdown_total_reward": t.breakdown_total_reward,
         }
 
@@ -4396,6 +4441,7 @@ class MAPPOTrainer:
             process_reward=float(d.get("process_reward", d.get("reward", 0.0))),
             sequence_reward=float(d.get("sequence_reward", 0.0)),
             communication_reward=float(d.get("communication_reward", 0.0)),
+            paired_comm_reward=float(d.get("paired_comm_reward", 0.0)),
             breakdown_total_reward=float(
                 d.get(
                     "breakdown_total_reward",

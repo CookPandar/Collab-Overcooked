@@ -141,7 +141,10 @@ class RewardAssignmentTest(unittest.TestCase):
                     original_log = (((timeline[step_idx] or {}).get("content") or {}).get("original_log")) or []
                     for agent_idx, agent_calls in enumerate(original_log):
                         for raw_call in agent_calls or []:
-                            if raw_call.get("call_type") == "communication":
+                            semantic_mode = self.classify_action_mode_from_output(
+                                raw_call.get("output") or ""
+                            )
+                            if semantic_mode == "communication":
                                 communication_cases.append(
                                     {
                                         "category": "communication",
@@ -158,10 +161,13 @@ class RewardAssignmentTest(unittest.TestCase):
                             for raw_call in (original_log[agent_idx] if agent_idx < len(original_log) else [])
                         }
                         for reward_entry in call_entries:
-                            if reward_entry.get("call_type") != "planner_main":
-                                continue
                             call_index = reward_entry.get("call_index")
                             if call_index not in raw_lookup:
+                                continue
+                            semantic_mode = self.classify_action_mode_from_output(
+                                raw_lookup[call_index].get("output") or ""
+                            )
+                            if semantic_mode != "planner_main":
                                 continue
                             planner_cases.append(
                                 {
@@ -225,21 +231,62 @@ class RewardAssignmentTest(unittest.TestCase):
                 data = self.load_real_log(path)
                 rewards = data.get("process_rewards") or []
                 for step_idx, reward_step in enumerate(rewards):
+                    timeline = data.get("content") or []
+                    original_log = (
+                        (((timeline[step_idx] or {}).get("content") or {}).get("original_log")) or []
+                        if step_idx < len(timeline)
+                        else []
+                    )
+                    raw_lookup = {
+                        agent_idx: {
+                            raw_call.get("call_index"): raw_call
+                            for raw_call in (agent_calls or [])
+                        }
+                        for agent_idx, agent_calls in enumerate(original_log)
+                    }
                     for agent_idx, agent_reward in enumerate(reward_step.get("per_agent") or []):
                         for reward_entry in agent_reward.get("calls") or []:
-                            if reward_entry.get("call_type") != "planner_main":
+                            call_index = reward_entry.get("call_index")
+                            raw_call = raw_lookup.get(agent_idx, {}).get(call_index)
+                            if raw_call is None:
+                                continue
+                            semantic_mode = self.classify_action_mode_from_output(
+                                raw_call.get("output") or ""
+                            )
+                            if semantic_mode != "planner_main":
                                 continue
                             sequence_reward = float(reward_entry.get("sequence_reward", 0.0) or 0.0)
                             if sequence_reward <= 0.0:
                                 continue
                             prefix_safe = True
                             for prefix_step_idx, prefix_reward_step in enumerate(rewards[: step_idx + 1]):
+                                prefix_timeline = data.get("content") or []
+                                prefix_original_log = (
+                                    (((prefix_timeline[prefix_step_idx] or {}).get("content") or {}).get("original_log")) or []
+                                    if prefix_step_idx < len(prefix_timeline)
+                                    else []
+                                )
+                                prefix_raw_lookup = {
+                                    idx: {
+                                        raw_call.get("call_index"): raw_call
+                                        for raw_call in (agent_calls or [])
+                                    }
+                                    for idx, agent_calls in enumerate(prefix_original_log)
+                                }
                                 for prefix_entry in (
                                     (prefix_reward_step.get("per_agent") or [])[agent_idx].get("calls") or []
                                 ):
                                     if prefix_step_idx == step_idx and prefix_entry.get("call_index") == reward_entry.get("call_index"):
                                         break
-                                    if prefix_entry.get("call_type") != "communication":
+                                    prefix_raw_call = prefix_raw_lookup.get(agent_idx, {}).get(
+                                        prefix_entry.get("call_index")
+                                    )
+                                    if prefix_raw_call is None:
+                                        continue
+                                    prefix_mode = self.classify_action_mode_from_output(
+                                        prefix_raw_call.get("output") or ""
+                                    )
+                                    if prefix_mode != "communication":
                                         continue
                                     action_text = str(prefix_entry.get("action") or "").strip().lower()
                                     if action_text.startswith(("request(", "seek(", "ack(", "deny(")):
@@ -759,6 +806,123 @@ class RewardAssignmentTest(unittest.TestCase):
         self.assertAlmostEqual(records[1].reward, 0.6554694229112834)
         self.assertEqual(records[1].metadata["reward_breakdown"]["call_type"], "planner_main")
 
+    def test_all_azure_gpt4o_baked_bell_pepper_logs_preserve_reward_assignment(self):
+        session = CollabMainSession.__new__(CollabMainSession)
+        root = REPO_ROOT / "assets/data/batch_results/azure-gpt-4o/json/baked_bell_pepper"
+        self.assertTrue(root.exists(), f"Missing azure-gpt-4o fixture dir: {root}")
+        checked_calls = 0
+
+        for path in sorted(root.glob("*.json")):
+            data = self.load_real_log(path)
+            timeline = data.get("content") or []
+            rewards = data.get("process_rewards") or []
+            self.assertEqual(
+                len(timeline),
+                len(rewards),
+                f"Timeline/process_rewards length mismatch in {path.name}",
+            )
+
+            for step_idx, process_reward in enumerate(rewards):
+                original_log = (((timeline[step_idx] or {}).get("content") or {}).get("original_log")) or []
+                records = []
+                for agent_calls in original_log:
+                    records.extend(
+                        self.build_records_from_log_calls(
+                            agent_calls, inject_action_mode=True
+                        )
+                    )
+
+                session._assign_call_rewards(records, process_reward, done_flag=False)
+
+                for agent_idx, agent_reward in enumerate(process_reward.get("per_agent") or []):
+                    reward_calls = agent_reward.get("calls") or []
+                    if not reward_calls:
+                        continue
+                    record_lookup = {
+                        int(record.metadata.get("call_index")): record
+                        for record in records
+                        if record.agent_index == agent_idx
+                        and record.metadata.get("call_index") is not None
+                    }
+
+                    for reward_entry in reward_calls:
+                        call_index = reward_entry.get("call_index")
+                        self.assertIn(
+                            int(call_index),
+                            record_lookup,
+                            f"Missing record for {path.name} step={step_idx} agent={agent_idx} call_index={call_index}",
+                        )
+                        record = record_lookup[int(call_index)]
+                        breakdown = record.metadata.get("reward_breakdown") or {}
+                        expected_seq = float(
+                            reward_entry.get("sequence_reward", 0.0) or 0.0
+                        )
+                        expected_fmt = float(
+                            reward_entry.get("format_reward", 0.0) or 0.0
+                        )
+                        expected_validator = float(
+                            reward_entry.get("validator_reward", 0.0) or 0.0
+                        )
+                        expected_comm = float(
+                            reward_entry.get("communication_reward", 0.0) or 0.0
+                        )
+                        expected_paired_comm = float(
+                            reward_entry.get("paired_comm_reward", 0.0) or 0.0
+                        )
+                        expected_total = (
+                            expected_seq
+                            + expected_fmt
+                            + expected_validator
+                            + expected_comm
+                            + expected_paired_comm
+                        )
+
+                        with self.subTest(
+                            path=path.name,
+                            step=step_idx,
+                            agent=agent_idx,
+                            call_index=call_index,
+                            semantic_call_type=record.metadata.get("semantic_call_type"),
+                        ):
+                            self.assertAlmostEqual(record.reward, expected_total)
+                            self.assertAlmostEqual(
+                                float(breakdown.get("sequence_reward", 0.0) or 0.0),
+                                expected_seq,
+                            )
+                            self.assertAlmostEqual(
+                                float(breakdown.get("format_reward", 0.0) or 0.0),
+                                expected_fmt,
+                            )
+                            self.assertAlmostEqual(
+                                float(
+                                    breakdown.get("validator_reward", 0.0) or 0.0
+                                ),
+                                expected_validator,
+                            )
+                            self.assertAlmostEqual(
+                                float(
+                                    breakdown.get("communication_reward", 0.0)
+                                    or 0.0
+                                ),
+                                expected_comm,
+                            )
+                            self.assertAlmostEqual(
+                                float(breakdown.get("paired_comm_reward", 0.0) or 0.0),
+                                expected_paired_comm,
+                            )
+                            action_mode = record.metadata.get("action_mode")
+                            semantic_call_type = record.metadata.get(
+                                "semantic_call_type"
+                            ) or record.metadata.get("call_type")
+                            if action_mode in {"planner_main", "communication"}:
+                                self.assertEqual(
+                                    semantic_call_type,
+                                    action_mode,
+                                )
+                            checked_calls += 1
+
+        self.assertGreater(checked_calls, 0)
+
     def test_batch_sampled_real_cases_match_expected_reward_values(self):
         session = CollabMainSession.__new__(CollabMainSession)
         sampled_cases = self.collect_real_reward_cases()
@@ -799,7 +963,8 @@ class RewardAssignmentTest(unittest.TestCase):
                         float(breakdown.get("sequence_reward", 0.0))
                         + float(breakdown.get("format_reward", 0.0))
                         + float(breakdown.get("validator_reward", 0.0))
-                        + float(breakdown.get("communication_reward", 0.0)),
+                        + float(breakdown.get("communication_reward", 0.0))
+                        + float(breakdown.get("paired_comm_reward", 0.0)),
                     )
                     continue
 
@@ -851,7 +1016,8 @@ class RewardAssignmentTest(unittest.TestCase):
                         breakdown["sequence_reward"]
                         + breakdown["format_reward"]
                         + breakdown["validator_reward"]
-                        + breakdown["communication_reward"],
+                        + breakdown["communication_reward"]
+                        + float(breakdown.get("paired_comm_reward", 0.0)),
                     )
 
         self.assertGreaterEqual(fmt_hits, 10)
