@@ -13,9 +13,9 @@ reward:
 trainer:
   type: mappo
   collect_only: true
-  off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/snapshots/one_episode.jsonl
+  off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/snapshots/one_episode.jsonl
   steps_per_update: 256
-  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/rollouts_kl
+  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/rollouts_kl
   model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
   lora_path: null
   actor_adapters:
@@ -32,7 +32,7 @@ trainer:
       r: 16
       alpha: 32
       dropout: 0.05
-  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/latest_model_kl.json
+  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/latest_model_kl.json
   generation_temperature: 0.7
   evaluation_batch_size: 32
   max_new_tokens: 512

@@ -60,6 +60,43 @@ def _resolve_lora_dir(raw: str, base_dir: Path) -> str:
     return str(path)
 
 
+def _map_generated_path(path_str: str, repo_root: Path, experiment_root: Path) -> str:
+    path = Path(path_str)
+    if not path.is_absolute():
+        return path_str
+    try:
+        rel = path.relative_to(repo_root)
+    except ValueError:
+        return path_str
+    return str((experiment_root / rel).resolve())
+
+
+def _rewrite_experiment_paths(trainer: dict, repo_root: Path) -> None:
+    experiment_root_raw = os.environ.get("RL_EXPERIMENT_ROOT", "").strip()
+    if not experiment_root_raw:
+        return
+    experiment_root = Path(experiment_root_raw).resolve()
+    path_keys = [
+        "rollout_dir",
+        "output_dir",
+        "export_latest_dir",
+        "latest_model_path_file",
+        "initial_rollout_cache_dir",
+        "off_policy_snapshots",
+    ]
+    for key in path_keys:
+        value = trainer.get(key)
+        if isinstance(value, str) and value:
+            trainer[key] = _map_generated_path(value, repo_root, experiment_root)
+        elif isinstance(value, list):
+            trainer[key] = [
+                _map_generated_path(item, repo_root, experiment_root)
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+
+
 def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
     latest_file = trainer.get("latest_model_path_file")
     if not latest_file:
@@ -120,6 +157,7 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
 
     data = yaml.safe_load(src_cfg.read_text(encoding="utf-8"))
     trainer = data.setdefault("trainer", {})
+    _rewrite_experiment_paths(trainer, repo_root)
     _apply_latest_override(trainer, repo_root)
     for key in [
         "rollout_dir",

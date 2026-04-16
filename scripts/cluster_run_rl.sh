@@ -38,6 +38,8 @@ visible_gpu_count() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXPERIMENT_ROOT="${RL_EXPERIMENT_ROOT:-$REPO_ROOT}"
+EXPERIMENT_ROOT="$(abs_path "$EXPERIMENT_ROOT")"
 COLLAB_ENV="$(abs_path "$1")"
 shift || true
 
@@ -120,6 +122,7 @@ fi
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 export RL_REPO_ROOT="$REPO_ROOT"
+export RL_EXPERIMENT_ROOT="$EXPERIMENT_ROOT"
 export RL_VLLM_HOST="$VLLM_HOST"
 export RL_VLLM_START_PORT="$VLLM_START_PORT"
 export RL_VLLM_API_KEY="$API_KEY"
@@ -165,7 +168,12 @@ case "$VLLM_MODE" in
         ;;
 esac
 
-mkdir -p "$REPO_ROOT/runs/rl" "$REPO_ROOT/rollouts_kl" "$REPO_ROOT/rollouts_eval_kl" "$REPO_ROOT/logs/rl_vllm"
+LOG_ROOT="$EXPERIMENT_ROOT/logs"
+RUNS_ROOT="$EXPERIMENT_ROOT/runs/rl"
+ROLLOUT_ROOT="$EXPERIMENT_ROOT/rollouts_kl"
+ROLLOUT_EVAL_ROOT="$EXPERIMENT_ROOT/rollouts_eval_kl"
+
+mkdir -p "$RUNS_ROOT" "$ROLLOUT_ROOT" "$ROLLOUT_EVAL_ROOT" "$LOG_ROOT/rl_vllm" "$LOG_ROOT/rl_workers"
 find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
 
 VLLM_PIDS=()
@@ -173,6 +181,7 @@ VLLM_PORTS=()
 VLLM_ENGINE_PORTS=()
 VLLM_INTERNAL_PORT_BASES=()
 VLLM_INTERNAL_PORT_SPAN="${RL_VLLM_INTERNAL_PORT_SPAN:-20}"
+TAIL_FAILED_LOGS="${RL_TAIL_FAILED_LOGS:-0}"
 cleanup() {
     stop_vllm_servers
 }
@@ -315,7 +324,11 @@ wait_for_port() {
     for _ in $(seq 1 180); do
         if ! ps -p "$pid" >/dev/null 2>&1; then
             echo "[cluster-rl] vLLM exited early on $host:$port; log=$log_file" >&2
-            tail -n 100 "$log_file" >&2 || true
+            if [[ "$TAIL_FAILED_LOGS" == "1" ]]; then
+                tail -n 100 "$log_file" >&2 || true
+            else
+                echo "[cluster-rl] inspect with: tail -n 100 $log_file" >&2
+            fi
             return 1
         fi
         if python - <<PY
@@ -336,7 +349,11 @@ PY
         sleep 1
     done
     echo "[cluster-rl] timeout waiting for $host:$port; log=$log_file" >&2
-    tail -n 100 "$log_file" >&2 || true
+    if [[ "$TAIL_FAILED_LOGS" == "1" ]]; then
+        tail -n 100 "$log_file" >&2 || true
+    else
+        echo "[cluster-rl] inspect with: tail -n 100 $log_file" >&2
+    fi
     return 1
 }
 
@@ -356,7 +373,7 @@ start_vllm_servers() {
         for ((offset=0; offset<VLLM_INTERNAL_PORT_SPAN; offset++)); do
             kill_port_listener "$((internal_port_base + offset))"
         done
-        local log_file="$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
+        local log_file="$LOG_ROOT/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
         echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port engine_port=$engine_port internal_port_base=$internal_port_base"
         "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
             --gpu "$gpu" \
@@ -378,7 +395,7 @@ start_vllm_servers() {
 
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
-        wait_for_port "$VLLM_HOST" "$port" "${VLLM_PIDS[$gpu]}" "$REPO_ROOT/logs/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
+        wait_for_port "$VLLM_HOST" "$port" "${VLLM_PIDS[$gpu]}" "$LOG_ROOT/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
     done
 }
 
@@ -396,10 +413,10 @@ run_stage_workers() {
     local worker_pids=()
     local worker_logs=()
     local status=0
-    mkdir -p "$REPO_ROOT/logs/rl_workers"
+    mkdir -p "$LOG_ROOT/rl_workers"
     for ((worker_id=0; worker_id<total_workers; worker_id++)); do
         local rank=$((worker_id % NUM_PROCS))
-        local log_file="$REPO_ROOT/logs/rl_workers/${stage_name}_worker${worker_id}_gpu${rank}.log"
+        local log_file="$LOG_ROOT/rl_workers/${stage_name}_worker${worker_id}_gpu${rank}.log"
         worker_logs+=("$log_file")
         echo "[cluster-rl] starting worker stage=$stage_name worker=$worker_id gpu=$rank log=$log_file"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
@@ -419,7 +436,11 @@ run_stage_workers() {
         if ! wait "$pid"; then
             status=1
             echo "[cluster-rl] worker failed stage=$stage_name worker=$idx log=${worker_logs[$idx]}" >&2
-            tail -n 80 "${worker_logs[$idx]}" >&2 || true
+            if [[ "$TAIL_FAILED_LOGS" == "1" ]]; then
+                tail -n 80 "${worker_logs[$idx]}" >&2 || true
+            else
+                echo "[cluster-rl] inspect with: tail -n 80 ${worker_logs[$idx]}" >&2
+            fi
         fi
     done
     return "$status"
@@ -462,8 +483,8 @@ run_stage() {
         fi
         return $worker_status
     else
-        mkdir -p "$REPO_ROOT/logs/rl_workers"
-        local train_log="$REPO_ROOT/logs/rl_workers/${stage_name}_accelerate.log"
+        mkdir -p "$LOG_ROOT/rl_workers"
+        local train_log="$LOG_ROOT/rl_workers/${stage_name}_accelerate.log"
         ensure_train_master_port "$MASTER_PORT"
         echo "[cluster-rl] accelerate log=$train_log"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \

@@ -31,13 +31,13 @@ trainer:
       r: 16
       alpha: 32
       dropout: 0.05
-  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/rollouts_eval_kl
-  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/latest_model_kl.json
+  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/rollouts_eval_kl
+  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/latest_model_kl.json
   generation_temperature: 0.0
   max_new_tokens: 512
   evaluation_batch_size: 32
   fix_mistral_regex: true
-  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/results/rl_eval_kl
+  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/results/rl_eval_kl
 agents:
   num_agents: 2
   agent_0:
