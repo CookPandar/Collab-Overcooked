@@ -172,11 +172,13 @@ LOG_ROOT="$EXPERIMENT_ROOT/logs"
 RUNS_ROOT="$EXPERIMENT_ROOT/runs/rl"
 ROLLOUT_ROOT="$EXPERIMENT_ROOT/rollouts_kl"
 ROLLOUT_EVAL_ROOT="$EXPERIMENT_ROOT/rollouts_eval_kl"
+STATE_ROOT="$LOG_ROOT/rl_runtime"
 
-mkdir -p "$RUNS_ROOT" "$ROLLOUT_ROOT" "$ROLLOUT_EVAL_ROOT" "$LOG_ROOT/rl_vllm" "$LOG_ROOT/rl_workers"
+mkdir -p "$RUNS_ROOT" "$ROLLOUT_ROOT" "$ROLLOUT_EVAL_ROOT" "$LOG_ROOT/rl_vllm" "$LOG_ROOT/rl_workers" "$STATE_ROOT"
 find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
 
 VLLM_PIDS=()
+VLLM_PGIDS=()
 VLLM_PORTS=()
 VLLM_ENGINE_PORTS=()
 VLLM_INTERNAL_PORT_BASES=()
@@ -186,6 +188,51 @@ cleanup() {
     stop_vllm_servers
 }
 trap cleanup EXIT
+
+process_exists() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1
+}
+
+kill_process_group() {
+    local pgid="$1"
+    [[ -n "$pgid" ]] || return 0
+    kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
+    sleep 1
+    kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
+}
+
+write_list_file() {
+    local path="$1"
+    shift || true
+    : > "$path"
+    local item
+    for item in "$@"; do
+        [[ -n "$item" ]] && printf '%s\n' "$item" >> "$path"
+    done
+}
+
+save_runtime_state() {
+    printf 'experiment_root=%s\n' "$EXPERIMENT_ROOT" > "$STATE_ROOT/meta.env"
+    printf 'log_root=%s\n' "$LOG_ROOT" >> "$STATE_ROOT/meta.env"
+    printf 'num_procs=%s\n' "$NUM_PROCS" >> "$STATE_ROOT/meta.env"
+    printf 'vllm_start_port=%s\n' "$VLLM_START_PORT" >> "$STATE_ROOT/meta.env"
+    printf 'vllm_internal_port_span=%s\n' "$VLLM_INTERNAL_PORT_SPAN" >> "$STATE_ROOT/meta.env"
+    write_list_file "$STATE_ROOT/vllm_pids.txt" "${VLLM_PIDS[@]:-}"
+    write_list_file "$STATE_ROOT/vllm_pgids.txt" "${VLLM_PGIDS[@]:-}"
+    write_list_file "$STATE_ROOT/vllm_ports.txt" "${VLLM_PORTS[@]:-}"
+    write_list_file "$STATE_ROOT/vllm_engine_ports.txt" "${VLLM_ENGINE_PORTS[@]:-}"
+    write_list_file "$STATE_ROOT/vllm_internal_bases.txt" "${VLLM_INTERNAL_PORT_BASES[@]:-}"
+}
+
+save_worker_state() {
+    write_list_file "$STATE_ROOT/worker_pids.txt" "$@"
+}
+
+clear_worker_state() {
+    : > "$STATE_ROOT/worker_pids.txt"
+}
 
 kill_port_listener() {
     local port="$1"
@@ -282,6 +329,7 @@ reserve_vllm_port_block() {
             VLLM_START_PORT="$candidate"
             export RL_VLLM_START_PORT="$VLLM_START_PORT"
             echo "[cluster-rl] reserved vLLM port block start=$VLLM_START_PORT count=$count internal_span=$per_gpu_internal_span"
+            save_runtime_state
             return 0
         fi
         try_idx=$((try_idx + 1))
@@ -291,9 +339,20 @@ reserve_vllm_port_block() {
 }
 
 stop_vllm_servers() {
-    for pid in "${VLLM_PIDS[@]:-}"; do
-        if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
-            kill "$pid" || true
+    for idx in "${!VLLM_PIDS[@]}"; do
+        local pid="${VLLM_PIDS[$idx]}"
+        local pgid=""
+        if [[ "$idx" -lt "${#VLLM_PGIDS[@]}" ]]; then
+            pgid="${VLLM_PGIDS[$idx]}"
+        fi
+        if process_exists "$pid"; then
+            if [[ -n "$pgid" ]]; then
+                kill_process_group "$pgid"
+            else
+                kill "$pid" >/dev/null 2>&1 || true
+                sleep 1
+                kill -9 "$pid" >/dev/null 2>&1 || true
+            fi
             wait "$pid" || true
         fi
     done
@@ -311,9 +370,11 @@ stop_vllm_servers() {
         fi
     done
     VLLM_PIDS=()
+    VLLM_PGIDS=()
     VLLM_PORTS=()
     VLLM_ENGINE_PORTS=()
     VLLM_INTERNAL_PORT_BASES=()
+    save_runtime_state
 }
 
 wait_for_port() {
@@ -375,23 +436,48 @@ start_vllm_servers() {
         done
         local log_file="$LOG_ROOT/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
         echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port engine_port=$engine_port internal_port_base=$internal_port_base"
-        "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
-            --gpu "$gpu" \
-            --port "$port" \
-            --engine-port "$engine_port" \
-            --internal-port-base "$internal_port_base" \
-            --model "$VLLM_MODEL_PATH" \
-            --config "$cfg_path" \
-            --served-model-name "$SERVED_MODEL_NAME" \
-            --gpu-memory-utilization "$GPU_MEM" \
-            --max-model-len "$MAX_MODEL_LEN" \
-            --api-key "$API_KEY" \
-            --max-loras "$MAX_LORAS" \
-            --max-lora-rank "$MAX_LORA_RANK" \
-            $([[ "$ENFORCE_EAGER" == "1" ]] && echo "--enforce-eager") \
-            >"$log_file" 2>&1 &
-        VLLM_PIDS+=("$!")
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
+                --gpu "$gpu" \
+                --port "$port" \
+                --engine-port "$engine_port" \
+                --internal-port-base "$internal_port_base" \
+                --model "$VLLM_MODEL_PATH" \
+                --config "$cfg_path" \
+                --served-model-name "$SERVED_MODEL_NAME" \
+                --gpu-memory-utilization "$GPU_MEM" \
+                --max-model-len "$MAX_MODEL_LEN" \
+                --api-key "$API_KEY" \
+                --max-loras "$MAX_LORAS" \
+                --max-lora-rank "$MAX_LORA_RANK" \
+                $([[ "$ENFORCE_EAGER" == "1" ]] && echo "--enforce-eager") \
+                >"$log_file" 2>&1 &
+        else
+            "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
+                --gpu "$gpu" \
+                --port "$port" \
+                --engine-port "$engine_port" \
+                --internal-port-base "$internal_port_base" \
+                --model "$VLLM_MODEL_PATH" \
+                --config "$cfg_path" \
+                --served-model-name "$SERVED_MODEL_NAME" \
+                --gpu-memory-utilization "$GPU_MEM" \
+                --max-model-len "$MAX_MODEL_LEN" \
+                --api-key "$API_KEY" \
+                --max-loras "$MAX_LORAS" \
+                --max-lora-rank "$MAX_LORA_RANK" \
+                $([[ "$ENFORCE_EAGER" == "1" ]] && echo "--enforce-eager") \
+                >"$log_file" 2>&1 &
+        fi
+        local vllm_pid="$!"
+        local vllm_pgid=""
+        if command -v ps >/dev/null 2>&1; then
+            vllm_pgid="$(ps -o pgid= -p "$vllm_pid" 2>/dev/null | tr -d ' ' || true)"
+        fi
+        VLLM_PIDS+=("$vllm_pid")
+        VLLM_PGIDS+=("$vllm_pgid")
     done
+    save_runtime_state
 
     for ((gpu=0; gpu<count; gpu++)); do
         local port=$((VLLM_START_PORT + gpu))
@@ -430,6 +516,7 @@ run_stage_workers() {
             >"$log_file" 2>&1 &
         worker_pids+=("$!")
     done
+    save_worker_state "${worker_pids[@]}"
 
     for idx in "${!worker_pids[@]}"; do
         local pid="${worker_pids[$idx]}"
@@ -441,8 +528,33 @@ run_stage_workers() {
             else
                 echo "[cluster-rl] inspect with: tail -n 80 ${worker_logs[$idx]}" >&2
             fi
+            for other_idx in "${!worker_pids[@]}"; do
+                if [[ "$other_idx" != "$idx" ]]; then
+                    local other_pid="${worker_pids[$other_idx]}"
+                    if process_exists "$other_pid"; then
+                        kill "$other_pid" >/dev/null 2>&1 || true
+                    fi
+                fi
+            done
+            sleep 1
+            for other_idx in "${!worker_pids[@]}"; do
+                if [[ "$other_idx" != "$idx" ]]; then
+                    local other_pid="${worker_pids[$other_idx]}"
+                    if process_exists "$other_pid"; then
+                        kill -9 "$other_pid" >/dev/null 2>&1 || true
+                    fi
+                fi
+            done
+            if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+                stop_vllm_servers
+            fi
+            break
         fi
     done
+    for pid in "${worker_pids[@]}"; do
+        wait "$pid" >/dev/null 2>&1 || true
+    done
+    clear_worker_state
     return "$status"
 }
 

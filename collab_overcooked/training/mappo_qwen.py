@@ -1691,11 +1691,13 @@ class MAPPOTrainer:
             "agent0_format": 0.0,
             "agent0_validator": 0.0,
             "agent0_comm": 0.0,
+            "agent0_paired_comm": 0.0,
             "agent1_total": 0.0,
             "agent1_sequence": 0.0,
             "agent1_format": 0.0,
             "agent1_validator": 0.0,
             "agent1_comm": 0.0,
+            "agent1_paired_comm": 0.0,
             "team_total": 0.0,
         }
 
@@ -1740,8 +1742,8 @@ class MAPPOTrainer:
             return
         header = (
             "row_idx,update_idx,episode_idx,episode_return,episode_len,had_positive,rank,"
-            "agent0_custom_return,agent0_sequence_sum,agent0_format_sum,agent0_validator_sum,agent0_comm_sum,"
-            "agent1_custom_return,agent1_sequence_sum,agent1_format_sum,agent1_validator_sum,agent1_comm_sum,"
+            "agent0_custom_return,agent0_sequence_sum,agent0_format_sum,agent0_validator_sum,agent0_comm_sum,agent0_paired_comm_sum,"
+            "agent1_custom_return,agent1_sequence_sum,agent1_format_sum,agent1_validator_sum,agent1_comm_sum,agent1_paired_comm_sum,"
             "team_custom_return"
         )
         row_idx, _ = self._prepare_csv_log(self._episode_log_path, header)
@@ -1754,10 +1756,11 @@ class MAPPOTrainer:
                 f"{episode_len},{1 if had_positive else 0},{rank},"
                 f"{custom_stats.get('agent0_total', 0.0)},{custom_stats.get('agent0_sequence', 0.0)},"
                 f"{custom_stats.get('agent0_format', 0.0)},{custom_stats.get('agent0_validator', 0.0)},"
-                f"{custom_stats.get('agent0_comm', 0.0)},"
+                f"{custom_stats.get('agent0_comm', 0.0)},{custom_stats.get('agent0_paired_comm', 0.0)},"
                 f"{custom_stats.get('agent1_total', 0.0)},{custom_stats.get('agent1_sequence', 0.0)},"
                 f"{custom_stats.get('agent1_format', 0.0)},{custom_stats.get('agent1_validator', 0.0)},"
-                f"{custom_stats.get('agent1_comm', 0.0)},{custom_stats.get('team_total', 0.0)}\n"
+                f"{custom_stats.get('agent1_comm', 0.0)},{custom_stats.get('agent1_paired_comm', 0.0)},"
+                f"{custom_stats.get('team_total', 0.0)}\n"
             )
 
     def _extract_step_custom_reward_stats(
