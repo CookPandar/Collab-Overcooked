@@ -1276,6 +1276,19 @@ class MAPPOTrainer:
         self.enable_fresh_value_metrics = bool(
             trainer_cfg.get("enable_fresh_value_metrics", False)
         )
+        self.actor_freeze_updates = max(
+            0, int(trainer_cfg.get("actor_freeze_updates", 0))
+        )
+        self.critic_stability_window = max(
+            0, int(trainer_cfg.get("critic_stability_window", 0))
+        )
+        critic_threshold_cfg = trainer_cfg.get("critic_value_loss_threshold", None)
+        self.critic_value_loss_threshold = (
+            float(critic_threshold_cfg) if critic_threshold_cfg is not None else None
+        )
+        self.critic_value_loss_tolerance = float(
+            trainer_cfg.get("critic_value_loss_tolerance", 0.0)
+        )
         self.load_policy_model = self.train_only or (
             self.collect_only and self.compute_values_in_collect
         )
@@ -1553,6 +1566,65 @@ class MAPPOTrainer:
             elif name == "value_head":
                 current["value_head_lr"] = lr
         return current
+
+    def _recent_train_curve_rows(self, limit: int) -> List[Dict[str, str]]:
+        if limit <= 0:
+            return []
+        path = self.output_dir / "train_curve.csv"
+        if not path.exists():
+            return []
+        try:
+            lines = [
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except OSError:
+            return []
+        if len(lines) <= 1:
+            return []
+        header = lines[0].split(",")
+        rows: List[Dict[str, str]] = []
+        for line in lines[1:]:
+            values = line.split(",")
+            if len(values) != len(header):
+                continue
+            rows.append(dict(zip(header, values)))
+        return rows[-limit:]
+
+    def _critic_warmup_status(self, update_idx: int) -> Tuple[bool, str]:
+        if int(update_idx) <= self.actor_freeze_updates:
+            return True, f"min_updates<{self.actor_freeze_updates}"
+        if (
+            self.critic_stability_window <= 0
+            or self.critic_value_loss_threshold is None
+        ):
+            return False, "disabled"
+        recent_rows = self._recent_train_curve_rows(self.critic_stability_window)
+        if len(recent_rows) < self.critic_stability_window:
+            return True, (
+                f"need_history<{self.critic_stability_window}"
+            )
+        value_losses: List[float] = []
+        for row in recent_rows:
+            raw = row.get("value_loss", "")
+            try:
+                value_losses.append(float(raw))
+            except (TypeError, ValueError):
+                return True, "invalid_history"
+        if len(value_losses) < self.critic_stability_window:
+            return True, "invalid_history"
+        mean_loss = sum(value_losses) / float(len(value_losses))
+        span_loss = max(value_losses) - min(value_losses)
+        if mean_loss > float(self.critic_value_loss_threshold):
+            return True, (
+                f"value_loss_mean>{self.critic_value_loss_threshold}"
+            )
+        if span_loss > float(self.critic_value_loss_tolerance):
+            return True, (
+                f"value_loss_span>{self.critic_value_loss_tolerance}"
+            )
+        return False, "stable"
 
     def _runtime_stage_round_idx(self) -> int:
         raw = os.getenv("RL_STAGE_ROUND_IDX", "").strip()
@@ -2536,6 +2608,9 @@ class MAPPOTrainer:
                 f"[TrainOnly] Update {update_idx}: rank={self.accelerator.process_index} "
                 f"local shard transitions={len(local_transitions)}"
             )
+            local_transitions_for_logging = local_transitions[
+                : getattr(self, "_last_local_shard_valid_count", len(local_transitions))
+            ]
             self.accelerator.print(
                 f"[TrainOnly] Update {update_idx}: begin materialize_transition_values()"
             )
@@ -2565,7 +2640,7 @@ class MAPPOTrainer:
                 f"rank={self.accelerator.process_index}",
                 flush=True,
             )
-            self.log_rewards(update_idx, transitions)
+            self.log_rewards(update_idx, local_transitions_for_logging)
             print(
                 "[MAPPO] train_only after log_rewards "
                 f"rank={self.accelerator.process_index}",
@@ -2576,7 +2651,7 @@ class MAPPOTrainer:
                 f"rank={self.accelerator.process_index}",
                 flush=True,
             )
-            self.log_train_metrics(update_idx, loss_dict, transitions)
+            self.log_train_metrics(update_idx, loss_dict, local_transitions_for_logging)
             print(
                 "[MAPPO] train_only after log_train_metrics "
                 f"rank={self.accelerator.process_index}",
@@ -3068,6 +3143,10 @@ class MAPPOTrainer:
             self.text_policy
         )
         rank = self.accelerator.process_index
+        current_update_idx = self._current_train_round_idx()
+        actor_frozen, actor_freeze_reason = self._critic_warmup_status(
+            current_update_idx
+        )
         prompt_tensors = [t.prompt_ids for t in transitions]
         response_tensors = [t.response_ids for t in transitions]
         critic_tensors = [t.critic_input_ids for t in transitions]
@@ -3120,7 +3199,8 @@ class MAPPOTrainer:
             f"rank={rank} transitions={num_transitions} batch_size={batch_size} "
             f"epochs={self.update_epochs} minibatches={num_minibatches} "
             f"grad_accum={self.gradient_accumulation_steps} "
-            f"optimizer_steps_per_update={optimizer_steps_per_update}",
+            f"optimizer_steps_per_update={optimizer_steps_per_update} "
+            f"actor_frozen={actor_frozen} reason={actor_freeze_reason}",
             flush=True,
         )
         scheduler = self._build_lr_scheduler(optimizer_steps_per_update)
@@ -3148,7 +3228,7 @@ class MAPPOTrainer:
         actual_optimization_steps = 0
         accum_counter = 0
         stop_early = False
-        stop_policy_updates = False
+        stop_policy_updates = actor_frozen
         accum_approx_kl_sum = 0.0
         accum_approx_kl_count = 0
 
@@ -3576,6 +3656,7 @@ class MAPPOTrainer:
             "value_clipfrac": avg_value_clipfrac,
             "optimizer_steps": float(actual_optimization_steps),
             "stopped_early": 1.0 if stop_early else 0.0,
+            "actor_frozen": 1.0 if actor_frozen else 0.0,
         }
         step_denom = (
             float(actual_optimization_steps) if actual_optimization_steps > 0 else 1.0
@@ -3615,8 +3696,6 @@ class MAPPOTrainer:
         return result
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
-        if not self.accelerator.is_main_process:
-            return
         num = len(transitions)
         agent_stats: Dict[int, Dict[str, float]] = {}
         agent_counts: Dict[int, int] = {}
@@ -3632,43 +3711,43 @@ class MAPPOTrainer:
                     "comm": 0.0,
                     "breakdown_total": 0.0,
                     "legacy_process": 0.0,
+                    "rl_nonzero": 0.0,
+                    "format_nonzero": 0.0,
+                    "validator_nonzero": 0.0,
+                    "sequence_nonzero": 0.0,
+                    "comm_nonzero": 0.0,
+                    "breakdown_total_nonzero": 0.0,
+                    "legacy_process_nonzero": 0.0,
                 },
             )
             agent_counts[idx] = agent_counts.get(idx, 0) + 1
-            stats["rl"] += float(getattr(t, "reward", 0.0))
-            stats["format"] += float(getattr(t, "format_reward", 0.0))
-            stats["validator"] += float(getattr(t, "validator_reward", 0.0))
-            stats["sequence"] += float(getattr(t, "sequence_reward", 0.0))
-            stats["comm"] += float(getattr(t, "communication_reward", 0.0))
-            stats["breakdown_total"] += float(getattr(t, "breakdown_total_reward", 0.0))
-            stats["legacy_process"] += float(getattr(t, "process_reward", getattr(t, "reward", 0.0)))
-        log_path = self.output_dir / "reward_curve.csv"
-        header = (
-            "row_idx,update_idx,step,num_transitions,"
-            "agent0_n,agent1_n,"
-            "agent0_rl_sum,agent0_rl_mean,"
-            "agent0_format_sum,agent0_format_mean,"
-            "agent0_validator_sum,agent0_validator_mean,"
-            "agent0_sequence_sum,agent0_sequence_mean,"
-            "agent0_comm_sum,agent0_comm_mean,"
-            "agent0_breakdown_total_sum,agent0_breakdown_total_mean,"
-            "agent0_legacy_process_sum,agent0_legacy_process_mean,"
-            "agent1_rl_sum,agent1_rl_mean,"
-            "agent1_format_sum,agent1_format_mean,"
-            "agent1_validator_sum,agent1_validator_mean,"
-            "agent1_sequence_sum,agent1_sequence_mean,"
-            "agent1_comm_sum,agent1_comm_mean,"
-            "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
-            "agent1_legacy_process_sum,agent1_legacy_process_mean"
-        )
-        row_idx, last_row = self._prepare_csv_log(log_path, header)
-        prev_step = 0
-        if last_row is not None:
-            try:
-                prev_step = int(float(last_row.get("step", "0") or 0))
-            except (TypeError, ValueError):
-                prev_step = 0
-        step_est = prev_step + num
+            rl_value = float(getattr(t, "reward", 0.0))
+            format_value = float(getattr(t, "format_reward", 0.0))
+            validator_value = float(getattr(t, "validator_reward", 0.0))
+            sequence_value = float(getattr(t, "sequence_reward", 0.0))
+            comm_value = float(getattr(t, "communication_reward", 0.0))
+            breakdown_total_value = float(getattr(t, "breakdown_total_reward", 0.0))
+            legacy_process_value = float(
+                getattr(t, "process_reward", getattr(t, "reward", 0.0))
+            )
+            stats["rl"] += rl_value
+            stats["format"] += format_value
+            stats["validator"] += validator_value
+            stats["sequence"] += sequence_value
+            stats["comm"] += comm_value
+            stats["breakdown_total"] += breakdown_total_value
+            stats["legacy_process"] += legacy_process_value
+            stats["rl_nonzero"] += 1.0 if rl_value != 0.0 else 0.0
+            stats["format_nonzero"] += 1.0 if format_value != 0.0 else 0.0
+            stats["validator_nonzero"] += 1.0 if validator_value != 0.0 else 0.0
+            stats["sequence_nonzero"] += 1.0 if sequence_value != 0.0 else 0.0
+            stats["comm_nonzero"] += 1.0 if comm_value != 0.0 else 0.0
+            stats["breakdown_total_nonzero"] += (
+                1.0 if breakdown_total_value != 0.0 else 0.0
+            )
+            stats["legacy_process_nonzero"] += (
+                1.0 if legacy_process_value != 0.0 else 0.0
+            )
         a0_stats = agent_stats.get(
             0,
             {
@@ -3679,6 +3758,13 @@ class MAPPOTrainer:
                 "comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
+                "rl_nonzero": 0.0,
+                "format_nonzero": 0.0,
+                "validator_nonzero": 0.0,
+                "sequence_nonzero": 0.0,
+                "comm_nonzero": 0.0,
+                "breakdown_total_nonzero": 0.0,
+                "legacy_process_nonzero": 0.0,
             },
         )
         a1_stats = agent_stats.get(
@@ -3691,10 +3777,151 @@ class MAPPOTrainer:
                 "comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
+                "rl_nonzero": 0.0,
+                "format_nonzero": 0.0,
+                "validator_nonzero": 0.0,
+                "sequence_nonzero": 0.0,
+                "comm_nonzero": 0.0,
+                "breakdown_total_nonzero": 0.0,
+                "legacy_process_nonzero": 0.0,
             },
         )
-        a0_n = int(agent_counts.get(0, 0))
-        a1_n = int(agent_counts.get(1, 0))
+        packed = torch.tensor(
+            [
+                float(num),
+                float(agent_counts.get(0, 0)),
+                float(agent_counts.get(1, 0)),
+                a0_stats["rl"],
+                a0_stats["format"],
+                a0_stats["validator"],
+                a0_stats["sequence"],
+                a0_stats["comm"],
+                a0_stats["breakdown_total"],
+                a0_stats["legacy_process"],
+                a0_stats["rl_nonzero"],
+                a0_stats["format_nonzero"],
+                a0_stats["validator_nonzero"],
+                a0_stats["sequence_nonzero"],
+                a0_stats["comm_nonzero"],
+                a0_stats["breakdown_total_nonzero"],
+                a0_stats["legacy_process_nonzero"],
+                a1_stats["rl"],
+                a1_stats["format"],
+                a1_stats["validator"],
+                a1_stats["sequence"],
+                a1_stats["comm"],
+                a1_stats["breakdown_total"],
+                a1_stats["legacy_process"],
+                a1_stats["rl_nonzero"],
+                a1_stats["format_nonzero"],
+                a1_stats["validator_nonzero"],
+                a1_stats["sequence_nonzero"],
+                a1_stats["comm_nonzero"],
+                a1_stats["breakdown_total_nonzero"],
+                a1_stats["legacy_process_nonzero"],
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        summed = None
+        try:
+            if hasattr(self.accelerator, "reduce"):
+                summed = self.accelerator.reduce(packed, reduction="sum")
+        except Exception:
+            summed = None
+        if summed is None:
+            gathered = self.accelerator.gather(packed)
+            if gathered.ndim == 2 and gathered.shape[-1] == packed.numel():
+                summed = gathered.sum(dim=0)
+            elif gathered.ndim == 1 and gathered.numel() == packed.numel():
+                summed = gathered
+            elif gathered.ndim == 1 and gathered.numel() % packed.numel() == 0:
+                world = int(gathered.numel() // packed.numel())
+                summed = gathered.view(world, packed.numel()).sum(dim=0)
+            else:
+                raise ValueError(
+                    f"Unexpected gathered reward stats shape {tuple(gathered.shape)} "
+                    f"for packed {tuple(packed.shape)}"
+                )
+        (
+            num_f,
+            a0_n_f,
+            a1_n_f,
+            a0_rl_sum,
+            a0_format_sum,
+            a0_validator_sum,
+            a0_sequence_sum,
+            a0_comm_sum,
+            a0_breakdown_total_sum,
+            a0_legacy_process_sum,
+            a0_rl_nonzero,
+            a0_format_nonzero,
+            a0_validator_nonzero,
+            a0_sequence_nonzero,
+            a0_comm_nonzero,
+            a0_breakdown_total_nonzero,
+            a0_legacy_process_nonzero,
+            a1_rl_sum,
+            a1_format_sum,
+            a1_validator_sum,
+            a1_sequence_sum,
+            a1_comm_sum,
+            a1_breakdown_total_sum,
+            a1_legacy_process_sum,
+            a1_rl_nonzero,
+            a1_format_nonzero,
+            a1_validator_nonzero,
+            a1_sequence_nonzero,
+            a1_comm_nonzero,
+            a1_breakdown_total_nonzero,
+            a1_legacy_process_nonzero,
+        ) = [float(x) for x in summed.tolist()]
+        if not self.accelerator.is_main_process:
+            return
+        log_path = self.output_dir / "reward_curve.csv"
+        header = (
+            "row_idx,update_idx,step,num_transitions,"
+            "agent0_n,agent1_n,"
+            "agent0_rl_sum,agent0_rl_mean,"
+            "agent0_rl_nonzero_count,agent0_rl_nonzero_ratio,"
+            "agent0_format_sum,agent0_format_mean,"
+            "agent0_format_nonzero_count,agent0_format_nonzero_ratio,"
+            "agent0_validator_sum,agent0_validator_mean,"
+            "agent0_validator_nonzero_count,agent0_validator_nonzero_ratio,"
+            "agent0_sequence_sum,agent0_sequence_mean,"
+            "agent0_sequence_nonzero_count,agent0_sequence_nonzero_ratio,"
+            "agent0_comm_sum,agent0_comm_mean,"
+            "agent0_comm_nonzero_count,agent0_comm_nonzero_ratio,"
+            "agent0_breakdown_total_sum,agent0_breakdown_total_mean,"
+            "agent0_breakdown_total_nonzero_count,agent0_breakdown_total_nonzero_ratio,"
+            "agent0_legacy_process_sum,agent0_legacy_process_mean,"
+            "agent0_legacy_process_nonzero_count,agent0_legacy_process_nonzero_ratio,"
+            "agent1_rl_sum,agent1_rl_mean,"
+            "agent1_rl_nonzero_count,agent1_rl_nonzero_ratio,"
+            "agent1_format_sum,agent1_format_mean,"
+            "agent1_format_nonzero_count,agent1_format_nonzero_ratio,"
+            "agent1_validator_sum,agent1_validator_mean,"
+            "agent1_validator_nonzero_count,agent1_validator_nonzero_ratio,"
+            "agent1_sequence_sum,agent1_sequence_mean,"
+            "agent1_sequence_nonzero_count,agent1_sequence_nonzero_ratio,"
+            "agent1_comm_sum,agent1_comm_mean,"
+            "agent1_comm_nonzero_count,agent1_comm_nonzero_ratio,"
+            "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
+            "agent1_breakdown_total_nonzero_count,agent1_breakdown_total_nonzero_ratio,"
+            "agent1_legacy_process_sum,agent1_legacy_process_mean"
+            ",agent1_legacy_process_nonzero_count,agent1_legacy_process_nonzero_ratio"
+        )
+        row_idx, last_row = self._prepare_csv_log(log_path, header)
+        prev_step = 0
+        if last_row is not None:
+            try:
+                prev_step = int(float(last_row.get("step", "0") or 0))
+            except (TypeError, ValueError):
+                prev_step = 0
+        num = int(num_f)
+        a0_n = int(a0_n_f)
+        a1_n = int(a1_n_f)
+        step_est = prev_step + num
 
         def _mean(total: float, n: int) -> float:
             return float(total) / float(n) if n > 0 else 0.0
@@ -3703,20 +3930,34 @@ class MAPPOTrainer:
             f.write(
                 f"{row_idx},{update_idx},{step_est},{num},"
                 f"{a0_n},{a1_n},"
-                f"{a0_stats['rl']},{_mean(a0_stats['rl'], a0_n)},"
-                f"{a0_stats['format']},{_mean(a0_stats['format'], a0_n)},"
-                f"{a0_stats['validator']},{_mean(a0_stats['validator'], a0_n)},"
-                f"{a0_stats['sequence']},{_mean(a0_stats['sequence'], a0_n)},"
-                f"{a0_stats['comm']},{_mean(a0_stats['comm'], a0_n)},"
-                f"{a0_stats['breakdown_total']},{_mean(a0_stats['breakdown_total'], a0_n)},"
-                f"{a0_stats['legacy_process']},{_mean(a0_stats['legacy_process'], a0_n)},"
-                f"{a1_stats['rl']},{_mean(a1_stats['rl'], a1_n)},"
-                f"{a1_stats['format']},{_mean(a1_stats['format'], a1_n)},"
-                f"{a1_stats['validator']},{_mean(a1_stats['validator'], a1_n)},"
-                f"{a1_stats['sequence']},{_mean(a1_stats['sequence'], a1_n)},"
-                f"{a1_stats['comm']},{_mean(a1_stats['comm'], a1_n)},"
-                f"{a1_stats['breakdown_total']},{_mean(a1_stats['breakdown_total'], a1_n)},"
-                f"{a1_stats['legacy_process']},{_mean(a1_stats['legacy_process'], a1_n)}\n"
+                f"{a0_rl_sum},{_mean(a0_rl_sum, a0_n)},"
+                f"{a0_rl_nonzero},{_mean(a0_rl_nonzero, a0_n)},"
+                f"{a0_format_sum},{_mean(a0_format_sum, a0_n)},"
+                f"{a0_format_nonzero},{_mean(a0_format_nonzero, a0_n)},"
+                f"{a0_validator_sum},{_mean(a0_validator_sum, a0_n)},"
+                f"{a0_validator_nonzero},{_mean(a0_validator_nonzero, a0_n)},"
+                f"{a0_sequence_sum},{_mean(a0_sequence_sum, a0_n)},"
+                f"{a0_sequence_nonzero},{_mean(a0_sequence_nonzero, a0_n)},"
+                f"{a0_comm_sum},{_mean(a0_comm_sum, a0_n)},"
+                f"{a0_comm_nonzero},{_mean(a0_comm_nonzero, a0_n)},"
+                f"{a0_breakdown_total_sum},{_mean(a0_breakdown_total_sum, a0_n)},"
+                f"{a0_breakdown_total_nonzero},{_mean(a0_breakdown_total_nonzero, a0_n)},"
+                f"{a0_legacy_process_sum},{_mean(a0_legacy_process_sum, a0_n)},"
+                f"{a0_legacy_process_nonzero},{_mean(a0_legacy_process_nonzero, a0_n)},"
+                f"{a1_rl_sum},{_mean(a1_rl_sum, a1_n)},"
+                f"{a1_rl_nonzero},{_mean(a1_rl_nonzero, a1_n)},"
+                f"{a1_format_sum},{_mean(a1_format_sum, a1_n)},"
+                f"{a1_format_nonzero},{_mean(a1_format_nonzero, a1_n)},"
+                f"{a1_validator_sum},{_mean(a1_validator_sum, a1_n)},"
+                f"{a1_validator_nonzero},{_mean(a1_validator_nonzero, a1_n)},"
+                f"{a1_sequence_sum},{_mean(a1_sequence_sum, a1_n)},"
+                f"{a1_sequence_nonzero},{_mean(a1_sequence_nonzero, a1_n)},"
+                f"{a1_comm_sum},{_mean(a1_comm_sum, a1_n)},"
+                f"{a1_comm_nonzero},{_mean(a1_comm_nonzero, a1_n)},"
+                f"{a1_breakdown_total_sum},{_mean(a1_breakdown_total_sum, a1_n)},"
+                f"{a1_breakdown_total_nonzero},{_mean(a1_breakdown_total_nonzero, a1_n)},"
+                f"{a1_legacy_process_sum},{_mean(a1_legacy_process_sum, a1_n)},"
+                f"{a1_legacy_process_nonzero},{_mean(a1_legacy_process_nonzero, a1_n)}\n"
             )
 
     def log_train_metrics(
@@ -3725,6 +3966,84 @@ class MAPPOTrainer:
         loss_dict: Dict[str, float],
         transitions: List[TextTransition],
     ) -> None:
+        weight = float(len(transitions))
+        metric_names = [
+            "loss",
+            "policy",
+            "value",
+            "entropy",
+            "reward_mean",
+            "adv_mean",
+            "return_mean",
+            "value_mean",
+            "explained_var",
+            "fresh_value_mean",
+            "fresh_explained_var",
+            "agent0_adv_mean",
+            "agent0_return_mean",
+            "agent0_value_mean",
+            "agent0_explained_var",
+            "agent0_fresh_value_mean",
+            "agent0_fresh_explained_var",
+            "agent1_adv_mean",
+            "agent1_return_mean",
+            "agent1_value_mean",
+            "agent1_explained_var",
+            "agent1_fresh_value_mean",
+            "agent1_fresh_explained_var",
+            "clipfrac",
+            "approx_kl",
+            "policy_active_clipfrac",
+            "policy_active_approx_kl",
+            "policy_active_token_clipfrac",
+            "policy_active_token_approx_kl",
+            "kl_penalty",
+            "kl_penalty_coef",
+            "value_clipfrac",
+            "optimizer_steps",
+            "stopped_early",
+            "actor_lr",
+            "critic_adapter_lr",
+            "value_head_lr",
+            "actor0_grad_norm",
+            "actor0_param_delta",
+            "actor1_grad_norm",
+            "actor1_param_delta",
+            "critic_adapter_grad_norm",
+            "critic_adapter_param_delta",
+            "value_head_grad_norm",
+            "value_head_param_delta",
+        ]
+        packed = torch.tensor(
+            [weight] + [float(loss_dict.get(name, 0.0)) * weight for name in metric_names],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        summed = None
+        try:
+            if hasattr(self.accelerator, "reduce"):
+                summed = self.accelerator.reduce(packed, reduction="sum")
+        except Exception:
+            summed = None
+        if summed is None:
+            gathered = self.accelerator.gather(packed)
+            if gathered.ndim == 2 and gathered.shape[-1] == packed.numel():
+                summed = gathered.sum(dim=0)
+            elif gathered.ndim == 1 and gathered.numel() == packed.numel():
+                summed = gathered
+            elif gathered.ndim == 1 and gathered.numel() % packed.numel() == 0:
+                world = int(gathered.numel() // packed.numel())
+                summed = gathered.view(world, packed.numel()).sum(dim=0)
+            else:
+                raise ValueError(
+                    f"Unexpected gathered train stats shape {tuple(gathered.shape)} "
+                    f"for packed {tuple(packed.shape)}"
+                )
+        total_weight = max(float(summed[0].item()), 1.0)
+        aggregated_metrics = {
+            name: float(summed[idx + 1].item()) / total_weight
+            for idx, name in enumerate(metric_names)
+        }
         if not self.accelerator.is_main_process:
             return
         path = self.output_dir / "train_curve.csv"
@@ -3735,7 +4054,7 @@ class MAPPOTrainer:
             "agent1_adv_mean,agent1_return_mean,agent1_value_mean,agent1_explained_var,agent1_fresh_value_mean,agent1_fresh_explained_var,"
             "clipfrac,approx_kl,policy_active_clipfrac,policy_active_approx_kl,"
             "policy_active_token_clipfrac,policy_active_token_approx_kl,"
-            "kl_penalty,kl_penalty_coef,value_clipfrac,optimizer_steps,stopped_early,"
+            "kl_penalty,kl_penalty_coef,value_clipfrac,optimizer_steps,stopped_early,actor_frozen,"
             "actor_lr,critic_adapter_lr,value_head_lr,"
             "actor0_grad_norm,actor0_param_delta,"
             "actor1_grad_norm,actor1_param_delta,"
@@ -3745,30 +4064,30 @@ class MAPPOTrainer:
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
-                f"{row_idx},{update_idx},{len(transitions)},"
-                f"{loss_dict.get('loss', 0.0)},{loss_dict.get('policy', 0.0)},"
-                f"{loss_dict.get('value', 0.0)},{loss_dict.get('entropy', 0.0)},"
-                f"{loss_dict.get('reward_mean', 0.0)},{loss_dict.get('adv_mean', 0.0)},"
-                f"{loss_dict.get('return_mean', 0.0)},{loss_dict.get('value_mean', 0.0)},"
-                f"{loss_dict.get('explained_var', 0.0)},{loss_dict.get('fresh_value_mean', 0.0)},"
-                f"{loss_dict.get('fresh_explained_var', 0.0)},"
-                f"{loss_dict.get('agent0_adv_mean', 0.0)},{loss_dict.get('agent0_return_mean', 0.0)},"
-                f"{loss_dict.get('agent0_value_mean', 0.0)},{loss_dict.get('agent0_explained_var', 0.0)},"
-                f"{loss_dict.get('agent0_fresh_value_mean', 0.0)},{loss_dict.get('agent0_fresh_explained_var', 0.0)},"
-                f"{loss_dict.get('agent1_adv_mean', 0.0)},{loss_dict.get('agent1_return_mean', 0.0)},"
-                f"{loss_dict.get('agent1_value_mean', 0.0)},{loss_dict.get('agent1_explained_var', 0.0)},"
-                f"{loss_dict.get('agent1_fresh_value_mean', 0.0)},{loss_dict.get('agent1_fresh_explained_var', 0.0)},"
-                f"{loss_dict.get('clipfrac', 0.0)},{loss_dict.get('approx_kl', 0.0)},"
-                f"{loss_dict.get('policy_active_clipfrac', 0.0)},{loss_dict.get('policy_active_approx_kl', 0.0)},"
-                f"{loss_dict.get('policy_active_token_clipfrac', 0.0)},{loss_dict.get('policy_active_token_approx_kl', 0.0)},"
-                f"{loss_dict.get('kl_penalty', 0.0)},{loss_dict.get('kl_penalty_coef', 0.0)},"
-                f"{loss_dict.get('value_clipfrac', 0.0)},{loss_dict.get('optimizer_steps', 0.0)},"
-                f"{loss_dict.get('stopped_early', 0.0)},"
-                f"{loss_dict.get('actor_lr', 0.0)},{loss_dict.get('critic_adapter_lr', 0.0)},{loss_dict.get('value_head_lr', 0.0)},"
-                f"{loss_dict.get('actor0_grad_norm', 0.0)},{loss_dict.get('actor0_param_delta', 0.0)},"
-                f"{loss_dict.get('actor1_grad_norm', 0.0)},{loss_dict.get('actor1_param_delta', 0.0)},"
-                f"{loss_dict.get('critic_adapter_grad_norm', 0.0)},{loss_dict.get('critic_adapter_param_delta', 0.0)},"
-                f"{loss_dict.get('value_head_grad_norm', 0.0)},{loss_dict.get('value_head_param_delta', 0.0)}\n"
+                f"{row_idx},{update_idx},{int(total_weight)},"
+                f"{aggregated_metrics.get('loss', 0.0)},{aggregated_metrics.get('policy', 0.0)},"
+                f"{aggregated_metrics.get('value', 0.0)},{aggregated_metrics.get('entropy', 0.0)},"
+                f"{aggregated_metrics.get('reward_mean', 0.0)},{aggregated_metrics.get('adv_mean', 0.0)},"
+                f"{aggregated_metrics.get('return_mean', 0.0)},{aggregated_metrics.get('value_mean', 0.0)},"
+                f"{aggregated_metrics.get('explained_var', 0.0)},{aggregated_metrics.get('fresh_value_mean', 0.0)},"
+                f"{aggregated_metrics.get('fresh_explained_var', 0.0)},"
+                f"{aggregated_metrics.get('agent0_adv_mean', 0.0)},{aggregated_metrics.get('agent0_return_mean', 0.0)},"
+                f"{aggregated_metrics.get('agent0_value_mean', 0.0)},{aggregated_metrics.get('agent0_explained_var', 0.0)},"
+                f"{aggregated_metrics.get('agent0_fresh_value_mean', 0.0)},{aggregated_metrics.get('agent0_fresh_explained_var', 0.0)},"
+                f"{aggregated_metrics.get('agent1_adv_mean', 0.0)},{aggregated_metrics.get('agent1_return_mean', 0.0)},"
+                f"{aggregated_metrics.get('agent1_value_mean', 0.0)},{aggregated_metrics.get('agent1_explained_var', 0.0)},"
+                f"{aggregated_metrics.get('agent1_fresh_value_mean', 0.0)},{aggregated_metrics.get('agent1_fresh_explained_var', 0.0)},"
+                f"{aggregated_metrics.get('clipfrac', 0.0)},{aggregated_metrics.get('approx_kl', 0.0)},"
+                f"{aggregated_metrics.get('policy_active_clipfrac', 0.0)},{aggregated_metrics.get('policy_active_approx_kl', 0.0)},"
+                f"{aggregated_metrics.get('policy_active_token_clipfrac', 0.0)},{aggregated_metrics.get('policy_active_token_approx_kl', 0.0)},"
+                f"{aggregated_metrics.get('kl_penalty', 0.0)},{aggregated_metrics.get('kl_penalty_coef', 0.0)},"
+                f"{aggregated_metrics.get('value_clipfrac', 0.0)},{aggregated_metrics.get('optimizer_steps', 0.0)},"
+                f"{aggregated_metrics.get('stopped_early', 0.0)},{aggregated_metrics.get('actor_frozen', 0.0)},"
+                f"{aggregated_metrics.get('actor_lr', 0.0)},{aggregated_metrics.get('critic_adapter_lr', 0.0)},{aggregated_metrics.get('value_head_lr', 0.0)},"
+                f"{aggregated_metrics.get('actor0_grad_norm', 0.0)},{aggregated_metrics.get('actor0_param_delta', 0.0)},"
+                f"{aggregated_metrics.get('actor1_grad_norm', 0.0)},{aggregated_metrics.get('actor1_param_delta', 0.0)},"
+                f"{aggregated_metrics.get('critic_adapter_grad_norm', 0.0)},{aggregated_metrics.get('critic_adapter_param_delta', 0.0)},"
+                f"{aggregated_metrics.get('value_head_grad_norm', 0.0)},{aggregated_metrics.get('value_head_param_delta', 0.0)}\n"
             )
 
     def log_performance(self, update_idx: int):
@@ -4211,8 +4530,10 @@ class MAPPOTrainer:
 
         start = rank * per_rank
         end = start + per_rank
+        valid_count = max(0, min(end, total) - start)
         shard_indices = indices[start:end]
         shard = [transitions[idx] for idx in shard_indices]
+        self._last_local_shard_valid_count = valid_count
         print(
             "[MAPPO] shard after "
             f"rank={rank}/{world_size} local={len(shard)}",

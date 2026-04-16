@@ -105,6 +105,8 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
 
 def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     rank = _runtime_worker_rank()
+    worker_id_raw = os.environ.get("RL_WORKER_ID", "").strip()
+    worker_id = worker_id_raw if worker_id_raw else None
     host = os.environ["RL_VLLM_HOST"]
     start_port = int(os.environ["RL_VLLM_START_PORT"])
     port = start_port + rank
@@ -129,6 +131,24 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
         value = trainer.get(key)
         if isinstance(value, str) and value and not value.startswith("/"):
             trainer[key] = str(repo_root / value)
+
+    if stage in {"collect", "eval"}:
+        base_output = trainer.get("output_dir")
+        if not isinstance(base_output, str) or not base_output:
+            order = (
+                (data.get("environment") or {}).get("order")
+                or "task"
+            )
+            base_output = str(repo_root / "results" / f"mappo_{order}")
+        if worker_id is not None:
+            trainer["output_dir"] = str(
+                Path(base_output)
+                / "__stage_workers__"
+                / stage
+                / f"worker_{worker_id}"
+            )
+        else:
+            trainer["output_dir"] = str(Path(base_output) / "__stage_workers__" / stage / "worker_unknown")
 
     model_path = trainer.get("model_path")
     if not isinstance(model_path, str) or not model_path.startswith("/"):

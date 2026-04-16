@@ -218,6 +218,54 @@ ensure_train_master_port() {
     export MASTER_PORT
 }
 
+port_is_listening() {
+    local port="$1"
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -tiTCP:"$port" -sTCP:LISTEN -Pn >/dev/null 2>&1
+        return $?
+    fi
+    python - <<PY
+import socket, sys
+sock = socket.socket()
+sock.settimeout(0.2)
+try:
+    sock.connect(("127.0.0.1", int("$port")))
+except OSError:
+    sys.exit(1)
+else:
+    sock.close()
+    sys.exit(0)
+PY
+}
+
+reserve_vllm_port_block() {
+    local base_port="${1:-$VLLM_START_PORT}"
+    local count="${2:-$NUM_PROCS}"
+    local max_tries=200
+    local try_idx=0
+    while (( try_idx < max_tries )); do
+        local candidate=$((base_port + try_idx * count))
+        local ok=1
+        for ((gpu=0; gpu<count; gpu++)); do
+            local api_port=$((candidate + gpu))
+            local engine_port=$((candidate + 100 + gpu))
+            if port_is_listening "$api_port" || port_is_listening "$engine_port"; then
+                ok=0
+                break
+            fi
+        done
+        if (( ok == 1 )); then
+            VLLM_START_PORT="$candidate"
+            export RL_VLLM_START_PORT="$VLLM_START_PORT"
+            echo "[cluster-rl] reserved vLLM port block start=$VLLM_START_PORT count=$count"
+            return 0
+        fi
+        try_idx=$((try_idx + 1))
+    done
+    echo "[cluster-rl] unable to reserve a free vLLM port block from base=$base_port count=$count" >&2
+    return 1
+}
+
 stop_vllm_servers() {
     for pid in "${VLLM_PIDS[@]:-}"; do
         if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
@@ -348,6 +396,18 @@ run_stage_workers() {
     return "$status"
 }
 
+aggregate_stage_metrics() {
+    local stage_name="$1"
+    local cfg_path="$2"
+    if [[ "$stage_name" != "collect" && "$stage_name" != "eval" ]]; then
+        return 0
+    fi
+    echo "[cluster-rl] aggregating stage metrics stage=$stage_name cfg=$cfg_path"
+    "$PY_BIN" "$REPO_ROOT/scripts/aggregate_stage_metrics.py" \
+        --config "$cfg_path" \
+        --stage "$stage_name"
+}
+
 run_stage() {
     local stage_name="$1"
     local cfg_path="$2"
@@ -355,6 +415,7 @@ run_stage() {
         return 0
     fi
     if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+        reserve_vllm_port_block "$VLLM_START_PORT" "$NUM_PROCS" || return 1
         ensure_vllm_servers "$cfg_path" "$stage_name"
     else
         stop_vllm_servers
@@ -366,6 +427,11 @@ run_stage() {
             total_workers="$EVAL_WORKERS"
         fi
         run_stage_workers "$stage_name" "$cfg_path" "$total_workers"
+        local worker_status=$?
+        if [[ $worker_status -eq 0 ]]; then
+            aggregate_stage_metrics "$stage_name" "$cfg_path"
+        fi
+        return $worker_status
     else
         mkdir -p "$REPO_ROOT/logs/rl_workers"
         local train_log="$REPO_ROOT/logs/rl_workers/${stage_name}_accelerate.log"

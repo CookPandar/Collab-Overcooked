@@ -52,6 +52,10 @@ trainer:
   gradient_checkpointing: true
   gradient_accumulation_steps: 1
   enable_fresh_value_metrics: false
+  actor_freeze_updates: 3
+  critic_stability_window: 2
+  critic_value_loss_threshold: 1.5
+  critic_value_loss_tolerance: 0.25
   target_kl: 0.01
   kl_penalty_coef: 0.05
   clip_coef: 0.15
