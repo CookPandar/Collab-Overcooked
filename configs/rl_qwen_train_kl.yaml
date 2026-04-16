@@ -22,11 +22,12 @@ trainer:
       lora_path: ./runs/Assistant
   critic_adapter:
     adapter_name: critic
-    lora_path: null
+    lora_path: ./runs/adapter_critic/critic
     lora_config:
       r: 8
       alpha: 16
       dropout: 0.05
+  value_head_path: ./runs/value_head.pt
   rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/rollouts_kl
   output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/train_kl
   save_interval: 10
