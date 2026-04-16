@@ -2543,20 +2543,70 @@ class MAPPOTrainer:
             self.accelerator.print(
                 f"[TrainOnly] Update {update_idx}: begin update_policy()"
             )
+            print(
+                "[MAPPO] train_only before update_policy "
+                f"rank={self.accelerator.process_index} transitions={len(local_transitions)}",
+                flush=True,
+            )
             loss_dict = self.update_policy(local_transitions)
+            print(
+                "[MAPPO] train_only after update_policy "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             self.accelerator.print(
                 f"[TrainOnly] Update {update_idx}: finished update_policy()"
             )
+            print(
+                "[MAPPO] train_only before log_rewards "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             self.log_rewards(update_idx, transitions)
+            print(
+                "[MAPPO] train_only after log_rewards "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
+            print(
+                "[MAPPO] train_only before log_train_metrics "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             self.log_train_metrics(update_idx, loss_dict, transitions)
+            print(
+                "[MAPPO] train_only after log_train_metrics "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             if self.cleanup_rollouts and self.accelerator.is_main_process:
+                print(
+                    "[MAPPO] train_only before cleanup_rollouts "
+                    f"rank={self.accelerator.process_index}",
+                    flush=True,
+                )
                 self._cleanup_rollout_files()
+                print(
+                    "[MAPPO] train_only after cleanup_rollouts "
+                    f"rank={self.accelerator.process_index}",
+                    flush=True,
+                )
             self.accelerator.print(
                 f"[TrainOnly] Update {update_idx} "
                 f"loss={loss_dict['loss']:.4f} policy={loss_dict['policy']:.4f} "
                 f"value={loss_dict['value']:.4f} entropy={loss_dict['entropy']:.4f}"
             )
+            print(
+                "[MAPPO] train_only before maybe_export_latest "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             self._maybe_export_latest(update_idx)
+            print(
+                "[MAPPO] train_only after maybe_export_latest "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             return
 
         update_idx = self._runtime_stage_round_idx()
@@ -3014,6 +3064,7 @@ class MAPPOTrainer:
         unwrapped_model: QwenLMActorCritic = self.accelerator.unwrap_model(
             self.text_policy
         )
+        rank = self.accelerator.process_index
         prompt_tensors = [t.prompt_ids for t in transitions]
         response_tensors = [t.response_ids for t in transitions]
         critic_tensors = [t.critic_input_ids for t in transitions]
@@ -3061,6 +3112,14 @@ class MAPPOTrainer:
             1,
             math.ceil(total_optimization_steps / float(self.gradient_accumulation_steps)),
         )
+        print(
+            "[MAPPO] update_policy enter "
+            f"rank={rank} transitions={num_transitions} batch_size={batch_size} "
+            f"epochs={self.update_epochs} minibatches={num_minibatches} "
+            f"grad_accum={self.gradient_accumulation_steps} "
+            f"optimizer_steps_per_update={optimizer_steps_per_update}",
+            flush=True,
+        )
         scheduler = self._build_lr_scheduler(optimizer_steps_per_update)
         total_loss = 0.0
         total_policy = 0.0
@@ -3091,16 +3150,30 @@ class MAPPOTrainer:
         accum_approx_kl_count = 0
 
         self.optimizer.zero_grad()
-        for _ in range(self.update_epochs):
+        for epoch_idx in range(self.update_epochs):
+            print(
+                "[MAPPO] update_policy epoch_start "
+                f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs}",
+                flush=True,
+            )
             if self.shuffle_minibatches and num_transitions > 1:
                 perm = torch.randperm(num_transitions)
                 ordered_indices = perm.tolist()
             else:
                 ordered_indices = list(range(num_transitions))
 
-            for start in range(0, num_transitions, batch_size):
+            for minibatch_idx, start in enumerate(
+                range(0, num_transitions, batch_size), start=1
+            ):
                 end = min(start + batch_size, num_transitions)
                 batch_indices = ordered_indices[start:end]
+                print(
+                    "[MAPPO] update_policy minibatch_start "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches} "
+                    f"start={start} end={end} size={len(batch_indices)}",
+                    flush=True,
+                )
                 batch_prompts = [prompt_tensors[i] for i in batch_indices]
                 batch_responses = [response_tensors[i] for i in batch_indices]
                 batch_critic = [critic_tensors[i] for i in batch_indices]
@@ -3118,6 +3191,13 @@ class MAPPOTrainer:
                 policy_forward_ctx = (
                     nullcontext() if not stop_policy_updates else torch.no_grad()
                 )
+                print(
+                    "[MAPPO] update_policy before policy_forward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches} "
+                    f"stop_policy_updates={stop_policy_updates}",
+                    flush=True,
+                )
                 with policy_forward_ctx:
                     log_probs, entropies, token_log_probs = unwrapped_model.evaluate_policy_batch(
                         batch_prompts,
@@ -3127,6 +3207,12 @@ class MAPPOTrainer:
                             policy_temperatures[i] for i in batch_indices
                         ],
                     )
+                print(
+                    "[MAPPO] update_policy after policy_forward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches}",
+                    flush=True,
+                )
                 log_probs = log_probs.to(self.device, dtype=torch.float32)
                 entropies = entropies.to(self.device, dtype=torch.float32)
 
@@ -3186,15 +3272,39 @@ class MAPPOTrainer:
                         + self.entropy_coef * entropy_loss_raw
                         + kl_penalty_raw
                     )
+                    print(
+                        "[MAPPO] update_policy before policy_backward "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches}",
+                        flush=True,
+                    )
                     self.accelerator.backward(
                         policy_objective / float(self.gradient_accumulation_steps)
                     )
+                    print(
+                        "[MAPPO] update_policy after policy_backward "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches}",
+                        flush=True,
+                    )
+                print(
+                    "[MAPPO] update_policy before value_forward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches}",
+                    flush=True,
+                )
                 values = unwrapped_model.evaluate_values_batch_train(
                     batch_prompts,
                     batch_responses,
                     batch_agent_indices,
                     critic_tensors=batch_critic,
                 ).to(self.device, dtype=torch.float32)
+                print(
+                    "[MAPPO] update_policy after value_forward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches}",
+                    flush=True,
+                )
                 value_pred_clipped = torch.clamp(
                     values,
                     batch_old_values - self.value_clip_coef,
@@ -3209,9 +3319,21 @@ class MAPPOTrainer:
                     + self.entropy_coef * entropy_loss
                     + kl_penalty
                 )
+                print(
+                    "[MAPPO] update_policy before value_backward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches}",
+                    flush=True,
+                )
                 self.accelerator.backward(
                     (self.value_coef * value_loss)
                     / float(self.gradient_accumulation_steps)
+                )
+                print(
+                    "[MAPPO] update_policy after value_backward "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches}",
+                    flush=True,
                 )
                 accum_counter += 1
                 accum_approx_kl_sum += float(approx_kl.item())
@@ -3226,6 +3348,13 @@ class MAPPOTrainer:
                     else float(approx_kl.item())
                 )
                 if should_step:
+                    print(
+                        "[MAPPO] update_policy before optimizer_step "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches} "
+                        f"accum_counter={accum_counter}",
+                        flush=True,
+                    )
                     group_snapshots = {
                         name: self._snapshot_param_group(params)
                         for name, params in param_groups.items()
@@ -3250,6 +3379,13 @@ class MAPPOTrainer:
                     accum_counter = 0
                     accum_approx_kl_sum = 0.0
                     accum_approx_kl_count = 0
+                    print(
+                        "[MAPPO] update_policy after optimizer_step "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches} "
+                        f"actual_steps={actual_optimization_steps}",
+                        flush=True,
+                    )
 
                 total_loss += loss.item()
                 total_policy += policy_loss_raw.item()
@@ -3289,6 +3425,27 @@ class MAPPOTrainer:
                 ):
                     stop_early = True
                     stop_policy_updates = True
+                    print(
+                        "[MAPPO] update_policy target_kl_reached "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches} "
+                        f"step_approx_kl={step_approx_kl:.6f} target_kl={self.target_kl}",
+                        flush=True,
+                    )
+                print(
+                    "[MAPPO] update_policy minibatch_done "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"minibatch={minibatch_idx}/{num_minibatches} "
+                    f"should_step={should_step} loss={loss.item():.6f} "
+                    f"policy_loss={policy_loss_raw.item():.6f} "
+                    f"value_loss={value_loss.item():.6f} approx_kl={approx_kl.item():.6f}",
+                    flush=True,
+                )
+            print(
+                "[MAPPO] update_policy epoch_done "
+                f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs}",
+                flush=True,
+            )
 
         metric_denom = metric_steps if metric_steps > 0 else 1
         avg_loss = total_loss / metric_denom if metric_denom > 0 else 0.0
@@ -3365,10 +3522,20 @@ class MAPPOTrainer:
                     "value_mean": float(agent_values.mean().item()),
                     "explained_var": agent_explained_var,
                 }
+        print(
+            "[MAPPO] update_policy before fresh_value_metrics "
+            f"rank={rank}",
+            flush=True,
+        )
         fresh_value_metrics = self._compute_fresh_value_metrics(
             transitions=transitions,
             returns_cpu=returns_cpu,
             agent_indices=agent_indices,
+        )
+        print(
+            "[MAPPO] update_policy after fresh_value_metrics "
+            f"rank={rank}",
+            flush=True,
         )
 
         result = {
@@ -3426,6 +3593,12 @@ class MAPPOTrainer:
                 )
             )
         result.update(self._current_group_lrs())
+        print(
+            "[MAPPO] update_policy exit "
+            f"rank={rank} avg_loss={avg_loss:.6f} avg_policy={avg_policy:.6f} "
+            f"avg_value={avg_value:.6f} actual_steps={actual_optimization_steps}",
+            flush=True,
+        )
         return result
 
     def log_rewards(self, update_idx: int, transitions: List[TextTransition]):
@@ -4037,9 +4210,29 @@ class MAPPOTrainer:
     # ------------------------------------------------------------------
     def save_checkpoint(self, tag: str):
         ckpt_dir = self.output_dir / tag
+        print(
+            "[MAPPO] save_checkpoint begin "
+            f"rank={self.accelerator.process_index} tag={tag} path={ckpt_dir}",
+            flush=True,
+        )
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            "[MAPPO] save_checkpoint before barrier "
+            f"rank={self.accelerator.process_index} tag={tag}",
+            flush=True,
+        )
         self.accelerator.wait_for_everyone()
+        print(
+            "[MAPPO] save_checkpoint before save_state "
+            f"rank={self.accelerator.process_index} tag={tag}",
+            flush=True,
+        )
         self.accelerator.save_state(ckpt_dir)
+        print(
+            "[MAPPO] save_checkpoint after save_state "
+            f"rank={self.accelerator.process_index} tag={tag}",
+            flush=True,
+        )
         if self.accelerator.is_main_process:
             metadata = {
                 "model_path": self.model_path,
@@ -4058,6 +4251,11 @@ class MAPPOTrainer:
             }
             meta_path = ckpt_dir / "metadata.json"
             meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            print(
+                "[MAPPO] save_checkpoint wrote metadata "
+                f"rank={self.accelerator.process_index} tag={tag} path={meta_path}",
+                flush=True,
+            )
 
 
 __all__ = ["MAPPOTrainer"]
