@@ -2446,7 +2446,17 @@ class MAPPOTrainer:
             flush=True,
         )
         if self.collect_only or self.train_only:
+            print(
+                "[MAPPO] before rollout_dir.mkdir "
+                f"rank={self.accelerator.process_index} path={self.rollout_dir}",
+                flush=True,
+            )
             self.rollout_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                "[MAPPO] after rollout_dir.mkdir "
+                f"rank={self.accelerator.process_index} path={self.rollout_dir}",
+                flush=True,
+            )
 
         # Collect-only mode: just roll out and save to disk.
         if self.collect_only:
@@ -2476,6 +2486,11 @@ class MAPPOTrainer:
 
         # Train-only mode: load rollouts from disk and update policy.
         if self.train_only:
+            print(
+                "[MAPPO] entering train_only branch "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             update_idx = self._runtime_stage_round_idx()
             self._current_update_idx = update_idx
             self.accelerator.print(
