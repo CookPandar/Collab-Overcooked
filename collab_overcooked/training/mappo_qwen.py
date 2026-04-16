@@ -2960,11 +2960,27 @@ class MAPPOTrainer:
         unwrapped_model: QwenLMActorCritic = self.accelerator.unwrap_model(
             self.text_policy
         )
+        print(
+            "[MAPPO] materialize before "
+            f"rank={self.accelerator.process_index} transitions={len(transitions)}",
+            flush=True,
+        )
         missing = [idx for idx, t in enumerate(transitions) if t.critic_input_ids is not None and float(t.value) == 0.0]
         if not missing:
+            print(
+                "[MAPPO] materialize skip "
+                f"rank={self.accelerator.process_index} missing=0",
+                flush=True,
+            )
             return
         critic_tensors = [transitions[idx].critic_input_ids for idx in missing]
         batch_span = max(1, int(getattr(unwrapped_model, "eval_batch_size", 1)))
+        print(
+            "[MAPPO] materialize missing "
+            f"rank={self.accelerator.process_index} missing={len(missing)} "
+            f"batch_span={batch_span}",
+            flush=True,
+        )
         was_training = self.text_policy.training
         self.text_policy.eval()
         try:
@@ -2972,6 +2988,11 @@ class MAPPOTrainer:
                 for start in range(0, len(missing), batch_span):
                     end = min(start + batch_span, len(missing))
                     batch_indices = missing[start:end]
+                    print(
+                        "[MAPPO] materialize batch "
+                        f"rank={self.accelerator.process_index} start={start} end={end}",
+                        flush=True,
+                    )
                     values = unwrapped_model._evaluate_value_inputs(
                         [transitions[idx].critic_input_ids.to(self.device) for idx in batch_indices],
                         use_critic_adapter=True,
@@ -2981,6 +3002,11 @@ class MAPPOTrainer:
         finally:
             if was_training:
                 self.text_policy.train()
+        print(
+            "[MAPPO] materialize after "
+            f"rank={self.accelerator.process_index}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     def update_policy(self, transitions: List[TextTransition]):
@@ -3971,6 +3997,11 @@ class MAPPOTrainer:
         """
         world_size = max(1, int(self.accelerator.num_processes))
         rank = int(self.accelerator.process_index)
+        print(
+            "[MAPPO] shard before "
+            f"rank={rank}/{world_size} total={len(transitions)}",
+            flush=True,
+        )
         if world_size <= 1 or not transitions:
             return list(transitions)
 
@@ -3985,6 +4016,11 @@ class MAPPOTrainer:
         end = start + per_rank
         shard_indices = indices[start:end]
         shard = [transitions[idx] for idx in shard_indices]
+        print(
+            "[MAPPO] shard after "
+            f"rank={rank}/{world_size} local={len(shard)}",
+            flush=True,
+        )
         self.accelerator.print(
             "[TrainOnly] rollout shard "
             f"rank={rank}/{world_size} global={total} local={len(shard)} "
