@@ -2491,12 +2491,32 @@ class MAPPOTrainer:
                 f"rank={self.accelerator.process_index}",
                 flush=True,
             )
+            print(
+                "[MAPPO] train_only before update_idx "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             update_idx = self._runtime_stage_round_idx()
+            print(
+                "[MAPPO] train_only after update_idx "
+                f"rank={self.accelerator.process_index} update_idx={update_idx}",
+                flush=True,
+            )
             self._current_update_idx = update_idx
+            print(
+                "[MAPPO] train_only before load_rollouts "
+                f"rank={self.accelerator.process_index}",
+                flush=True,
+            )
             self.accelerator.print(
                 f"[TrainOnly] Update {update_idx}: begin load_rollouts()"
             )
             transitions = self.load_rollouts()
+            print(
+                "[MAPPO] train_only after load_rollouts "
+                f"rank={self.accelerator.process_index} transitions={len(transitions)}",
+                flush=True,
+            )
             if not transitions:
                 self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
                 return
@@ -3898,8 +3918,23 @@ class MAPPOTrainer:
         return True
 
     def load_rollouts(self) -> List[TextTransition]:
+        print(
+            "[MAPPO] load_rollouts before barrier "
+            f"rank={self.accelerator.process_index}",
+            flush=True,
+        )
         self.accelerator.wait_for_everyone()
+        print(
+            "[MAPPO] load_rollouts after barrier "
+            f"rank={self.accelerator.process_index}",
+            flush=True,
+        )
         files = sorted(self.rollout_dir.glob("rollout_rank*_u*.pt"))
+        print(
+            "[MAPPO] load_rollouts found files "
+            f"rank={self.accelerator.process_index} count={len(files)}",
+            flush=True,
+        )
         if not files:
             return []
         # 仅加载最新一轮（最大 u 值）的采样文件，避免历史数据无限累积。
