@@ -260,17 +260,31 @@ sock.close()
 PY
 }
 
+port_is_bindable() {
+    local port="$1"
+    python - <<PY
+import socket, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("127.0.0.1", int("$port")))
+except OSError:
+    sys.exit(1)
+else:
+    sock.close()
+    sys.exit(0)
+PY
+}
+
 ensure_train_master_port() {
     local desired_port="$1"
-    if command -v lsof >/dev/null 2>&1; then
-        if lsof -tiTCP:"$desired_port" -sTCP:LISTEN -Pn >/dev/null 2>&1; then
-            local new_port
-            new_port="$(pick_free_port)"
-            echo "[cluster-rl] MASTER_PORT $desired_port is busy, switching to $new_port"
-            MASTER_PORT="$new_port"
-            export MASTER_PORT
-            return
-        fi
+    if ! port_is_bindable "$desired_port"; then
+        local new_port
+        new_port="$(pick_free_port)"
+        echo "[cluster-rl] MASTER_PORT $desired_port is busy, switching to $new_port"
+        MASTER_PORT="$new_port"
+        export MASTER_PORT
+        return
     fi
     MASTER_PORT="$desired_port"
     export MASTER_PORT
@@ -598,6 +612,7 @@ run_stage() {
         mkdir -p "$LOG_ROOT/rl_workers"
         local train_log="$LOG_ROOT/rl_workers/${stage_name}_accelerate.log"
         ensure_train_master_port "$MASTER_PORT"
+        echo "[cluster-rl] using MASTER_PORT=$MASTER_PORT"
         echo "[cluster-rl] accelerate log=$train_log"
         env -u MASTER_ADDR -u MASTER_PORT -u WORLD_SIZE -u RANK -u LOCAL_RANK \
         RL_STAGE_PHASE="$stage_name" \
