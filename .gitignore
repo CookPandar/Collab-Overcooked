@@ -198,3 +198,8 @@ src/batch_run.sh
 
 # Temporary debug scripts
 scripts/run_debug_main.py
+
+# Local training artifacts (keep local only)
+rollouts_kl/
+rollouts_eval_kl/
+runs/rl_policy_records/**/session_*/
