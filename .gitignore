@@ -203,3 +203,4 @@ scripts/run_debug_main.py
 rollouts_kl/
 rollouts_eval_kl/
 runs/rl_policy_records/**/session_*/
+runs/rl/
