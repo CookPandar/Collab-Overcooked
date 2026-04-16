@@ -2897,11 +2897,14 @@ class MAPPOTrainer:
 
     def _materialize_transition_values(self, transitions: List[TextTransition]) -> None:
         assert self.text_policy is not None
+        unwrapped_model: QwenLMActorCritic = self.accelerator.unwrap_model(
+            self.text_policy
+        )
         missing = [idx for idx, t in enumerate(transitions) if t.critic_input_ids is not None and float(t.value) == 0.0]
         if not missing:
             return
         critic_tensors = [transitions[idx].critic_input_ids for idx in missing]
-        batch_span = max(1, int(getattr(self.text_policy, "eval_batch_size", 1)))
+        batch_span = max(1, int(getattr(unwrapped_model, "eval_batch_size", 1)))
         was_training = self.text_policy.training
         self.text_policy.eval()
         try:
@@ -2909,7 +2912,7 @@ class MAPPOTrainer:
                 for start in range(0, len(missing), batch_span):
                     end = min(start + batch_span, len(missing))
                     batch_indices = missing[start:end]
-                    values = self.text_policy._evaluate_value_inputs(
+                    values = unwrapped_model._evaluate_value_inputs(
                         [transitions[idx].critic_input_ids.to(self.device) for idx in batch_indices],
                         use_critic_adapter=True,
                     ).detach().float().cpu()
