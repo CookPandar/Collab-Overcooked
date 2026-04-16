@@ -2495,8 +2495,14 @@ class MAPPOTrainer:
             if not transitions:
                 self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
                 return
-            self._materialize_transition_values(transitions)
-            loss_dict = self.update_policy(transitions)
+            local_transitions = self._shard_transitions_for_rank(transitions)
+            if not local_transitions:
+                self.accelerator.print(
+                    "[TrainOnly] Local rank received no rollout shard; stopping."
+                )
+                return
+            self._materialize_transition_values(local_transitions)
+            loss_dict = self.update_policy(local_transitions)
             self.log_rewards(update_idx, transitions)
             self.log_train_metrics(update_idx, loss_dict, transitions)
             if self.cleanup_rollouts and self.accelerator.is_main_process:
@@ -3884,6 +3890,39 @@ class MAPPOTrainer:
             data = torch.load(p, map_location="cpu")
             transitions.extend([self._dict_to_transition(d) for d in data])
         return transitions
+
+    def _shard_transitions_for_rank(
+        self, transitions: List[TextTransition]
+    ) -> List[TextTransition]:
+        """Shard rollout data across DDP ranks with padding to equal lengths.
+
+        Each rank receives a different, fixed-size shard so that all processes
+        execute the same number of optimizer steps. Padding reuses samples from
+        the front of the dataset when the total size is not divisible by
+        ``world_size``.
+        """
+        world_size = max(1, int(self.accelerator.num_processes))
+        rank = int(self.accelerator.process_index)
+        if world_size <= 1 or not transitions:
+            return list(transitions)
+
+        total = len(transitions)
+        per_rank = int(math.ceil(total / float(world_size)))
+        padded_size = per_rank * world_size
+        indices = list(range(total))
+        if padded_size > total:
+            indices.extend(indices[: padded_size - total])
+
+        start = rank * per_rank
+        end = start + per_rank
+        shard_indices = indices[start:end]
+        shard = [transitions[idx] for idx in shard_indices]
+        self.accelerator.print(
+            "[TrainOnly] rollout shard "
+            f"rank={rank}/{world_size} global={total} local={len(shard)} "
+            f"padded={padded_size}"
+        )
+        return shard
 
     def _cleanup_rollout_files(self):
         if not self.accelerator.is_main_process:
