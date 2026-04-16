@@ -2478,18 +2478,40 @@ class MAPPOTrainer:
         if self.train_only:
             update_idx = self._runtime_stage_round_idx()
             self._current_update_idx = update_idx
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: begin load_rollouts()"
+            )
             transitions = self.load_rollouts()
             if not transitions:
                 self.accelerator.print("[TrainOnly] No rollouts found; stopping.")
                 return
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: loaded global transitions={len(transitions)}"
+            )
             local_transitions = self._shard_transitions_for_rank(transitions)
             if not local_transitions:
                 self.accelerator.print(
                     "[TrainOnly] Local rank received no rollout shard; stopping."
                 )
                 return
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: rank={self.accelerator.process_index} "
+                f"local shard transitions={len(local_transitions)}"
+            )
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: begin materialize_transition_values()"
+            )
             self._materialize_transition_values(local_transitions)
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: finished materialize_transition_values()"
+            )
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: begin update_policy()"
+            )
             loss_dict = self.update_policy(local_transitions)
+            self.accelerator.print(
+                f"[TrainOnly] Update {update_idx}: finished update_policy()"
+            )
             self.log_rewards(update_idx, transitions)
             self.log_train_metrics(update_idx, loss_dict, transitions)
             if self.cleanup_rollouts and self.accelerator.is_main_process:
@@ -2828,7 +2850,10 @@ class MAPPOTrainer:
         old_token_log_probs_list: List[torch.Tensor] = []
         critic_tensors = [t.critic_input_ids for t in transitions]
         fresh_values_chunks: List[torch.Tensor] = []
-        batch_span = max(1, int(getattr(self.text_policy, "eval_batch_size", 1)))
+        unwrapped_model: QwenLMActorCritic = self.accelerator.unwrap_model(
+            self.text_policy
+        )
+        batch_span = max(1, int(getattr(unwrapped_model, "eval_batch_size", 1)))
         was_training = self.text_policy.training
         self.text_policy.eval()
         try:
@@ -2836,7 +2861,7 @@ class MAPPOTrainer:
                 for start in range(0, len(transitions), batch_span):
                     end = min(start + batch_span, len(transitions))
                     fresh_values_chunks.append(
-                        self.text_policy.evaluate_values_batch(
+                        unwrapped_model.evaluate_values_batch(
                             prompt_tensors[start:end],
                             response_tensors[start:end],
                             agent_indices[start:end],
@@ -2925,6 +2950,9 @@ class MAPPOTrainer:
     # ------------------------------------------------------------------
     def update_policy(self, transitions: List[TextTransition]):
         assert self.text_policy is not None
+        unwrapped_model: QwenLMActorCritic = self.accelerator.unwrap_model(
+            self.text_policy
+        )
         prompt_tensors = [t.prompt_ids for t in transitions]
         response_tensors = [t.response_ids for t in transitions]
         critic_tensors = [t.critic_input_ids for t in transitions]
@@ -3030,7 +3058,7 @@ class MAPPOTrainer:
                     nullcontext() if not stop_policy_updates else torch.no_grad()
                 )
                 with policy_forward_ctx:
-                    log_probs, entropies, token_log_probs = self.text_policy.evaluate_policy_batch(
+                    log_probs, entropies, token_log_probs = unwrapped_model.evaluate_policy_batch(
                         batch_prompts,
                         batch_responses,
                         batch_agent_indices,
@@ -3100,7 +3128,7 @@ class MAPPOTrainer:
                     self.accelerator.backward(
                         policy_objective / float(self.gradient_accumulation_steps)
                     )
-                values = self.text_policy.evaluate_values_batch_train(
+                values = unwrapped_model.evaluate_values_batch_train(
                     batch_prompts,
                     batch_responses,
                     batch_agent_indices,
