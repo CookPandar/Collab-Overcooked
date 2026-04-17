@@ -619,7 +619,7 @@ run_stage() {
         RL_STAGE_ROUND_IDX="$i" \
         RL_LOOP_ROUND_IDX="$i" \
         MASTER_PORT="$MASTER_PORT" \
-        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" "${EXTRA_ACCEL[@]}" \
+        "$ACCEL_BIN" launch --num_processes "$NUM_PROCS" --main_process_port "$MASTER_PORT" "${EXTRA_ACCEL[@]}" \
             "$REPO_ROOT/scripts/rl_stage_runner.py" --config "$cfg_path" --stage "$stage_name" -- "${RUN_ARGS[@]}" \
             2>&1 | tee "$train_log"
     fi
