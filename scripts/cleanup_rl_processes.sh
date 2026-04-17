@@ -14,6 +14,23 @@ LOG_ROOT="$EXPERIMENT_ROOT/logs"
 STATE_ROOT="$LOG_ROOT/rl_runtime"
 TAIL_LINES="${RL_CLEANUP_TAIL_LINES:-40}"
 PURGE_OUTPUTS="${RL_CLEANUP_PURGE_OUTPUTS:-1}"
+KILL_BY_PORT="${RL_CLEANUP_KILL_BY_PORT:-1}"
+FALLBACK_PORT_BLOCK="${RL_CLEANUP_FALLBACK_PORT_BLOCK:-0}"
+PROTECTED_PORTS_RAW="${RL_CLEANUP_PROTECTED_PORTS:-8000,8001}"
+
+port_is_protected() {
+    local port="$1"
+    [[ -n "$port" ]] || return 1
+    local item
+    IFS=',' read -r -a ports <<< "${PROTECTED_PORTS_RAW// /}"
+    for item in "${ports[@]}"; do
+        [[ -n "$item" ]] || continue
+        if [[ "$item" == "$port" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 process_exists() {
     local pid="$1"
@@ -44,6 +61,10 @@ kill_pid_if_exists() {
 kill_port_listener() {
     local port="$1"
     [[ -n "$port" ]] || return 0
+    if port_is_protected "$port"; then
+        echo "[cleanup-rl] skip protected port=$port"
+        return 0
+    fi
     if command -v lsof >/dev/null 2>&1; then
         local pids=()
         while IFS= read -r pid; do
@@ -129,8 +150,16 @@ cleanup_from_state() {
 }
 
 cleanup_from_port_block() {
+    if [[ "$FALLBACK_PORT_BLOCK" != "1" ]]; then
+        echo "[cleanup-rl] skip derived port-block cleanup (set RL_CLEANUP_FALLBACK_PORT_BLOCK=1 to enable)" >&2
+        return 0
+    fi
     if [[ "${NUM_PROCS_LOCAL:-0}" -le 0 || "${START_PORT_LOCAL:-0}" -le 0 ]]; then
         echo "[cleanup-rl] no runtime state and insufficient RL_NUM_PROCS/RL_VLLM_START_PORT to infer port block" >&2
+        return 0
+    fi
+    if [[ "$KILL_BY_PORT" != "1" ]]; then
+        echo "[cleanup-rl] derived port-block cleanup requires RL_CLEANUP_KILL_BY_PORT=1" >&2
         return 0
     fi
     echo "[cleanup-rl] no explicit state found; cleaning derived port block start=$START_PORT_LOCAL num_procs=$NUM_PROCS_LOCAL internal_span=$INTERNAL_SPAN_LOCAL"
@@ -188,6 +217,9 @@ load_meta
 
 echo "[cleanup-rl] experiment_root=$EXPERIMENT_ROOT"
 echo "[cleanup-rl] state_root=$STATE_ROOT"
+echo "[cleanup-rl] kill_by_port=$KILL_BY_PORT"
+echo "[cleanup-rl] fallback_port_block=$FALLBACK_PORT_BLOCK"
+echo "[cleanup-rl] protected_ports=$PROTECTED_PORTS_RAW"
 
 if ! cleanup_from_state; then
     cleanup_from_port_block
