@@ -265,7 +265,6 @@ port_is_bindable() {
     python - <<PY
 import socket, sys
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     sock.bind(("127.0.0.1", int("$port")))
 except OSError:
@@ -324,13 +323,13 @@ reserve_vllm_port_block() {
             local api_port=$((candidate + gpu))
             local engine_port=$((candidate + 100 + gpu))
             local internal_base=$((candidate + 200 + gpu * per_gpu_internal_span))
-            if port_is_listening "$api_port" || port_is_listening "$engine_port"; then
+            if ! port_is_bindable "$api_port" || ! port_is_bindable "$engine_port"; then
                 ok=0
                 break
             fi
             for ((offset=0; offset<per_gpu_internal_span; offset++)); do
                 local internal_port=$((internal_base + offset))
-                if port_is_listening "$internal_port"; then
+                if ! port_is_bindable "$internal_port"; then
                     ok=0
                     break
                 fi
@@ -591,6 +590,7 @@ run_stage() {
         return 0
     fi
     if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+        stop_vllm_servers
         reserve_vllm_port_block "$VLLM_START_PORT" "$NUM_PROCS" || return 1
         ensure_vllm_servers "$cfg_path" "$stage_name"
     else
@@ -605,8 +605,9 @@ run_stage() {
         run_stage_workers "$stage_name" "$cfg_path" "$total_workers"
         local worker_status=$?
         if [[ $worker_status -eq 0 ]]; then
-            aggregate_stage_metrics "$stage_name" "$cfg_path"
+            aggregate_stage_metrics "$stage_name" "$cfg_path" || worker_status=$?
         fi
+        stop_vllm_servers
         return $worker_status
     else
         mkdir -p "$LOG_ROOT/rl_workers"
