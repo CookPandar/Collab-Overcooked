@@ -1,5 +1,4 @@
 environment:
-  layout: cramped_room
   order: baked_bell_pepper
   horizon: 17
 reward:
@@ -16,7 +15,7 @@ trainer:
   train_only: true
   collect_only: false
   fix_mistral_regex: true
-  model_path: qwen2.5-7b
+  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
   lora_path: null
   lora: {}
   actor_adapters:
@@ -34,12 +33,12 @@ trainer:
       alpha: 16
       dropout: 0.05
   value_head_path: ./runs/value_head.pt
-  rollout_dir: ./rollouts_kl/debug_t13_t16
-  output_dir: ./runs/rl/debug_t13_t16/train
+  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/rollouts_kl
+  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/train
   save_interval: 1
   checkpoint_interval: 0
-  export_latest_dir: ./runs/rl/debug_t13_t16/export_latest
-  latest_model_path_file: ./runs/rl/debug_t13_t16/latest_model.json
+  export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/export_latest
+  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/latest_model.json
   apply_latest_model_override: true
   export_interval: 1
   max_new_tokens: 512
@@ -79,10 +78,10 @@ agents:
     base_url: http://127.0.0.1:9000/v1
     temperature: 0
     max_tokens: 512
-    timeout: 30
+    timeout: 180
     max_retries: 3
     role: Chef
-    local_model_path: qwen2.5-7b
+    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
     cuda_visible_devices:
     - 0
     data_parallel_size: 1
@@ -93,10 +92,10 @@ agents:
     base_url: http://127.0.0.1:9001/v1
     temperature: 0
     max_tokens: 512
-    timeout: 30
+    timeout: 180
     max_retries: 3
     role: Assistant
-    local_model_path: qwen2.5-7b
+    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
     cuda_visible_devices:
     - 1
     data_parallel_size: 1
