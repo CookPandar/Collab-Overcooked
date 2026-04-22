@@ -96,7 +96,6 @@ def _rewrite_experiment_paths(trainer: dict, repo_root: Path) -> None:
         "export_latest_dir",
         "latest_model_path_file",
         "initial_rollout_cache_dir",
-        "off_policy_snapshots",
     ]
     for key in path_keys:
         value = trainer.get(key)

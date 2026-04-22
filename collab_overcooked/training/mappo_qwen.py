@@ -1236,6 +1236,7 @@ class MAPPOTrainer:
             snapshot_paths = [snapshot_paths]
         elif not isinstance(snapshot_paths, list):
             snapshot_paths = []
+        self.snapshot_paths_configured = bool(snapshot_paths)
         self.snapshot_records: List[SnapshotRecord] = (
             self._load_snapshot_dataset(snapshot_paths) if snapshot_paths else []
         )
@@ -2834,6 +2835,11 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------------
     def collect_rollout(self):
+        if self.snapshot_paths_configured and not self.snapshot_records:
+            raise RuntimeError(
+                "trainer.off_policy_snapshots was configured, but no snapshot states were loaded. "
+                "Please verify the snapshot path exists on the server and is readable."
+            )
         if self.snapshot_records:
             self._collect_snapshot_rollout()
         else:
