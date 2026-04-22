@@ -323,6 +323,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key", required=False, default="")
     parser.add_argument("--max-loras", type=int, default=1)
     parser.add_argument("--max-lora-rank", type=int, default=0)
+    # Backward-compatible no-op: LoRA modules are now passed via
+    # RL_VLLM_LORA_MODULES_JSON instead of CLI args.
+    parser.add_argument("--lora-modules", nargs="*", default=None)
     parser.add_argument("--enforce-eager", action="store_true")
     return parser.parse_args()
 

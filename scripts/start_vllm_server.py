@@ -248,9 +248,6 @@ def main() -> int:
         max_lora_rank = int(args.max_lora_rank) if int(args.max_lora_rank) > 0 else inferred_max_lora_rank
         if max_lora_rank > 0:
             cmd.extend(['--max-lora-rank', str(max_lora_rank)])
-        cmd.append('--lora-modules')
-        for name, path in lora_modules:
-            cmd.append(f'{name}={path}')
     return subprocess.call(cmd, env=env)
 
 
