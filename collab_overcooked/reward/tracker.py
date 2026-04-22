@@ -248,18 +248,22 @@ class ProcessRewardTracker:
         force_communication_penalty = bool(
             meta.get("force_communication_penalty", False)
         )
-        communication_reward = self._process_communication_reward(
+        repeat_communication_reward = self._process_communication_reward(
             agent_index,
             normalized_action,
             suppress_penalty=suppress_repeat_penalty,
         )
+        forced_communication_reward = 0.0
         paired_comm_reward, paired_comm_meta = self._process_paired_comm_reward(
             agent_index,
             ts=-1 if timestamp is None else int(timestamp),
             action=normalized_action,
         )
         if force_communication_penalty:
-            communication_reward += self.forced_communication_penalty_value
+            forced_communication_reward += self.forced_communication_penalty_value
+        communication_reward = (
+            repeat_communication_reward + forced_communication_reward
+        )
         if is_collab:
             seq_reward = 0.0
         else:
@@ -285,6 +289,8 @@ class ProcessRewardTracker:
             "sequence_reward": seq_reward,
             "progress_reward": seq_reward,
             "communication_reward": communication_reward,
+            "repeat_communication_reward": repeat_communication_reward,
+            "forced_communication_reward": forced_communication_reward,
             "paired_comm_reward": paired_comm_reward,
             "paired_comm_role": paired_comm_meta.get("role"),
             "paired_comm_result": paired_comm_meta.get("result"),
@@ -322,6 +328,14 @@ class ProcessRewardTracker:
             communication_reward = sum(
                 entry.get("communication_reward", 0.0) for entry in call_entries
             )
+            repeat_communication_reward = sum(
+                entry.get("repeat_communication_reward", 0.0)
+                for entry in call_entries
+            )
+            forced_communication_reward = sum(
+                entry.get("forced_communication_reward", 0.0)
+                for entry in call_entries
+            )
             paired_comm_reward = sum(
                 entry.get("paired_comm_reward", 0.0) for entry in call_entries
             )
@@ -336,6 +350,8 @@ class ProcessRewardTracker:
                 {
                     "sequence_reward": seq_reward,
                     "communication_reward": communication_reward,
+                    "repeat_communication_reward": repeat_communication_reward,
+                    "forced_communication_reward": forced_communication_reward,
                     "paired_comm_reward": paired_comm_reward,
                     "penalty_total": penalty_total,
                     "penalties": penalty_details,

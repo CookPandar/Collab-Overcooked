@@ -2,8 +2,8 @@ environment:
   order: baked_bell_pepper
   horizon: 17
 reward:
-  communication_penalty: 0.1
-  forced_communication_penalty: 0.4
+  communication_penalty: 0.0
+  forced_communication_penalty: 0.05
   paired_comm_reward_enabled: true
   paired_comm_request_positive_reward: 0.5
   paired_comm_request_negative_reward: -0.1

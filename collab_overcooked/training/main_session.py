@@ -680,6 +680,12 @@ class CollabMainSession:
                 communication_reward = float(
                     reward_entry.get("communication_reward", 0.0)
                 )
+                repeat_communication_reward = float(
+                    reward_entry.get("repeat_communication_reward", 0.0)
+                )
+                forced_communication_reward = float(
+                    reward_entry.get("forced_communication_reward", 0.0)
+                )
                 paired_comm_reward = float(
                     reward_entry.get("paired_comm_reward", 0.0)
                 )
@@ -695,6 +701,8 @@ class CollabMainSession:
                     "format_reward": fmt_reward,
                     "validator_reward": validator_reward,
                     "communication_reward": communication_reward,
+                    "repeat_communication_reward": repeat_communication_reward,
+                    "forced_communication_reward": forced_communication_reward,
                     "paired_comm_reward": paired_comm_reward,
                     "call_type": reward_entry.get("call_type"),
                     "raw": reward_entry,

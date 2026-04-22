@@ -60,6 +60,8 @@ class TextTransition:
     # NOTE: `reward` is still the scalar used for RL updates; these fields are only for logging/analysis.
     sequence_reward: float = 0.0
     communication_reward: float = 0.0
+    repeat_communication_reward: float = 0.0
+    forced_communication_reward: float = 0.0
     paired_comm_reward: float = 0.0
     breakdown_total_reward: float = 0.0
 
@@ -1776,8 +1778,10 @@ class MAPPOTrainer:
             return
         header = (
             "row_idx,update_idx,episode_idx,episode_return,episode_len,had_positive,rank,"
-            "agent0_custom_return,agent0_sequence_sum,agent0_format_sum,agent0_validator_sum,agent0_comm_sum,agent0_paired_comm_sum,"
-            "agent1_custom_return,agent1_sequence_sum,agent1_format_sum,agent1_validator_sum,agent1_comm_sum,agent1_paired_comm_sum,"
+            "agent0_custom_return,agent0_sequence_sum,agent0_format_sum,agent0_validator_sum,"
+            "agent0_comm_sum,agent0_comm_repeat_sum,agent0_comm_forced_sum,agent0_paired_comm_sum,"
+            "agent1_custom_return,agent1_sequence_sum,agent1_format_sum,agent1_validator_sum,"
+            "agent1_comm_sum,agent1_comm_repeat_sum,agent1_comm_forced_sum,agent1_paired_comm_sum,"
             "team_custom_return"
         )
         row_idx, _ = self._prepare_csv_log(self._episode_log_path, header)
@@ -1790,10 +1794,12 @@ class MAPPOTrainer:
                 f"{episode_len},{1 if had_positive else 0},{rank},"
                 f"{custom_stats.get('agent0_total', 0.0)},{custom_stats.get('agent0_sequence', 0.0)},"
                 f"{custom_stats.get('agent0_format', 0.0)},{custom_stats.get('agent0_validator', 0.0)},"
-                f"{custom_stats.get('agent0_comm', 0.0)},{custom_stats.get('agent0_paired_comm', 0.0)},"
+                f"{custom_stats.get('agent0_comm', 0.0)},{custom_stats.get('agent0_comm_repeat', 0.0)},"
+                f"{custom_stats.get('agent0_comm_forced', 0.0)},{custom_stats.get('agent0_paired_comm', 0.0)},"
                 f"{custom_stats.get('agent1_total', 0.0)},{custom_stats.get('agent1_sequence', 0.0)},"
                 f"{custom_stats.get('agent1_format', 0.0)},{custom_stats.get('agent1_validator', 0.0)},"
-                f"{custom_stats.get('agent1_comm', 0.0)},{custom_stats.get('agent1_paired_comm', 0.0)},"
+                f"{custom_stats.get('agent1_comm', 0.0)},{custom_stats.get('agent1_comm_repeat', 0.0)},"
+                f"{custom_stats.get('agent1_comm_forced', 0.0)},{custom_stats.get('agent1_paired_comm', 0.0)},"
                 f"{custom_stats.get('team_total', 0.0)}\n"
             )
 
@@ -1806,11 +1812,15 @@ class MAPPOTrainer:
             "agent0_format": 0.0,
             "agent0_validator": 0.0,
             "agent0_comm": 0.0,
+            "agent0_comm_repeat": 0.0,
+            "agent0_comm_forced": 0.0,
             "agent1_total": 0.0,
             "agent1_sequence": 0.0,
             "agent1_format": 0.0,
             "agent1_validator": 0.0,
             "agent1_comm": 0.0,
+            "agent1_comm_repeat": 0.0,
+            "agent1_comm_forced": 0.0,
             "team_total": 0.0,
         }
         if not process_reward or not isinstance(process_reward, dict):
@@ -1825,6 +1835,14 @@ class MAPPOTrainer:
             fmt = sum(float(call.get("format_reward", 0.0) or 0.0) for call in calls)
             validator = sum(float(call.get("validator_reward", 0.0) or 0.0) for call in calls)
             comm = sum(float(call.get("communication_reward", 0.0) or 0.0) for call in calls)
+            comm_repeat = sum(
+                float(call.get("repeat_communication_reward", 0.0) or 0.0)
+                for call in calls
+            )
+            comm_forced = sum(
+                float(call.get("forced_communication_reward", 0.0) or 0.0)
+                for call in calls
+            )
             paired_comm = sum(
                 float(call.get("paired_comm_reward", 0.0) or 0.0) for call in calls
             )
@@ -1835,6 +1853,8 @@ class MAPPOTrainer:
             stats[f"{prefix}_format"] = fmt
             stats[f"{prefix}_validator"] = validator
             stats[f"{prefix}_comm"] = comm
+            stats[f"{prefix}_comm_repeat"] = comm_repeat
+            stats[f"{prefix}_comm_forced"] = comm_forced
             stats[f"{prefix}_paired_comm"] = paired_comm
             stats["team_total"] += total
         return stats
@@ -2868,6 +2888,20 @@ class MAPPOTrainer:
                 breakdown.get("sequence_reward", raw_entry.get("sequence_reward", 0.0) or 0.0)
             )
             communication_reward = float(breakdown.get("communication_reward", 0.0) or 0.0)
+            repeat_communication_reward = float(
+                breakdown.get(
+                    "repeat_communication_reward",
+                    raw_entry.get("repeat_communication_reward", 0.0),
+                )
+                or 0.0
+            )
+            forced_communication_reward = float(
+                breakdown.get(
+                    "forced_communication_reward",
+                    raw_entry.get("forced_communication_reward", 0.0),
+                )
+                or 0.0
+            )
             paired_comm_reward = float(breakdown.get("paired_comm_reward", 0.0) or 0.0)
             breakdown_total_reward = float(
                 raw_entry.get(
@@ -2905,6 +2939,8 @@ class MAPPOTrainer:
                 process_reward=process_reward,
                 sequence_reward=seq_reward,
                 communication_reward=communication_reward,
+                repeat_communication_reward=repeat_communication_reward,
+                forced_communication_reward=forced_communication_reward,
                 paired_comm_reward=paired_comm_reward,
                 breakdown_total_reward=breakdown_total_reward,
             )
@@ -3281,9 +3317,6 @@ class MAPPOTrainer:
         agent_indices = [t.agent_index for t in transitions]
         policy_temperatures = [t.policy_temperature for t in transitions]
         old_token_log_probs_list: List[torch.Tensor] = []
-        old_log_probs = torch.tensor(
-            [t.log_prob for t in transitions], dtype=torch.float32, device=self.device
-        )
         for t in transitions:
             if t.response_log_probs is not None:
                 old_token_log_probs_list.append(
@@ -3389,15 +3422,9 @@ class MAPPOTrainer:
                 batch_responses = [response_tensors[i] for i in batch_indices]
                 batch_critic = [critic_tensors[i] for i in batch_indices]
                 batch_agent_indices = [agent_indices[i] for i in batch_indices]
-                batch_old_log_probs = old_log_probs[batch_indices]
                 batch_old_values = old_values[batch_indices]
                 batch_adv = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
-                batch_response_lengths = torch.tensor(
-                    [max(1, int(response_tensors[i].numel())) for i in batch_indices],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
 
                 policy_forward_ctx = (
                     nullcontext() if not stop_policy_updates else torch.no_grad()
@@ -3410,7 +3437,7 @@ class MAPPOTrainer:
                     flush=True,
                 )
                 with policy_forward_ctx:
-                    log_probs, entropies, token_log_probs = unwrapped_model.evaluate_policy_batch(
+                    _, entropies, token_log_probs = unwrapped_model.evaluate_policy_batch(
                         batch_prompts,
                         batch_responses,
                         batch_agent_indices,
@@ -3424,16 +3451,15 @@ class MAPPOTrainer:
                     f"minibatch={minibatch_idx}/{num_minibatches}",
                     flush=True,
                 )
-                log_probs = log_probs.to(self.device, dtype=torch.float32)
                 entropies = entropies.to(self.device, dtype=torch.float32)
-
-                logratio = log_probs - batch_old_log_probs
-                ratios = torch.exp(logratio)
                 batch_old_token_log_probs = [
                     old_token_log_probs_list[i] for i in batch_indices
                 ]
                 token_logratio_parts: List[torch.Tensor] = []
-                for new_lp, old_lp in zip(token_log_probs, batch_old_token_log_probs):
+                token_policy_loss_parts: List[torch.Tensor] = []
+                for sample_idx, (new_lp, old_lp) in enumerate(
+                    zip(token_log_probs, batch_old_token_log_probs)
+                ):
                     if new_lp.numel() == 0:
                         continue
                     if old_lp.numel() != new_lp.numel():
@@ -3447,19 +3473,37 @@ class MAPPOTrainer:
                                     float(old_lp[-1].item()) if old_lp.numel() > 0 else 0.0,
                                 )
                                 old_lp = torch.cat([old_lp, pad], dim=0)
-                    token_logratio_parts.append(new_lp - old_lp)
+                    sample_token_logratio = new_lp - old_lp
+                    sample_token_ratios = torch.exp(sample_token_logratio)
+                    sample_adv = batch_adv[sample_idx].expand_as(sample_token_logratio)
+                    sample_clipped_ratios = torch.clamp(
+                        sample_token_ratios,
+                        1.0 - self.clip_coef,
+                        1.0 + self.clip_coef,
+                    )
+                    sample_surr1 = sample_token_ratios * sample_adv
+                    sample_surr2 = sample_clipped_ratios * sample_adv
+                    token_logratio_parts.append(sample_token_logratio)
+                    # Keep each sample on the same footing instead of letting long
+                    # responses dominate the PPO objective through summed log-probs.
+                    token_policy_loss_parts.append(
+                        -torch.min(sample_surr1, sample_surr2).mean()
+                    )
                 token_logratio = (
                     torch.cat(token_logratio_parts, dim=0)
                     if token_logratio_parts
                     else torch.empty(0, dtype=torch.float32, device=self.device)
                 )
-                token_ratios = torch.exp(token_logratio) if token_logratio.numel() > 0 else token_logratio
-                surr1 = ratios * batch_adv
-                clipped_ratios = torch.clamp(
-                    ratios, 1.0 - self.clip_coef, 1.0 + self.clip_coef
+                token_ratios = (
+                    torch.exp(token_logratio)
+                    if token_logratio.numel() > 0
+                    else token_logratio
                 )
-                surr2 = clipped_ratios * batch_adv
-                policy_loss_raw = -torch.min(surr1, surr2).mean()
+                policy_loss_raw = (
+                    torch.stack(token_policy_loss_parts).mean()
+                    if token_policy_loss_parts
+                    else torch.zeros((), dtype=torch.float32, device=self.device)
+                )
                 # PPO-style non-negative KL approximation under the rollout policy.
                 approx_kl = (
                     ((token_ratios - 1.0) - token_logratio).mean().clamp_min(0.0)
@@ -3837,6 +3881,8 @@ class MAPPOTrainer:
                     "validator": 0.0,
                     "sequence": 0.0,
                     "comm": 0.0,
+                    "comm_repeat": 0.0,
+                    "comm_forced": 0.0,
                     "paired_comm": 0.0,
                     "breakdown_total": 0.0,
                     "legacy_process": 0.0,
@@ -3845,6 +3891,8 @@ class MAPPOTrainer:
                     "validator_nonzero": 0.0,
                     "sequence_nonzero": 0.0,
                     "comm_nonzero": 0.0,
+                    "comm_repeat_nonzero": 0.0,
+                    "comm_forced_nonzero": 0.0,
                     "paired_comm_nonzero": 0.0,
                     "breakdown_total_nonzero": 0.0,
                     "legacy_process_nonzero": 0.0,
@@ -3856,6 +3904,12 @@ class MAPPOTrainer:
             validator_value = float(getattr(t, "validator_reward", 0.0))
             sequence_value = float(getattr(t, "sequence_reward", 0.0))
             comm_value = float(getattr(t, "communication_reward", 0.0))
+            comm_repeat_value = float(
+                getattr(t, "repeat_communication_reward", 0.0)
+            )
+            comm_forced_value = float(
+                getattr(t, "forced_communication_reward", 0.0)
+            )
             paired_comm_value = float(getattr(t, "paired_comm_reward", 0.0))
             breakdown_total_value = float(getattr(t, "breakdown_total_reward", 0.0))
             legacy_process_value = float(
@@ -3866,6 +3920,8 @@ class MAPPOTrainer:
             stats["validator"] += validator_value
             stats["sequence"] += sequence_value
             stats["comm"] += comm_value
+            stats["comm_repeat"] += comm_repeat_value
+            stats["comm_forced"] += comm_forced_value
             stats["paired_comm"] += paired_comm_value
             stats["breakdown_total"] += breakdown_total_value
             stats["legacy_process"] += legacy_process_value
@@ -3874,6 +3930,8 @@ class MAPPOTrainer:
             stats["validator_nonzero"] += 1.0 if validator_value != 0.0 else 0.0
             stats["sequence_nonzero"] += 1.0 if sequence_value != 0.0 else 0.0
             stats["comm_nonzero"] += 1.0 if comm_value != 0.0 else 0.0
+            stats["comm_repeat_nonzero"] += 1.0 if comm_repeat_value != 0.0 else 0.0
+            stats["comm_forced_nonzero"] += 1.0 if comm_forced_value != 0.0 else 0.0
             stats["paired_comm_nonzero"] += (
                 1.0 if paired_comm_value != 0.0 else 0.0
             )
@@ -3891,6 +3949,8 @@ class MAPPOTrainer:
                 "validator": 0.0,
                 "sequence": 0.0,
                 "comm": 0.0,
+                "comm_repeat": 0.0,
+                "comm_forced": 0.0,
                 "paired_comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
@@ -3899,6 +3959,8 @@ class MAPPOTrainer:
                 "validator_nonzero": 0.0,
                 "sequence_nonzero": 0.0,
                 "comm_nonzero": 0.0,
+                "comm_repeat_nonzero": 0.0,
+                "comm_forced_nonzero": 0.0,
                 "paired_comm_nonzero": 0.0,
                 "breakdown_total_nonzero": 0.0,
                 "legacy_process_nonzero": 0.0,
@@ -3912,6 +3974,8 @@ class MAPPOTrainer:
                 "validator": 0.0,
                 "sequence": 0.0,
                 "comm": 0.0,
+                "comm_repeat": 0.0,
+                "comm_forced": 0.0,
                 "paired_comm": 0.0,
                 "breakdown_total": 0.0,
                 "legacy_process": 0.0,
@@ -3920,6 +3984,8 @@ class MAPPOTrainer:
                 "validator_nonzero": 0.0,
                 "sequence_nonzero": 0.0,
                 "comm_nonzero": 0.0,
+                "comm_repeat_nonzero": 0.0,
+                "comm_forced_nonzero": 0.0,
                 "paired_comm_nonzero": 0.0,
                 "breakdown_total_nonzero": 0.0,
                 "legacy_process_nonzero": 0.0,
@@ -3935,6 +4001,8 @@ class MAPPOTrainer:
                 a0_stats["validator"],
                 a0_stats["sequence"],
                 a0_stats["comm"],
+                a0_stats["comm_repeat"],
+                a0_stats["comm_forced"],
                 a0_stats["paired_comm"],
                 a0_stats["breakdown_total"],
                 a0_stats["legacy_process"],
@@ -3943,6 +4011,8 @@ class MAPPOTrainer:
                 a0_stats["validator_nonzero"],
                 a0_stats["sequence_nonzero"],
                 a0_stats["comm_nonzero"],
+                a0_stats["comm_repeat_nonzero"],
+                a0_stats["comm_forced_nonzero"],
                 a0_stats["paired_comm_nonzero"],
                 a0_stats["breakdown_total_nonzero"],
                 a0_stats["legacy_process_nonzero"],
@@ -3951,6 +4021,8 @@ class MAPPOTrainer:
                 a1_stats["validator"],
                 a1_stats["sequence"],
                 a1_stats["comm"],
+                a1_stats["comm_repeat"],
+                a1_stats["comm_forced"],
                 a1_stats["paired_comm"],
                 a1_stats["breakdown_total"],
                 a1_stats["legacy_process"],
@@ -3959,6 +4031,8 @@ class MAPPOTrainer:
                 a1_stats["validator_nonzero"],
                 a1_stats["sequence_nonzero"],
                 a1_stats["comm_nonzero"],
+                a1_stats["comm_repeat_nonzero"],
+                a1_stats["comm_forced_nonzero"],
                 a1_stats["paired_comm_nonzero"],
                 a1_stats["breakdown_total_nonzero"],
                 a1_stats["legacy_process_nonzero"],
@@ -3995,6 +4069,8 @@ class MAPPOTrainer:
             a0_validator_sum,
             a0_sequence_sum,
             a0_comm_sum,
+            a0_comm_repeat_sum,
+            a0_comm_forced_sum,
             a0_paired_comm_sum,
             a0_breakdown_total_sum,
             a0_legacy_process_sum,
@@ -4003,6 +4079,8 @@ class MAPPOTrainer:
             a0_validator_nonzero,
             a0_sequence_nonzero,
             a0_comm_nonzero,
+            a0_comm_repeat_nonzero,
+            a0_comm_forced_nonzero,
             a0_paired_comm_nonzero,
             a0_breakdown_total_nonzero,
             a0_legacy_process_nonzero,
@@ -4011,6 +4089,8 @@ class MAPPOTrainer:
             a1_validator_sum,
             a1_sequence_sum,
             a1_comm_sum,
+            a1_comm_repeat_sum,
+            a1_comm_forced_sum,
             a1_paired_comm_sum,
             a1_breakdown_total_sum,
             a1_legacy_process_sum,
@@ -4019,6 +4099,8 @@ class MAPPOTrainer:
             a1_validator_nonzero,
             a1_sequence_nonzero,
             a1_comm_nonzero,
+            a1_comm_repeat_nonzero,
+            a1_comm_forced_nonzero,
             a1_paired_comm_nonzero,
             a1_breakdown_total_nonzero,
             a1_legacy_process_nonzero,
@@ -4039,6 +4121,10 @@ class MAPPOTrainer:
             "agent0_sequence_nonzero_count,agent0_sequence_nonzero_ratio,"
             "agent0_comm_sum,agent0_comm_mean,"
             "agent0_comm_nonzero_count,agent0_comm_nonzero_ratio,"
+            "agent0_comm_repeat_sum,agent0_comm_repeat_mean,"
+            "agent0_comm_repeat_nonzero_count,agent0_comm_repeat_nonzero_ratio,"
+            "agent0_comm_forced_sum,agent0_comm_forced_mean,"
+            "agent0_comm_forced_nonzero_count,agent0_comm_forced_nonzero_ratio,"
             "agent0_paired_comm_sum,agent0_paired_comm_mean,"
             "agent0_paired_comm_nonzero_count,agent0_paired_comm_nonzero_ratio,"
             "agent0_breakdown_total_sum,agent0_breakdown_total_mean,"
@@ -4055,6 +4141,10 @@ class MAPPOTrainer:
             "agent1_sequence_nonzero_count,agent1_sequence_nonzero_ratio,"
             "agent1_comm_sum,agent1_comm_mean,"
             "agent1_comm_nonzero_count,agent1_comm_nonzero_ratio,"
+            "agent1_comm_repeat_sum,agent1_comm_repeat_mean,"
+            "agent1_comm_repeat_nonzero_count,agent1_comm_repeat_nonzero_ratio,"
+            "agent1_comm_forced_sum,agent1_comm_forced_mean,"
+            "agent1_comm_forced_nonzero_count,agent1_comm_forced_nonzero_ratio,"
             "agent1_paired_comm_sum,agent1_paired_comm_mean,"
             "agent1_paired_comm_nonzero_count,agent1_paired_comm_nonzero_ratio,"
             "agent1_breakdown_total_sum,agent1_breakdown_total_mean,"
@@ -4091,6 +4181,10 @@ class MAPPOTrainer:
                 f"{a0_sequence_nonzero},{_mean(a0_sequence_nonzero, a0_n)},"
                 f"{a0_comm_sum},{_mean(a0_comm_sum, a0_n)},"
                 f"{a0_comm_nonzero},{_mean(a0_comm_nonzero, a0_n)},"
+                f"{a0_comm_repeat_sum},{_mean(a0_comm_repeat_sum, a0_n)},"
+                f"{a0_comm_repeat_nonzero},{_mean(a0_comm_repeat_nonzero, a0_n)},"
+                f"{a0_comm_forced_sum},{_mean(a0_comm_forced_sum, a0_n)},"
+                f"{a0_comm_forced_nonzero},{_mean(a0_comm_forced_nonzero, a0_n)},"
                 f"{a0_paired_comm_sum},{_mean(a0_paired_comm_sum, a0_n)},"
                 f"{a0_paired_comm_nonzero},{_mean(a0_paired_comm_nonzero, a0_n)},"
                 f"{a0_breakdown_total_sum},{_mean(a0_breakdown_total_sum, a0_n)},"
@@ -4107,6 +4201,10 @@ class MAPPOTrainer:
                 f"{a1_sequence_nonzero},{_mean(a1_sequence_nonzero, a1_n)},"
                 f"{a1_comm_sum},{_mean(a1_comm_sum, a1_n)},"
                 f"{a1_comm_nonzero},{_mean(a1_comm_nonzero, a1_n)},"
+                f"{a1_comm_repeat_sum},{_mean(a1_comm_repeat_sum, a1_n)},"
+                f"{a1_comm_repeat_nonzero},{_mean(a1_comm_repeat_nonzero, a1_n)},"
+                f"{a1_comm_forced_sum},{_mean(a1_comm_forced_sum, a1_n)},"
+                f"{a1_comm_forced_nonzero},{_mean(a1_comm_forced_nonzero, a1_n)},"
                 f"{a1_paired_comm_sum},{_mean(a1_paired_comm_sum, a1_n)},"
                 f"{a1_paired_comm_nonzero},{_mean(a1_paired_comm_nonzero, a1_n)},"
                 f"{a1_breakdown_total_sum},{_mean(a1_breakdown_total_sum, a1_n)},"
@@ -4157,6 +4255,7 @@ class MAPPOTrainer:
             "value_clipfrac",
             "optimizer_steps",
             "stopped_early",
+            "actor_frozen",
             "actor_lr",
             "critic_adapter_lr",
             "value_head_lr",
@@ -4525,6 +4624,8 @@ class MAPPOTrainer:
             "process_reward": t.process_reward,
             "sequence_reward": t.sequence_reward,
             "communication_reward": t.communication_reward,
+            "repeat_communication_reward": t.repeat_communication_reward,
+            "forced_communication_reward": t.forced_communication_reward,
             "paired_comm_reward": t.paired_comm_reward,
             "breakdown_total_reward": t.breakdown_total_reward,
         }
@@ -4552,6 +4653,12 @@ class MAPPOTrainer:
             process_reward=float(d.get("process_reward", d.get("reward", 0.0))),
             sequence_reward=float(d.get("sequence_reward", 0.0)),
             communication_reward=float(d.get("communication_reward", 0.0)),
+            repeat_communication_reward=float(
+                d.get("repeat_communication_reward", 0.0)
+            ),
+            forced_communication_reward=float(
+                d.get("forced_communication_reward", 0.0)
+            ),
             paired_comm_reward=float(d.get("paired_comm_reward", 0.0)),
             breakdown_total_reward=float(
                 d.get(
