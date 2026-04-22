@@ -52,10 +52,10 @@ trainer:
   lr_scheduler: linear
   lr_warmup_updates: 0
   lr_min_ratio: 0.0
-  train_batch_size: 8
+  train_batch_size: 2
   update_epochs: 1
   gradient_checkpointing: true
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   enable_fresh_value_metrics: false
   actor_freeze_updates: 3
   critic_stability_window: 2
