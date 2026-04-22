@@ -98,12 +98,10 @@ class RLVLLMService:
         value_runtime_requested = self.value_head is not None and KVTransferConfig is not None
         if value_runtime_requested:
             llm_kwargs["kv_transfer_config"] = KVTransferConfig(
-                kv_connector="HiddenStatesConnectorV1",
-                kv_role="kv_both",
+                kv_connector="ExampleHiddenStatesConnector",
+                kv_role="kv_producer",
                 kv_connector_extra_config={
-                    "storage_path": str(self.hidden_state_root),
-                    "save_hidden_states": True,
-                    "load_hidden_states": False,
+                    "shared_storage_path": str(self.hidden_state_root),
                 },
             )
             # vLLM's hidden-state extraction API expects a speculative config
@@ -129,7 +127,8 @@ class RLVLLMService:
         except Exception as exc:
             error_text = str(exc)
             if self.value_runtime_enabled and (
-                "HiddenStatesConnectorV1" in error_text
+                "ExampleHiddenStatesConnector" in error_text
+                or "HiddenStatesConnectorV1" in error_text
                 or "Unsupported connector type" in error_text
             ):
                 print(
@@ -301,8 +300,6 @@ class RLVLLMService:
     def value(self, request: ValueRequest) -> Dict[str, Any]:
         if self.value_head is None or not self.value_runtime_enabled:
             return {"value": 0.0, "available": False}
-        request_id = f"critic-{uuid.uuid4().hex}"
-        hidden_state_path = self.hidden_state_root / f"{request_id}.safetensors"
         prompt = request.critic_text
         sampling = SamplingParams(
             temperature=0.0,
@@ -312,12 +309,15 @@ class RLVLLMService:
             [prompt],
             sampling_params=sampling,
             lora_request=self._build_lora_request(request.adapter_name, strict=False),
-            kv_transfer_params={"request_id": request_id},
         )
         if not outputs:
             raise HTTPException(status_code=500, detail="Empty vLLM output for value request.")
-        if not hidden_state_path.exists():
+        output = outputs[0]
+        kv_transfer_params = getattr(output, "kv_transfer_params", None) or {}
+        hidden_states_path = kv_transfer_params.get("hidden_states_path")
+        if not hidden_states_path:
             return {"value": 0.0, "available": False}
+        hidden_state_path = Path(str(hidden_states_path))
         try:
             last_hidden = self._read_hidden_state_file(hidden_state_path)
             with torch.no_grad():
