@@ -207,7 +207,7 @@ if [[ "$PRE_CLEANUP" == "1" && -x "$REPO_ROOT/scripts/cleanup_rl_processes.sh" ]
     echo "[cluster-rl] pre-cleanup stale RL/vLLM processes under experiment_root=$EXPERIMENT_ROOT"
     RL_EXPERIMENT_ROOT="$EXPERIMENT_ROOT" \
         RL_CLEANUP_PURGE_OUTPUTS=0 \
-        RL_CLEANUP_FALLBACK_PORT_BLOCK=1 \
+        RL_CLEANUP_FALLBACK_PORT_BLOCK=0 \
         "$REPO_ROOT/scripts/cleanup_rl_processes.sh" || true
 fi
 
