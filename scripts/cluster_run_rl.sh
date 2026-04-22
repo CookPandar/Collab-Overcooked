@@ -182,6 +182,7 @@ RUNS_ROOT="$EXPERIMENT_ROOT/runs/rl"
 ROLLOUT_ROOT="$EXPERIMENT_ROOT/rollouts_kl"
 ROLLOUT_EVAL_ROOT="$EXPERIMENT_ROOT/rollouts_eval_kl"
 STATE_ROOT="$LOG_ROOT/rl_runtime"
+PRE_CLEANUP="${RL_PRE_CLEANUP:-1}"
 
 mkdir -p "$RUNS_ROOT" "$ROLLOUT_ROOT" "$ROLLOUT_EVAL_ROOT" "$LOG_ROOT/rl_vllm" "$LOG_ROOT/rl_workers" "$STATE_ROOT"
 find "$REPO_ROOT" -maxdepth 1 -name '.tmp_*.yaml' -delete 2>/dev/null || true
@@ -197,6 +198,18 @@ cleanup() {
     stop_vllm_servers
 }
 trap cleanup EXIT
+trap 'stop_vllm_servers; exit 130' INT
+trap 'stop_vllm_servers; exit 143' TERM
+trap 'stop_vllm_servers; exit 129' HUP
+trap 'stop_vllm_servers; exit 131' QUIT
+
+if [[ "$PRE_CLEANUP" == "1" && -x "$REPO_ROOT/scripts/cleanup_rl_processes.sh" ]]; then
+    echo "[cluster-rl] pre-cleanup stale RL/vLLM processes under experiment_root=$EXPERIMENT_ROOT"
+    RL_EXPERIMENT_ROOT="$EXPERIMENT_ROOT" \
+        RL_CLEANUP_PURGE_OUTPUTS=0 \
+        RL_CLEANUP_FALLBACK_PORT_BLOCK=1 \
+        "$REPO_ROOT/scripts/cleanup_rl_processes.sh" || true
+fi
 
 process_exists() {
     local pid="$1"
