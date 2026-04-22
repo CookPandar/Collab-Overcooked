@@ -379,6 +379,35 @@ class RewardAssignmentTest(unittest.TestCase):
         self.assertGreater(tracker.sequence_scores[0], 0.0)
         self.assertGreater(tracker.sequence_scores[1], 0.0)
 
+    def test_clear_pending_penalties_drops_snapshot_validator_debt(self):
+        tracker = self.build_tracker(
+            order="soup",
+            refs_agent0=["pickup(onion)", "cook(onion)"],
+            refs_agent1=["place_obj_on_counter()"],
+        )
+        tracker.import_state(
+            {
+                "sequence_histories": [[], []],
+                "sequence_scores": [0.0, 0.0],
+                "collab_sequence_scores": [0.0, 0.0],
+                "penalty_queue": [
+                    [{"type": "validator", "detail": "old chef error"}],
+                    [{"type": "validator", "detail": "old assistant error"}],
+                ],
+            }
+        )
+        tracker.clear_pending_penalties()
+        entry = tracker.register_llm_action(
+            agent_index=0,
+            timestamp=3,
+            action_text="pickup(onion)",
+            agent_name="Chef",
+            call_index=0,
+            call_type="planner_main",
+        )
+        self.assertEqual(tracker.penalty_queue, [[], []])
+        self.assertEqual(entry["validator_reward"], 0.0)
+
     def test_register_llm_action_combines_incremental_sequence_and_penalties(self):
         tracker = self.build_tracker(
             order="soup",

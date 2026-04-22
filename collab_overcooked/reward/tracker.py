@@ -218,6 +218,11 @@ class ProcessRewardTracker:
             restored = True
         return restored
 
+    def clear_pending_penalties(self) -> None:
+        """Drop unconsumed historical penalties after snapshot teleport."""
+        for queue in self.penalty_queue:
+            queue.clear()
+
     def register_llm_action(
         self,
         agent_index: int,
