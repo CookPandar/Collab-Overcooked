@@ -428,6 +428,105 @@ class RewardAssignmentTest(unittest.TestCase):
         self.assertEqual(entry["sequence_reward"], 1.0)
         self.assertEqual(entry["format_reward"], -0.5)
         self.assertEqual(entry["validator_reward"], 0.0)
+
+    def test_success_episode_requires_full_episode_return(self):
+        trainer = MAPPOTrainer.__new__(MAPPOTrainer)
+        trainer._last_rollout_stats = {}
+        trainer._current_episode_return = 0.0
+        trainer._current_episode_length = 0
+        trainer._current_episode_has_positive = False
+        trainer._current_episode_custom_stats = {
+            "agent0_total": 0.0,
+            "agent0_sequence": 0.0,
+            "agent0_format": 0.0,
+            "agent0_validator": 0.0,
+            "agent0_comm": 0.0,
+            "agent0_paired_comm": 0.0,
+            "agent1_total": 0.0,
+            "agent1_sequence": 0.0,
+            "agent1_format": 0.0,
+            "agent1_validator": 0.0,
+            "agent1_comm": 0.0,
+            "agent1_paired_comm": 0.0,
+            "team_total": 0.0,
+        }
+        trainer._episode_log_path = None
+        trainer._runtime_worker_id = lambda: 0
+        trainer._current_update_idx = 1
+        trainer._episode_counter = 0
+        trainer._extract_step_custom_reward_stats = lambda process_reward=None: {
+            "agent0_total": 0.0,
+            "agent0_sequence": 0.0,
+            "agent0_format": 0.0,
+            "agent0_validator": 0.0,
+            "agent0_comm": 0.0,
+            "agent0_paired_comm": 0.0,
+            "agent1_total": 0.0,
+            "agent1_sequence": 0.0,
+            "agent1_format": 0.0,
+            "agent1_validator": 0.0,
+            "agent1_comm": 0.0,
+            "agent1_paired_comm": 0.0,
+            "team_total": 0.0,
+        }
+        trainer._log_episode_return = lambda **kwargs: None
+
+        MAPPOTrainer._update_rollout_stats(
+            trainer,
+            step_reward=5.0,
+            done=False,
+            policy_calls=1,
+            process_reward=None,
+        )
+        MAPPOTrainer._update_rollout_stats(
+            trainer,
+            step_reward=10.0,
+            done=False,
+            policy_calls=1,
+            process_reward=None,
+        )
+        MAPPOTrainer._update_rollout_stats(
+            trainer,
+            step_reward=5.0,
+            done=True,
+            policy_calls=1,
+            process_reward=None,
+        )
+        self.assertEqual(trainer._last_rollout_stats["episodes_completed"], 1)
+        self.assertEqual(trainer._last_rollout_stats["success_episodes"], 1)
+
+        trainer._last_rollout_stats = {
+            "env_steps": 0,
+            "episodes_completed": 0,
+            "success_episodes": 0,
+            "env_reward_sum": 0.0,
+            "positive_reward_steps": 0,
+            "policy_calls": 0,
+            "episode_return_sum": 0.0,
+            "episode_lengths_sum": 0,
+            "agent0_custom_return_sum": 0.0,
+            "agent1_custom_return_sum": 0.0,
+            "team_custom_return_sum": 0.0,
+        }
+        trainer._current_episode_return = 0.0
+        trainer._current_episode_length = 0
+        trainer._current_episode_has_positive = False
+        MAPPOTrainer._update_rollout_stats(
+            trainer,
+            step_reward=1.0,
+            done=False,
+            policy_calls=1,
+            process_reward=None,
+        )
+        MAPPOTrainer._update_rollout_stats(
+            trainer,
+            step_reward=1.0,
+            done=True,
+            policy_calls=1,
+            process_reward=None,
+        )
+        self.assertEqual(trainer._last_rollout_stats["episodes_completed"], 1)
+        self.assertEqual(trainer._last_rollout_stats["success_episodes"], 0)
         self.assertEqual(entry["total"], 0.5)
 
         # Penalties should be consumed by exactly one call.

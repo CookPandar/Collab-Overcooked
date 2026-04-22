@@ -1860,7 +1860,7 @@ class MAPPOTrainer:
             self._current_episode_custom_stats[key] += float(value)
         if done:
             stats["episodes_completed"] += 1
-            if self._current_episode_has_positive:
+            if abs(float(self._current_episode_return) - 20.0) < 1e-6:
                 stats["success_episodes"] += 1
             stats["episode_return_sum"] += float(self._current_episode_return)
             stats["episode_lengths_sum"] += int(self._current_episode_length)
