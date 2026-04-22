@@ -338,6 +338,47 @@ class RewardAssignmentTest(unittest.TestCase):
             settings=settings,
         )
 
+    def test_bootstrap_histories_from_snapshot_recovers_prefix_actions(self):
+        tracker = self.build_tracker(
+            order="soup",
+            refs_agent0=["pickup(onion)", "cook(onion)", "serve(soup)"],
+            refs_agent1=["place_obj_on_counter()", "wash_dish()"],
+        )
+        tracker.import_state(
+            {
+                "sequence_histories": [[], []],
+                "sequence_scores": [0.0, 0.0],
+                "collab_sequence_scores": [0.0, 0.0],
+            }
+        )
+        restored = tracker.bootstrap_histories_from_snapshot(
+            {
+                "0": {
+                    "teammate_ml_actions": [
+                        {"timestamp": 1, "action": "place_obj_on_counter()"},
+                        {"timestamp": 2, "action": "wash_dish()"},
+                    ]
+                },
+                "1": {
+                    "teammate_ml_actions": [
+                        {"timestamp": 3, "action": "pickup(onion)"},
+                        {"timestamp": 5, "action": "cook(onion)"},
+                    ]
+                },
+            }
+        )
+        self.assertTrue(restored)
+        self.assertEqual(
+            tracker.sequence_histories[0],
+            ["pickup(onion)", "cook(onion)"],
+        )
+        self.assertEqual(
+            tracker.sequence_histories[1],
+            ["place_obj_on_counter()", "wash_dish()"],
+        )
+        self.assertGreater(tracker.sequence_scores[0], 0.0)
+        self.assertGreater(tracker.sequence_scores[1], 0.0)
+
     def test_register_llm_action_combines_incremental_sequence_and_penalties(self):
         tracker = self.build_tracker(
             order="soup",

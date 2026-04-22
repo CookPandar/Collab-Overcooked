@@ -89,6 +89,8 @@ def load_session_snapshot(session, snapshot: Dict[str, Any]):
     if tracker_state and session.reward_tracker:
         session.reward_tracker.import_state(tracker_state)
     agents_payload = snapshot.get("agents", {})
+    if isinstance(agents_payload, dict) and session.reward_tracker:
+        session.reward_tracker.bootstrap_histories_from_snapshot(agents_payload)
     if isinstance(agents_payload, dict):
         for idx, agent in enumerate(getattr(session.team, "agents", [])):
             payload = agents_payload.get(str(idx))

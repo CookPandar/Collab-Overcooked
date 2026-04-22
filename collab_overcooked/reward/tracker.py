@@ -162,6 +162,62 @@ class ProcessRewardTracker:
         self.call_events.clear()
         self.step_call_records.clear()
 
+    def bootstrap_histories_from_snapshot(
+        self, agents_payload: Optional[Dict[str, Any]]
+    ) -> bool:
+        """
+        Seed executed embodied action histories from snapshot agent payloads.
+
+        Off-policy snapshot files may restore the reward tracker with empty
+        ``sequence_histories`` even though each agent snapshot still stores the
+        teammate's completed medium-level actions in ``teammate_ml_actions``.
+        That causes TES/ITES style rewards to be computed from an empty prefix on
+        tail snapshots. When both histories are empty, recover them from the
+        cross-observed teammate action lists before continuing rollout.
+        """
+        if not isinstance(agents_payload, dict):
+            return False
+        if any(self.sequence_histories[idx] for idx in range(min(len(self.sequence_histories), 2))):
+            return False
+
+        restored = False
+        for agent_idx in range(2):
+            observer_payload = agents_payload.get(str(1 - agent_idx)) or {}
+            teammate_actions = observer_payload.get("teammate_ml_actions") or []
+            if not isinstance(teammate_actions, list):
+                continue
+            action_rows: List[Tuple[int, int, str]] = []
+            for order_idx, item in enumerate(teammate_actions):
+                if not isinstance(item, dict):
+                    continue
+                normalized = self._normalize_action(str(item.get("action") or ""))
+                if not normalized:
+                    continue
+                if normalized.lower().startswith("wait"):
+                    continue
+                if self._is_collab_action(normalized):
+                    continue
+                ts_raw = item.get("timestamp")
+                try:
+                    ts = int(ts_raw)
+                except (TypeError, ValueError):
+                    ts = order_idx
+                action_rows.append((ts, order_idx, normalized))
+            action_rows.sort(key=lambda row: (row[0], row[1]))
+            history = [row[2] for row in action_rows]
+            if not history:
+                continue
+            self.sequence_histories[agent_idx] = list(history)
+            self.sequence_scores[agent_idx] = self._best_sequence_score_from_history(
+                agent_idx, history
+            )
+            self.collab_sequence_scores[agent_idx] = max(
+                self.collab_sequence_scores[agent_idx],
+                self.sequence_scores[agent_idx],
+            )
+            restored = True
+        return restored
+
     def register_llm_action(
         self,
         agent_index: int,
