@@ -60,6 +60,20 @@ def _resolve_lora_dir(raw: str, base_dir: Path) -> str:
     return str(path)
 
 
+def _resolve_path_list_or_scalar(value, base_dir: Path):
+    if isinstance(value, str) and value:
+        return _resolve_path(value, base_dir)
+    if isinstance(value, list):
+        resolved = []
+        for item in value:
+            if isinstance(item, str) and item:
+                resolved.append(_resolve_path(item, base_dir))
+            else:
+                resolved.append(item)
+        return resolved
+    return value
+
+
 def _map_generated_path(path_str: str, repo_root: Path, experiment_root: Path) -> str:
     path = Path(path_str)
     if not path.is_absolute():
@@ -169,6 +183,9 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
         value = trainer.get(key)
         if isinstance(value, str) and value and not value.startswith("/"):
             trainer[key] = str(repo_root / value)
+    for key in ["off_policy_snapshots", "snapshot_files"]:
+        if key in trainer:
+            trainer[key] = _resolve_path_list_or_scalar(trainer.get(key), repo_root)
 
     if stage in {"collect", "eval"}:
         base_output = trainer.get("output_dir")

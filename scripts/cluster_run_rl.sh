@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Usage:
-#   bash scripts/cluster_run_rl.sh /path/to/collab_env [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--loop-rounds N] [-- main_rl args...]
+#   bash scripts/cluster_run_rl.sh /path/to/collab_env [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--loop-rounds N] [-- main_rl args...]
 #
 # Default behavior:
 #   - start one vLLM server per GPU on ports 9000+
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--loop-rounds N] [-- main_rl args...]" >&2
+    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--loop-rounds N] [-- main_rl args...]" >&2
     exit 1
 fi
 
@@ -64,6 +64,7 @@ EVAL_EVERY="${RL_EVAL_EVERY:-1}"
 COLLECT_CFG="${RL_COLLECT_CONFIG:-$REPO_ROOT/configs/rl_qwen_collect_snapshot_kl.yaml}"
 TRAIN_CFG="${RL_TRAIN_CONFIG:-$REPO_ROOT/configs/rl_qwen_train_kl.yaml}"
 EVAL_CFG="${RL_EVAL_CONFIG:-$REPO_ROOT/configs/rl_qwen_eval_kl.yaml}"
+SKIP_EVAL="${RL_SKIP_EVAL:-0}"
 VLLM_MODEL_PATH="${RL_VLLM_MODEL_PATH:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b}"
 VLLM_HOST="${RL_VLLM_HOST:-127.0.0.1}"
 VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
@@ -97,6 +98,10 @@ while [[ $# -gt 0 ]]; do
             LOOP_ROUNDS="$2"
             shift 2
             ;;
+        --skip-eval)
+            SKIP_EVAL=1
+            shift
+            ;;
         --)
             shift
             RUN_ARGS+=("$@")
@@ -108,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$SKIP_EVAL" == "1" ]]; then
+    EVAL_CFG=""
+fi
 
 for cfg in "$COLLECT_CFG" "$TRAIN_CFG" "$EVAL_CFG"; do
     if [[ -n "$cfg" && ! -f "$cfg" ]]; then
