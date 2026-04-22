@@ -104,7 +104,9 @@ def _apply_latest_override(
     trainer["model_path"] = _resolve_path(content, base_dir)
 
 
-def _build_lora_modules(config_path: Path) -> Tuple[str, List[Tuple[str, str]], int]:
+def _build_lora_modules(
+    config_path: Path,
+) -> Tuple[str, List[Tuple[str, str]], int, Optional[str]]:
     repo_root = Path(os.environ.get("RL_REPO_ROOT", str(Path.cwd()))).resolve()
     if yaml is not None:
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -134,6 +136,7 @@ def _build_lora_modules(config_path: Path) -> Tuple[str, List[Tuple[str, str]], 
         raise ValueError(f"trainer.model_path missing in {config_path}")
     modules: List[Tuple[str, str]] = []
     max_rank = 0
+    value_head_path = _resolve_path(trainer.get("value_head_path"), repo_root)
     actor_adapters = trainer.get("actor_adapters") or {}
     if isinstance(actor_adapters, dict):
         for key, value in sorted(actor_adapters.items()):
@@ -154,7 +157,20 @@ def _build_lora_modules(config_path: Path) -> Tuple[str, List[Tuple[str, str]], 
                     max_rank = max(max_rank, int(adapter_payload.get("r", 0) or 0))
                 except Exception:
                     pass
-    return model_path, modules, max_rank
+    critic_adapter = trainer.get("critic_adapter") or {}
+    if isinstance(critic_adapter, dict):
+        critic_lora_path = _resolve_lora_dir(critic_adapter.get("lora_path"), repo_root)
+        if critic_lora_path:
+            critic_name = str(critic_adapter.get("adapter_name") or "critic")
+            modules.append((critic_name, critic_lora_path))
+            adapter_cfg = Path(critic_lora_path) / "adapter_config.json"
+            if adapter_cfg.exists():
+                try:
+                    adapter_payload = json.loads(adapter_cfg.read_text(encoding="utf-8"))
+                    max_rank = max(max_rank, int(adapter_payload.get("r", 0) or 0))
+                except Exception:
+                    pass
+    return model_path, modules, max_rank, value_head_path
 
 
 def main() -> int:
@@ -175,6 +191,7 @@ def main() -> int:
     args = parser.parse_args()
 
     env = os.environ.copy()
+    repo_root = Path(os.environ.get("RL_REPO_ROOT", str(Path.cwd()))).resolve()
     env['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     env['VLLM_DP_RANK'] = '0'
     env['VLLM_DP_SIZE'] = '1'
@@ -198,33 +215,35 @@ def main() -> int:
     model_path = args.model
     lora_modules: List[Tuple[str, str]] = []
     inferred_max_lora_rank = 0
+    value_head_path: Optional[str] = None
     if args.config:
-        model_path, lora_modules, inferred_max_lora_rank = _build_lora_modules(
+        model_path, lora_modules, inferred_max_lora_rank, value_head_path = _build_lora_modules(
             Path(args.config).resolve()
+        )
+    if value_head_path:
+        env["RL_VLLM_VALUE_HEAD_PATH"] = value_head_path
+    if lora_modules:
+        env["RL_VLLM_LORA_MODULES_JSON"] = json.dumps(
+            [{"name": name, "path": path} for name, path in lora_modules]
         )
 
     cmd = [
         sys.executable,
-        '-m', 'vllm.entrypoints.openai.api_server',
+        str(repo_root / 'scripts' / 'serve_rl_vllm.py'),
         '--model', model_path,
         '--served-model-name', args.served_model_name,
         '--host', '127.0.0.1',
         '--port', str(args.port),
-        '--dtype', 'auto',
         '--max-model-len', str(args.max_model_len),
         '--gpu-memory-utilization', str(args.gpu_memory_utilization),
         '--api-key', args.api_key,
-        '--tensor-parallel-size', '1',
-        '--enable-prefix-caching',
-        '--enable-chunked-prefill',
-        '--disable-log-stats',
     ]
     if args.enforce_eager:
         cmd.append('--enforce-eager')
     if lora_modules:
+        max_loras = max(len(lora_modules), max(1, int(args.max_loras)))
         cmd.extend([
-            '--enable-lora',
-            '--max-loras', str(max(1, int(args.max_loras))),
+            '--max-loras', str(max_loras),
         ])
         max_lora_rank = int(args.max_lora_rank) if int(args.max_lora_rank) > 0 else inferred_max_lora_rank
         if max_lora_rank > 0:

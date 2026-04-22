@@ -14,13 +14,14 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import socket
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from openai import OpenAI
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1274,6 +1275,17 @@ class MAPPOTrainer:
         self.compute_values_in_collect = bool(
             trainer_cfg.get("compute_values_in_collect", False)
         )
+        self.collect_value_backend = str(
+            trainer_cfg.get(
+                "collect_value_backend",
+                "vllm" if self.collect_only else "local",
+            )
+        ).strip().lower()
+        self.use_vllm_value_service = bool(
+            self.collect_only
+            and self.compute_values_in_collect
+            and self.collect_value_backend == "vllm"
+        )
         self.enable_fresh_value_metrics = bool(
             trainer_cfg.get("enable_fresh_value_metrics", False)
         )
@@ -1291,7 +1303,23 @@ class MAPPOTrainer:
             trainer_cfg.get("critic_value_loss_tolerance", 0.0)
         )
         self.load_policy_model = self.train_only or (
-            self.collect_only and self.compute_values_in_collect
+            self.collect_only
+            and self.compute_values_in_collect
+            and not self.use_vllm_value_service
+        )
+        if self.collect_only and self.collect_value_backend == "vllm":
+            # In pure collect mode the worker should behave as an environment client:
+            # actor sampling and critic value requests must both be served by vLLM.
+            # Keep local model loading hard-disabled here to avoid duplicate GPU residency.
+            self.load_policy_model = False
+        self.accelerator.print(
+            "[MAPPO] runtime flags "
+            f"stage={self.runtime_stage_phase} "
+            f"collect_only={self.collect_only} train_only={self.train_only} "
+            f"compute_values_in_collect={self.compute_values_in_collect} "
+            f"collect_value_backend={self.collect_value_backend} "
+            f"use_vllm_value_service={self.use_vllm_value_service} "
+            f"load_policy_model={self.load_policy_model}"
         )
         target_kl_cfg = trainer_cfg.get("target_kl", None)
         self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
@@ -1420,6 +1448,11 @@ class MAPPOTrainer:
                 "[MAPPO] load_policy_model=false stage="
                 f"{self.runtime_stage_phase}; collect/eval use vLLM actor with tokenizer-only local state."
             )
+        self.accelerator.print(
+            "[MAPPO] collect_value_backend="
+            f"{self.collect_value_backend} compute_values_in_collect={self.compute_values_in_collect} "
+            f"use_vllm_value_service={self.use_vllm_value_service} load_policy_model={self.load_policy_model}"
+        )
         self.lr_scheduler = None
         if self.train_only:
             optimizer_groups: List[Dict[str, Any]] = []
@@ -2369,6 +2402,16 @@ class MAPPOTrainer:
             return_tensors="pt",
             add_special_tokens=False,
         )["input_ids"].squeeze(0).cpu()
+        critic_value = 0.0
+        if self.compute_values_in_collect and self.use_vllm_value_service:
+            critic_value = self._query_vllm_value(
+                critic_prompt=critic_prompt,
+                timeout=float(
+                    self.agents_cfg.get(f"agent_{agent_index}", {}).get(
+                        "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
+                    )
+                ),
+            )
         response_log_probs = actor_metadata.get("response_log_probs") or []
         response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
         total_log_prob = actor_metadata.get("log_prob")
@@ -2382,7 +2425,7 @@ class MAPPOTrainer:
             "response_log_probs": response_log_probs_tensor,
             "log_prob": float(total_log_prob),
             "policy_temperature": context.get("temperature"),
-            "value": 0.0,
+            "value": float(critic_value),
             "entropy": 0.0,
             "token_count": int(actor_metadata.get("token_count", len(response_ids))),
             "critic_input_ids": critic_input_ids,
@@ -2390,12 +2433,7 @@ class MAPPOTrainer:
         }
         return response_text, metadata
 
-    def _query_vllm_actor(
-        self,
-        agent_index: int,
-        messages: List[Dict[str, str]],
-        temperature: Optional[float],
-    ) -> Tuple[str, Dict[str, Any]]:
+    def _vllm_endpoint(self, path: str) -> Tuple[int, str]:
         rank_raw = (
             os.environ.get("RL_WORKER_RANK")
             or os.environ.get("LOCAL_RANK")
@@ -2408,43 +2446,74 @@ class MAPPOTrainer:
             rank = 0
         host = os.environ["RL_VLLM_HOST"]
         start_port = int(os.environ["RL_VLLM_START_PORT"])
-        api_key = os.environ.get("RL_VLLM_API_KEY", "YOUR_API_KEY")
-        base_url = f"http://{host}:{start_port + rank}/v1"
+        return rank, f"http://{host}:{start_port + rank}{path}"
+
+    def _post_json(
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        timeout: float,
+    ) -> Dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"vLLM endpoint HTTP {exc.code}: {detail}") from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"vLLM endpoint unavailable: {url} ({exc})") from exc
+        return json.loads(raw)
+
+    def _query_vllm_actor(
+        self,
+        agent_index: int,
+        messages: List[Dict[str, str]],
+        temperature: Optional[float],
+    ) -> Tuple[str, Dict[str, Any]]:
         model_name = self.agents_cfg.get(f"agent_{agent_index}", {}).get(
             "model", "qwen2.5-7B-instruct"
         )
+        actor_adapter_name = None
+        actor_spec = self.actor_adapters.get(agent_index)
+        if actor_spec is not None and actor_spec.name == model_name:
+            actor_adapter_name = actor_spec.name
         timeout = float(
             self.agents_cfg.get(f"agent_{agent_index}", {}).get(
                 "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
             )
         )
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        rank, endpoint_url = self._vllm_endpoint("/rl/generate")
         request_started = time.time()
         print(
             "[MAPPOTrainer] vllm request start "
             f"rank={rank} agent={agent_index} model={model_name} "
-            f"base_url={base_url} timeout={timeout} messages={len(messages)}"
+            f"url={endpoint_url} timeout={timeout} messages={len(messages)}"
         )
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            temperature=float(temperature if temperature is not None else 0.0),
-            max_tokens=int(self.trainer_cfg.get("max_new_tokens", 512)),
-            logprobs=True,
-            top_logprobs=1,
+        response = self._post_json(
+            endpoint_url,
+            {
+                "messages": messages,
+                "adapter_name": actor_adapter_name,
+                "temperature": float(temperature if temperature is not None else 0.0),
+                "max_tokens": int(self.trainer_cfg.get("max_new_tokens", 512)),
+            },
+            timeout=timeout,
         )
         elapsed = time.time() - request_started
-        response_text = response.choices[0].message.content or ""
-        content_logprobs = (
-            getattr(getattr(response.choices[0], "logprobs", None), "content", None)
-            or []
-        )
+        response_text = str(response.get("text") or "")
         token_logprobs = [
-            float(getattr(item, "logprob", 0.0))
-            for item in content_logprobs
-            if getattr(item, "logprob", None) is not None
+            float(item) for item in (response.get("response_log_probs") or [])
         ]
-        response_tokens = [getattr(item, "token", "") for item in content_logprobs]
+        response_tokens = [
+            str(item) for item in (response.get("response_tokens") or [])
+        ]
         print(
             "[MAPPOTrainer] vllm request done "
             f"rank={rank} agent={agent_index} model={model_name} "
@@ -2454,8 +2523,31 @@ class MAPPOTrainer:
             "response_log_probs": token_logprobs,
             "response_tokens": response_tokens,
             "log_prob": float(sum(token_logprobs)) if token_logprobs else 0.0,
-            "token_count": len(token_logprobs),
+            "token_count": int(response.get("token_count", len(token_logprobs))),
         }
+
+    def _query_vllm_value(self, critic_prompt: str, timeout: float) -> float:
+        rank, endpoint_url = self._vllm_endpoint("/rl/value")
+        request_started = time.time()
+        print(
+            "[MAPPOTrainer] vllm value start "
+            f"rank={rank} url={endpoint_url} prompt_chars={len(critic_prompt)}"
+        )
+        response = self._post_json(
+            endpoint_url,
+            {
+                "critic_text": critic_prompt,
+                "adapter_name": self.critic_adapter.name if self.critic_adapter else None,
+            },
+            timeout=timeout,
+        )
+        elapsed = time.time() - request_started
+        value = float(response.get("value", 0.0))
+        print(
+            "[MAPPOTrainer] vllm value done "
+            f"rank={rank} elapsed={elapsed:.2f}s value={value:.6f}"
+        )
+        return value
 
     def _policy_call_vllm_actor_local_critic(self, agent_index: int, messages, context):
         assert self.text_policy is not None
@@ -2489,11 +2581,21 @@ class MAPPOTrainer:
         critic_input_ids = tokenizer(critic_prompt, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
         critic_value = 0.0
         if self.compute_values_in_collect:
-            _, critic_value = model._evaluate_value_text_with_prefix(
-                critic_prefix,
-                critic_prompt,
-                adapter_name=model.critic_adapter_name,
-            )
+            if self.use_vllm_value_service:
+                critic_value = self._query_vllm_value(
+                    critic_prompt=critic_prompt,
+                    timeout=float(
+                        self.agents_cfg.get(f"agent_{agent_index}", {}).get(
+                            "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
+                        )
+                    ),
+                )
+            else:
+                _, critic_value = model._evaluate_value_text_with_prefix(
+                    critic_prefix,
+                    critic_prompt,
+                    adapter_name=model.critic_adapter_name,
+                )
 
         response_log_probs = actor_metadata.get("response_log_probs") or []
         response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
