@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Usage:
-#   bash scripts/cluster_run_rl.sh /path/to/collab_env [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--loop-rounds N] [-- main_rl args...]
+#   bash scripts/cluster_run_rl.sh /path/to/collab_env [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--resume] [--loop-rounds N] [-- main_rl args...]
 #
 # Default behavior:
 #   - start one vLLM server per GPU on ports 9000+
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--loop-rounds N] [-- main_rl args...]" >&2
+    echo "Usage: bash scripts/cluster_run_rl.sh <collab_env_prefix> [--collect-config cfg] [--train-config cfg] [--eval-config cfg] [--skip-eval] [--resume] [--loop-rounds N] [-- main_rl args...]" >&2
     exit 1
 fi
 
@@ -65,6 +65,7 @@ COLLECT_CFG="${RL_COLLECT_CONFIG:-$REPO_ROOT/configs/rl_qwen_collect_snapshot_kl
 TRAIN_CFG="${RL_TRAIN_CONFIG:-$REPO_ROOT/configs/rl_qwen_train_kl.yaml}"
 EVAL_CFG="${RL_EVAL_CONFIG:-$REPO_ROOT/configs/rl_qwen_eval_kl.yaml}"
 SKIP_EVAL="${RL_SKIP_EVAL:-0}"
+RESUME_RUN="${RL_RESUME:-0}"
 VLLM_MODEL_PATH="${RL_VLLM_MODEL_PATH:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b}"
 VLLM_HOST="${RL_VLLM_HOST:-127.0.0.1}"
 VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
@@ -102,6 +103,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_EVAL=1
             shift
             ;;
+        --resume)
+            RESUME_RUN=1
+            shift
+            ;;
         --)
             shift
             RUN_ARGS+=("$@")
@@ -117,6 +122,95 @@ done
 if [[ "$SKIP_EVAL" == "1" ]]; then
     EVAL_CFG=""
 fi
+
+detect_resume_round() {
+    COLLECT_CFG_ENV="$COLLECT_CFG" \
+    TRAIN_CFG_ENV="$TRAIN_CFG" \
+    EVAL_CFG_ENV="$EVAL_CFG" \
+    REPO_ROOT_ENV="$REPO_ROOT" \
+    "$PY_BIN" - <<'PY'
+import csv
+import json
+import os
+from pathlib import Path
+
+import yaml
+
+
+def resolve_path(raw: str, base: Path) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    return path
+
+
+def max_update_from_csv(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            values = []
+            for row in reader:
+                raw = (row or {}).get("update_idx")
+                if raw is None or raw == "":
+                    continue
+                try:
+                    values.append(int(raw))
+                except ValueError:
+                    continue
+        return max(values) if values else 0
+    except Exception:
+        return 0
+
+
+def max_update_from_latest(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+    if isinstance(payload, dict):
+        raw = payload.get("update_idx")
+        if raw is not None:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def inspect_cfg(raw_cfg: str, repo_root: Path) -> int:
+    if not raw_cfg:
+        return 0
+    cfg_path = Path(raw_cfg)
+    if not cfg_path.exists():
+        return 0
+    try:
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return 0
+    trainer = data.get("trainer") or {}
+    best = 0
+    latest_file = trainer.get("latest_model_path_file")
+    if latest_file:
+        best = max(best, max_update_from_latest(resolve_path(str(latest_file), repo_root)))
+    output_dir = trainer.get("output_dir")
+    if output_dir:
+        out = resolve_path(str(output_dir), repo_root)
+        for name in ("train_curve.csv", "reward_curve.csv", "performance_curve.csv"):
+            best = max(best, max_update_from_csv(out / name))
+    return best
+
+
+repo_root = Path(os.environ["REPO_ROOT_ENV"]).resolve()
+best = 0
+for key in ("COLLECT_CFG_ENV", "TRAIN_CFG_ENV", "EVAL_CFG_ENV"):
+    best = max(best, inspect_cfg(os.environ.get(key, ""), repo_root))
+print(best)
+PY
+}
 
 for cfg in "$COLLECT_CFG" "$TRAIN_CFG" "$EVAL_CFG"; do
     if [[ -n "$cfg" && ! -f "$cfg" ]]; then
@@ -649,8 +743,18 @@ run_stage() {
 }
 
 STATUS=0
-for ((i=1; i<=LOOP_ROUNDS; i++)); do
-    echo "[cluster-rl] round $i / $LOOP_ROUNDS"
+START_ROUND=1
+END_ROUND="$LOOP_ROUNDS"
+if [[ "$RESUME_RUN" == "1" ]]; then
+    LAST_COMPLETED="$(detect_resume_round)"
+    if [[ "$LAST_COMPLETED" =~ ^[0-9]+$ ]] && (( LAST_COMPLETED > 0 )); then
+        START_ROUND=$((LAST_COMPLETED + 1))
+    fi
+    END_ROUND=$((START_ROUND + LOOP_ROUNDS - 1))
+    echo "[cluster-rl] resume enabled last_completed=${LAST_COMPLETED:-0} start_round=$START_ROUND end_round=$END_ROUND"
+fi
+for ((i=START_ROUND; i<=END_ROUND; i++)); do
+    echo "[cluster-rl] round $i / $END_ROUND"
 
     set +e
     run_stage collect "$COLLECT_CFG"
