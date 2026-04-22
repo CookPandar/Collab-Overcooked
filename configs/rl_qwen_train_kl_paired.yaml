@@ -1,10 +1,9 @@
 environment:
-  layout: cramped_room
   order: baked_bell_pepper
-  horizon: 24
+  horizon: 17
 reward:
-  communication_penalty: 0.1
-  forced_communication_penalty: 0.4
+  communication_penalty: 0.0
+  forced_communication_penalty: 0.05
   paired_comm_reward_enabled: true
   paired_comm_request_positive_reward: 0.5
   paired_comm_request_negative_reward: -0.1
@@ -34,12 +33,12 @@ trainer:
       alpha: 16
       dropout: 0.05
   value_head_path: ./runs/value_head.pt
-  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/rollouts_kl
-  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/train_kl
-  save_interval: 10
+  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/rollouts_kl
+  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/runs/rl/train
+  save_interval: 1
   checkpoint_interval: 0
-  export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/export_latest_kl
-  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/paired_comm/runs/rl/latest_model_kl.json
+  export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/runs/rl/export_latest
+  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/runs/rl/latest_model.json
   apply_latest_model_override: true
   export_interval: 1
   max_new_tokens: 512
@@ -53,10 +52,10 @@ trainer:
   lr_scheduler: linear
   lr_warmup_updates: 0
   lr_min_ratio: 0.0
-  train_batch_size: 32
+  train_batch_size: 1
   update_epochs: 1
   gradient_checkpointing: true
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
   enable_fresh_value_metrics: false
   actor_freeze_updates: 3
   critic_stability_window: 2
@@ -69,7 +68,7 @@ trainer:
   value_coef: 0.5
   max_grad_norm: 0.5
   cleanup_rollouts: true
-  steps_per_update: 256
+  steps_per_update: 64
 agents:
   num_agents: 2
   agent_0:
@@ -79,7 +78,7 @@ agents:
     base_url: http://127.0.0.1:9000/v1
     temperature: 0
     max_tokens: 512
-    timeout: 30
+    timeout: 180
     max_retries: 3
     role: Chef
     local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
@@ -93,7 +92,7 @@ agents:
     base_url: http://127.0.0.1:9001/v1
     temperature: 0
     max_tokens: 512
-    timeout: 30
+    timeout: 180
     max_retries: 3
     role: Assistant
     local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
