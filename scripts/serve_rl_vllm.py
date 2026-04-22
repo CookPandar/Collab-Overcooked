@@ -106,12 +106,17 @@ class RLVLLMService:
                     "load_hidden_states": False,
                 },
             )
+            # vLLM's hidden-state extraction API expects a speculative config
+            # that routes auxiliary hidden states through a dummy draft model.
+            # Older "eagle_*" top-level fields are rejected by recent schemas.
             llm_kwargs["speculative_config"] = {
-                "method": "eagle",
-                "model": self.model_path,
+                "method": "extract_hidden_states",
                 "num_speculative_tokens": 1,
-                "eagle_num_layers": 1,
-                "eagle_aux_hidden_state_layer_ids": [self.last_hidden_layer],
+                "draft_model_config": {
+                    "hf_config": {
+                        "eagle_aux_hidden_state_layer_ids": [self.last_hidden_layer],
+                    }
+                },
             }
         llm_signature = inspect.signature(LLM.__init__)
         accepts_var_kwargs = any(
