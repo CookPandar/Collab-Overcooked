@@ -95,8 +95,8 @@ class RLVLLMService:
             llm_kwargs["max_loras"] = max(1, int(args.max_loras))
             if int(args.max_lora_rank) > 0:
                 llm_kwargs["max_lora_rank"] = int(args.max_lora_rank)
-        value_runtime_enabled = self.value_head is not None and KVTransferConfig is not None
-        if value_runtime_enabled:
+        value_runtime_requested = self.value_head is not None and KVTransferConfig is not None
+        if value_runtime_requested:
             llm_kwargs["kv_transfer_config"] = KVTransferConfig(
                 kv_connector="HiddenStatesConnectorV1",
                 kv_role="kv_both",
@@ -118,25 +118,31 @@ class RLVLLMService:
                     }
                 },
             }
-        llm_signature = inspect.signature(LLM.__init__)
-        accepts_var_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in llm_signature.parameters.values()
-        )
-        filtered_llm_kwargs = (
-            dict(llm_kwargs)
-            if accepts_var_kwargs
-            else {
-                key: value
-                for key, value in llm_kwargs.items()
-                if key in llm_signature.parameters
-            }
-        )
-        self.value_runtime_enabled = value_runtime_enabled and (
+        filtered_llm_kwargs = self._filter_llm_kwargs(llm_kwargs)
+        requested_value_runtime_enabled = value_runtime_requested and (
             "kv_transfer_config" in filtered_llm_kwargs
             and "speculative_config" in filtered_llm_kwargs
         )
-        self.llm = LLM(**filtered_llm_kwargs)
+        self.value_runtime_enabled = bool(requested_value_runtime_enabled)
+        try:
+            self.llm = LLM(**filtered_llm_kwargs)
+        except Exception as exc:
+            error_text = str(exc)
+            if self.value_runtime_enabled and (
+                "HiddenStatesConnectorV1" in error_text
+                or "Unsupported connector type" in error_text
+            ):
+                print(
+                    "[RLVLLMService] hidden-state value runtime unsupported by current vLLM; "
+                    "falling back to actor-only mode.",
+                    flush=True,
+                )
+                filtered_llm_kwargs.pop("kv_transfer_config", None)
+                filtered_llm_kwargs.pop("speculative_config", None)
+                self.value_runtime_enabled = False
+                self.llm = LLM(**filtered_llm_kwargs)
+            else:
+                raise
         print(
             "[RLVLLMService] init "
             f"model={self.model_path} "
@@ -147,6 +153,23 @@ class RLVLLMService:
             f"value_head={bool(self.value_head is not None)} "
             f"value_runtime_enabled={self.value_runtime_enabled}",
             flush=True,
+        )
+
+    @staticmethod
+    def _filter_llm_kwargs(llm_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        llm_signature = inspect.signature(LLM.__init__)
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in llm_signature.parameters.values()
+        )
+        return (
+            dict(llm_kwargs)
+            if accepts_var_kwargs
+            else {
+                key: value
+                for key, value in llm_kwargs.items()
+                if key in llm_signature.parameters
+            }
         )
 
     def _load_lora_modules(self) -> Dict[str, Dict[str, Any]]:
