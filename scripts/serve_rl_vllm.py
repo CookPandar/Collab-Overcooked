@@ -114,11 +114,19 @@ class RLVLLMService:
                 "eagle_aux_hidden_state_layer_ids": [self.last_hidden_layer],
             }
         llm_signature = inspect.signature(LLM.__init__)
-        filtered_llm_kwargs = {
-            key: value
-            for key, value in llm_kwargs.items()
-            if key in llm_signature.parameters
-        }
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in llm_signature.parameters.values()
+        )
+        filtered_llm_kwargs = (
+            dict(llm_kwargs)
+            if accepts_var_kwargs
+            else {
+                key: value
+                for key, value in llm_kwargs.items()
+                if key in llm_signature.parameters
+            }
+        )
         self.value_runtime_enabled = value_runtime_enabled and (
             "kv_transfer_config" in filtered_llm_kwargs
             and "speculative_config" in filtered_llm_kwargs
@@ -128,6 +136,9 @@ class RLVLLMService:
             "[RLVLLMService] init "
             f"model={self.model_path} "
             f"lora_modules={sorted(self.lora_modules.keys())} "
+            f"enable_lora={bool(filtered_llm_kwargs.get('enable_lora', False))} "
+            f"max_loras={filtered_llm_kwargs.get('max_loras')} "
+            f"max_lora_rank={filtered_llm_kwargs.get('max_lora_rank')} "
             f"value_head={bool(self.value_head is not None)} "
             f"value_runtime_enabled={self.value_runtime_enabled}",
             flush=True,
