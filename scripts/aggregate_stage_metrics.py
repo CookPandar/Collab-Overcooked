@@ -3,21 +3,48 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import yaml
+def _extract_yaml_scalar_block(config_text: str, block_name: str, key: str) -> str:
+    in_block = False
+    block_indent = 0
+    for raw_line in config_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if not in_block:
+            if indent == 0 and stripped == f"{block_name}:":
+                in_block = True
+                block_indent = indent
+            continue
+        if indent <= block_indent:
+            in_block = False
+            if indent == 0 and stripped == f"{block_name}:":
+                in_block = True
+                block_indent = indent
+            continue
+        if stripped.startswith(f"{key}:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value.strip("\"'")
+    return ""
 
 
 def _resolve_output_dir(config_path: Path, repo_root: Path) -> Path:
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    trainer = data.get("trainer") or {}
-    output_dir = trainer.get("output_dir")
-    if isinstance(output_dir, str) and output_dir:
+    explicit_output_dir = os.environ.get("RL_STAGE_OUTPUT_DIR", "").strip()
+    if explicit_output_dir:
+        return Path(explicit_output_dir).resolve()
+
+    config_text = config_path.read_text(encoding="utf-8")
+    output_dir = _extract_yaml_scalar_block(config_text, "trainer", "output_dir")
+    if output_dir:
         path = Path(output_dir)
         return path if path.is_absolute() else (repo_root / path).resolve()
-    order = ((data.get("environment") or {}).get("order")) or "task"
+
+    order = _extract_yaml_scalar_block(config_text, "environment", "order") or "task"
     return (repo_root / "results" / f"mappo_{order}").resolve()
 
 

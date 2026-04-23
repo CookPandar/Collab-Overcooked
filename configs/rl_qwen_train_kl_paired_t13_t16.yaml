@@ -47,16 +47,16 @@ trainer:
   gamma: 0.99
   gae_lambda: 0.95
   actor_lr: 1.0e-06
-  critic_lr: 3.0e-07
-  value_head_lr: 1.0e-06
+  critic_lr: 1.0e-06
+  value_head_lr: 2.0e-06
   lr_scheduler: linear
   lr_warmup_updates: 0
   lr_min_ratio: 0.0
   train_batch_size: 1
-  update_epochs: 1
+  update_epochs: 2
   gradient_checkpointing: true
   gradient_accumulation_steps: 8
-  enable_fresh_value_metrics: false
+  enable_fresh_value_metrics: true
   actor_freeze_updates: 3
   critic_stability_window: 2
   critic_value_loss_threshold: 1.5
@@ -64,8 +64,9 @@ trainer:
   target_kl: 0.01
   kl_penalty_coef: 0.05
   clip_coef: 0.15
+  value_clip_coef: 1.0
   entropy_coef: 0.01
-  value_coef: 0.5
+  value_coef: 1.0
   max_grad_norm: 0.5
   cleanup_rollouts: true
   steps_per_update: 64
