@@ -392,21 +392,6 @@ else:
 PY
 }
 
-wait_for_port_bindable() {
-    local port="$1"
-    local retries="${2:-30}"
-    local sleep_s="${3:-1}"
-    local attempt
-    for attempt in $(seq 1 "$retries"); do
-        if port_is_bindable "$port"; then
-            return 0
-        fi
-        sleep "$sleep_s"
-    done
-    echo "[cluster-rl] port still not bindable after waiting: $port" >&2
-    return 1
-}
-
 ensure_train_master_port() {
     local desired_port="$1"
     if ! port_is_bindable "$desired_port"; then
@@ -504,13 +489,11 @@ stop_vllm_servers() {
     for port in "${VLLM_PORTS[@]:-}"; do
         if [[ -n "$port" ]]; then
             kill_port_listener "$port"
-            wait_for_port_bindable "$port" 10 1 || true
         fi
     done
     for port in "${VLLM_ENGINE_PORTS[@]:-}"; do
         if [[ -n "$port" ]]; then
             kill_port_listener "$port"
-            wait_for_port_bindable "$port" 10 1 || true
         fi
     done
     for base in "${VLLM_INTERNAL_PORT_BASES[@]:-}"; do
@@ -518,7 +501,6 @@ stop_vllm_servers() {
             for ((offset=0; offset<VLLM_INTERNAL_PORT_SPAN; offset++)); do
                 local internal_port=$((base + offset))
                 kill_port_listener "$internal_port"
-                wait_for_port_bindable "$internal_port" 10 1 || true
             done
         fi
     done
@@ -584,12 +566,9 @@ start_vllm_servers() {
         VLLM_INTERNAL_PORT_BASES+=("$internal_port_base")
         kill_port_listener "$port"
         kill_port_listener "$engine_port"
-        wait_for_port_bindable "$port" 10 1 || true
-        wait_for_port_bindable "$engine_port" 10 1 || true
         for ((offset=0; offset<VLLM_INTERNAL_PORT_SPAN; offset++)); do
             local internal_port=$((internal_port_base + offset))
             kill_port_listener "$internal_port"
-            wait_for_port_bindable "$internal_port" 10 1 || true
         done
         local log_file="$LOG_ROOT/rl_vllm/vllm_${stage_name}_gpu${gpu}.log"
         echo "[cluster-rl] starting vLLM stage=$stage_name gpu=$gpu port=$port engine_port=$engine_port internal_port_base=$internal_port_base"
