@@ -69,6 +69,7 @@ RESUME_RUN="${RL_RESUME:-0}"
 VLLM_MODEL_PATH="${RL_VLLM_MODEL_PATH:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b}"
 VLLM_HOST="${RL_VLLM_HOST:-127.0.0.1}"
 VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
+VLLM_START_RETRIES="${RL_VLLM_START_RETRIES:-3}"
 MASTER_PORT="${RL_MASTER_PORT:-29540}"
 GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
 MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
@@ -706,9 +707,25 @@ run_stage() {
         return 0
     fi
     if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
-        stop_vllm_servers
-        reserve_vllm_port_block "$VLLM_START_PORT" "$NUM_PROCS" || return 1
-        ensure_vllm_servers "$cfg_path" "$stage_name"
+        local attempt=1
+        local next_base_port="$VLLM_START_PORT"
+        local reserved_start_port=""
+        while (( attempt <= VLLM_START_RETRIES )); do
+            stop_vllm_servers
+            reserve_vllm_port_block "$next_base_port" "$NUM_PROCS" || return 1
+            reserved_start_port="$VLLM_START_PORT"
+            if ensure_vllm_servers "$cfg_path" "$stage_name"; then
+                break
+            fi
+            echo "[cluster-rl] failed to start vLLM stage=$stage_name on port block start=$reserved_start_port attempt=$attempt/$VLLM_START_RETRIES" >&2
+            stop_vllm_servers
+            attempt=$((attempt + 1))
+            next_base_port=$((reserved_start_port + 1))
+        done
+        if (( attempt > VLLM_START_RETRIES )); then
+            echo "[cluster-rl] exhausted vLLM startup retries for stage=$stage_name" >&2
+            return 1
+        fi
     else
         stop_vllm_servers
     fi
