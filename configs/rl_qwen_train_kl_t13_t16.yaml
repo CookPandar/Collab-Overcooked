@@ -1,0 +1,99 @@
+environment:
+  order: baked_bell_pepper
+  horizon: 17
+reward:
+  communication_penalty: 0.1
+  forced_communication_penalty: 0.4
+  paired_comm_reward_enabled: false
+  paired_comm_request_positive_reward: 0.5
+  paired_comm_request_negative_reward: -0.1
+  paired_comm_response_positive_reward: 0.5
+  paired_comm_response_negative_reward: -0.1
+  paired_comm_deny_reward: 1.0
+trainer:
+  type: mappo
+  train_only: true
+  collect_only: false
+  fix_mistral_regex: true
+  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+  lora_path: null
+  lora: {}
+  actor_adapters:
+    agent_0:
+      adapter_name: Chef
+      lora_path: ./runs/Chef
+    agent_1:
+      adapter_name: Assistant
+      lora_path: ./runs/Assistant
+  critic_adapter:
+    adapter_name: critic
+    lora_path: ./runs/adapter_critic/critic
+    lora_config:
+      r: 8
+      alpha: 16
+      dropout: 0.05
+  value_head_path: ./runs/value_head.pt
+  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_process_debug/rollouts_kl
+  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_process_debug/runs/rl/train
+  save_interval: 1
+  checkpoint_interval: 0
+  export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_process_debug/runs/rl/export_latest
+  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_process_debug/runs/rl/latest_model.json
+  apply_latest_model_override: true
+  export_interval: 1
+  max_new_tokens: 512
+  generation_temperature: 0.0
+  evaluation_batch_size: 32
+  gamma: 0.99
+  gae_lambda: 0.95
+  actor_lr: 1.0e-06
+  critic_lr: 1.0e-06
+  value_head_lr: 2.0e-06
+  lr_scheduler: linear
+  lr_warmup_updates: 0
+  lr_min_ratio: 0.0
+  train_batch_size: 1
+  update_epochs: 4
+  gradient_checkpointing: true
+  gradient_accumulation_steps: 8
+  enable_fresh_value_metrics: true
+  critic_pretrain_value_loss_threshold: 0.5
+  target_kl: 0.01
+  kl_penalty_coef: 0.05
+  clip_coef: 0.15
+  value_clip_coef: 1.0
+  entropy_coef: 0.01
+  value_coef: 1.0
+  max_grad_norm: 0.5
+  cleanup_rollouts: true
+  steps_per_update: 64
+agents:
+  num_agents: 2
+  agent_0:
+    type: vllm
+    model: qwen2.5-7B-instruct
+    api_key: YOUR_API_KEY
+    base_url: http://127.0.0.1:9000/v1
+    temperature: 0
+    max_tokens: 512
+    timeout: 180
+    max_retries: 3
+    role: Chef
+    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    cuda_visible_devices:
+    - 0
+    data_parallel_size: 1
+  agent_1:
+    type: vllm
+    model: qwen2.5-7B-instruct
+    api_key: YOUR_API_KEY
+    base_url: http://127.0.0.1:9001/v1
+    temperature: 0
+    max_tokens: 512
+    timeout: 180
+    max_retries: 3
+    role: Assistant
+    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    cuda_visible_devices:
+    - 1
+    data_parallel_size: 1
