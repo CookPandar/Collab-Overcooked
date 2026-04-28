@@ -1292,18 +1292,13 @@ class MAPPOTrainer:
         self.enable_fresh_value_metrics = bool(
             trainer_cfg.get("enable_fresh_value_metrics", False)
         )
-        self.actor_freeze_updates = max(
-            0, int(trainer_cfg.get("actor_freeze_updates", 0))
+        critic_pretrain_threshold_cfg = trainer_cfg.get(
+            "critic_pretrain_value_loss_threshold", None
         )
-        self.critic_stability_window = max(
-            0, int(trainer_cfg.get("critic_stability_window", 0))
-        )
-        critic_threshold_cfg = trainer_cfg.get("critic_value_loss_threshold", None)
-        self.critic_value_loss_threshold = (
-            float(critic_threshold_cfg) if critic_threshold_cfg is not None else None
-        )
-        self.critic_value_loss_tolerance = float(
-            trainer_cfg.get("critic_value_loss_tolerance", 0.0)
+        self.critic_pretrain_value_loss_threshold = (
+            float(critic_pretrain_threshold_cfg)
+            if critic_pretrain_threshold_cfg is not None
+            else None
         )
         self.load_policy_model = self.train_only or (
             self.collect_only
@@ -1604,64 +1599,20 @@ class MAPPOTrainer:
                 current["value_head_lr"] = lr
         return current
 
-    def _recent_train_curve_rows(self, limit: int) -> List[Dict[str, str]]:
-        if limit <= 0:
-            return []
-        path = self.output_dir / "train_curve.csv"
-        if not path.exists():
-            return []
-        try:
-            lines = [
-                line.strip()
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        except OSError:
-            return []
-        if len(lines) <= 1:
-            return []
-        header = lines[0].split(",")
-        rows: List[Dict[str, str]] = []
-        for line in lines[1:]:
-            values = line.split(",")
-            if len(values) != len(header):
-                continue
-            rows.append(dict(zip(header, values)))
-        return rows[-limit:]
+    def _critic_pretrain_enabled(self) -> bool:
+        return self.critic_pretrain_value_loss_threshold is not None
 
-    def _critic_warmup_status(self, update_idx: int) -> Tuple[bool, str]:
-        if int(update_idx) <= self.actor_freeze_updates:
-            return True, f"min_updates<{self.actor_freeze_updates}"
-        if (
-            self.critic_stability_window <= 0
-            or self.critic_value_loss_threshold is None
-        ):
-            return False, "disabled"
-        recent_rows = self._recent_train_curve_rows(self.critic_stability_window)
-        if len(recent_rows) < self.critic_stability_window:
+    def _critic_pretrain_release_status(
+        self,
+        epoch_value_loss: float,
+    ) -> Tuple[bool, str]:
+        if self.critic_pretrain_value_loss_threshold is None:
+            return True, "disabled"
+        if epoch_value_loss <= float(self.critic_pretrain_value_loss_threshold):
             return True, (
-                f"need_history<{self.critic_stability_window}"
+                f"value_loss<={self.critic_pretrain_value_loss_threshold}"
             )
-        value_losses: List[float] = []
-        for row in recent_rows:
-            raw = row.get("value_loss", "")
-            try:
-                value_losses.append(float(raw))
-            except (TypeError, ValueError):
-                return True, "invalid_history"
-        if len(value_losses) < self.critic_stability_window:
-            return True, "invalid_history"
-        mean_loss = sum(value_losses) / float(len(value_losses))
-        span_loss = max(value_losses) - min(value_losses)
-        if mean_loss > float(self.critic_value_loss_threshold):
-            return True, (
-                f"value_loss_mean>{self.critic_value_loss_threshold}"
-            )
-        if span_loss > float(self.critic_value_loss_tolerance):
-            return True, (
-                f"value_loss_span>{self.critic_value_loss_tolerance}"
-            )
-        return False, "stable"
+        return False, f"value_loss>{self.critic_pretrain_value_loss_threshold}"
 
     def _runtime_stage_round_idx(self) -> int:
         raw = os.getenv("RL_STAGE_ROUND_IDX", "").strip()
@@ -3311,10 +3262,7 @@ class MAPPOTrainer:
             self.text_policy
         )
         rank = self.accelerator.process_index
-        current_update_idx = self._current_train_round_idx()
-        actor_frozen, actor_freeze_reason = self._critic_warmup_status(
-            current_update_idx
-        )
+        critic_pretrain_gate = self._critic_pretrain_enabled()
         prompt_tensors = [t.prompt_ids for t in transitions]
         response_tensors = [t.response_ids for t in transitions]
         critic_tensors = [t.critic_input_ids for t in transitions]
@@ -3365,7 +3313,8 @@ class MAPPOTrainer:
             f"epochs={self.update_epochs} minibatches={num_minibatches} "
             f"grad_accum={self.gradient_accumulation_steps} "
             f"optimizer_steps_per_update={optimizer_steps_per_update} "
-            f"actor_frozen={actor_frozen} reason={actor_freeze_reason}",
+            f"critic_pretrain_gate={critic_pretrain_gate} "
+            f"critic_pretrain_value_loss_threshold={self.critic_pretrain_value_loss_threshold}",
             flush=True,
         )
         scheduler = self._build_lr_scheduler(optimizer_steps_per_update)
@@ -3393,12 +3342,15 @@ class MAPPOTrainer:
         actual_optimization_steps = 0
         accum_counter = 0
         stop_early = False
-        stop_policy_updates = actor_frozen
+        stop_policy_updates = critic_pretrain_gate
         accum_approx_kl_sum = 0.0
         accum_approx_kl_count = 0
 
         self.optimizer.zero_grad()
+        last_pretrain_value_mean = float("inf")
         for epoch_idx in range(self.update_epochs):
+            epoch_value_total = 0.0
+            epoch_metric_steps = 0
             print(
                 "[MAPPO] update_policy epoch_start "
                 f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs}",
@@ -3571,7 +3523,18 @@ class MAPPOTrainer:
                 )
                 value_losses = (values - batch_returns) ** 2
                 value_losses_clipped = (value_pred_clipped - batch_returns) ** 2
-                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                value_loss_unclipped = 0.5 * value_losses.mean()
+                value_loss_clipped = 0.5 * torch.max(
+                    value_losses, value_losses_clipped
+                ).mean()
+                value_loss = (
+                    value_loss_unclipped
+                    if critic_pretrain_gate
+                    else value_loss_clipped
+                )
+                batch_value_loss_for_gate = float(
+                    value_loss_unclipped.detach().item()
+                )
                 loss = (
                     policy_loss
                     + self.value_coef * value_loss
@@ -3584,6 +3547,33 @@ class MAPPOTrainer:
                     f"minibatch={minibatch_idx}/{num_minibatches}",
                     flush=True,
                 )
+                released_current_minibatch = False
+                if critic_pretrain_gate:
+                    last_pretrain_value_mean = batch_value_loss_for_gate
+                    can_release, release_reason = self._critic_pretrain_release_status(
+                        epoch_value_loss=batch_value_loss_for_gate,
+                    )
+                    if can_release and not stop_early:
+                        critic_pretrain_gate = False
+                        stop_policy_updates = False
+                        released_current_minibatch = True
+                        print(
+                            "[MAPPO] critic_pretrain release_actor "
+                            f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                            f"minibatch={minibatch_idx}/{num_minibatches} "
+                            f"value_loss={batch_value_loss_for_gate:.6f} "
+                            f"reason={release_reason}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[MAPPO] critic_pretrain keep_actor_blocked "
+                            f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                            f"minibatch={minibatch_idx}/{num_minibatches} "
+                            f"value_loss={batch_value_loss_for_gate:.6f} "
+                            f"reason={release_reason} stop_early={stop_early}",
+                            flush=True,
+                        )
                 self.accelerator.backward(
                     (self.value_coef * value_loss)
                     / float(self.gradient_accumulation_steps)
@@ -3594,6 +3584,114 @@ class MAPPOTrainer:
                     f"minibatch={minibatch_idx}/{num_minibatches}",
                     flush=True,
                 )
+                if released_current_minibatch:
+                    print(
+                        "[MAPPO] critic_pretrain before release_policy_forward "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches}",
+                        flush=True,
+                    )
+                    _, entropies_release, token_log_probs_release = (
+                        unwrapped_model.evaluate_policy_batch(
+                            batch_prompts,
+                            batch_responses,
+                            batch_agent_indices,
+                            policy_temperatures=[
+                                policy_temperatures[i] for i in batch_indices
+                            ],
+                        )
+                    )
+                    token_logratio_parts_release: List[torch.Tensor] = []
+                    token_policy_loss_parts_release: List[torch.Tensor] = []
+                    for sample_idx, (new_lp, old_lp) in enumerate(
+                        zip(token_log_probs_release, batch_old_token_log_probs)
+                    ):
+                        if new_lp.numel() == 0:
+                            continue
+                        if old_lp.numel() != new_lp.numel():
+                            if old_lp.numel() == 0:
+                                old_lp = torch.zeros_like(new_lp)
+                            else:
+                                old_lp = old_lp[: new_lp.numel()]
+                                if old_lp.numel() < new_lp.numel():
+                                    pad = old_lp.new_full(
+                                        (new_lp.numel() - old_lp.numel(),),
+                                        float(old_lp[-1].item()) if old_lp.numel() > 0 else 0.0,
+                                    )
+                                    old_lp = torch.cat([old_lp, pad], dim=0)
+                        sample_token_logratio = new_lp - old_lp
+                        sample_token_ratios = torch.exp(sample_token_logratio)
+                        sample_adv = batch_adv[sample_idx].expand_as(
+                            sample_token_logratio
+                        )
+                        sample_clipped_ratios = torch.clamp(
+                            sample_token_ratios,
+                            1.0 - self.clip_coef,
+                            1.0 + self.clip_coef,
+                        )
+                        sample_surr1 = sample_token_ratios * sample_adv
+                        sample_surr2 = sample_clipped_ratios * sample_adv
+                        token_logratio_parts_release.append(sample_token_logratio)
+                        token_policy_loss_parts_release.append(
+                            -torch.min(sample_surr1, sample_surr2).mean()
+                        )
+                    token_logratio_release = (
+                        torch.cat(token_logratio_parts_release, dim=0)
+                        if token_logratio_parts_release
+                        else torch.empty(0, dtype=torch.float32, device=self.device)
+                    )
+                    token_ratios_release = (
+                        torch.exp(token_logratio_release)
+                        if token_logratio_release.numel() > 0
+                        else token_logratio_release
+                    )
+                    policy_loss_release = (
+                        torch.stack(token_policy_loss_parts_release).mean()
+                        if token_policy_loss_parts_release
+                        else torch.zeros((), dtype=torch.float32, device=self.device)
+                    )
+                    approx_kl_release = (
+                        ((token_ratios_release - 1.0) - token_logratio_release)
+                        .mean()
+                        .clamp_min(0.0)
+                        if token_logratio_release.numel() > 0
+                        else torch.zeros((), dtype=torch.float32, device=self.device)
+                    )
+                    entropy_loss_release = -entropies_release.to(
+                        self.device, dtype=torch.float32
+                    ).mean()
+                    kl_penalty_release = approx_kl_release * self.kl_penalty_coef
+                    policy_objective_release = (
+                        policy_loss_release
+                        + self.entropy_coef * entropy_loss_release
+                        + kl_penalty_release
+                    )
+                    self.accelerator.backward(
+                        policy_objective_release
+                        / float(self.gradient_accumulation_steps)
+                    )
+                    policy_loss_raw = policy_loss_release
+                    policy_loss = policy_loss_release
+                    entropy_loss_raw = entropy_loss_release
+                    entropy_loss = entropy_loss_release
+                    kl_penalty_raw = kl_penalty_release
+                    kl_penalty = kl_penalty_release
+                    approx_kl = approx_kl_release
+                    token_approx_kl = approx_kl_release
+                    token_ratios = token_ratios_release
+                    entropies = entropies_release.to(self.device, dtype=torch.float32)
+                    loss = (
+                        policy_loss
+                        + self.value_coef * value_loss
+                        + self.entropy_coef * entropy_loss
+                        + kl_penalty
+                    )
+                    print(
+                        "[MAPPO] critic_pretrain after release_policy_backward "
+                        f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                        f"minibatch={minibatch_idx}/{num_minibatches}",
+                        flush=True,
+                    )
                 accum_counter += 1
                 accum_approx_kl_sum += float(approx_kl.item())
                 accum_approx_kl_count += 1
@@ -3649,6 +3747,8 @@ class MAPPOTrainer:
                 total_loss += loss.item()
                 total_policy += policy_loss_raw.item()
                 total_value += value_loss.item()
+                epoch_value_total += float(value_loss.item())
+                epoch_metric_steps += 1
                 total_entropy += entropies.mean().item()
                 total_clipfrac += (
                     ((token_ratios - 1.0).abs() > self.clip_coef).float().mean().item()
@@ -3705,6 +3805,15 @@ class MAPPOTrainer:
                 f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs}",
                 flush=True,
             )
+            if critic_pretrain_gate and epoch_metric_steps > 0:
+                epoch_value_mean = epoch_value_total / float(epoch_metric_steps)
+                last_pretrain_value_mean = epoch_value_mean
+                print(
+                    "[MAPPO] critic_pretrain epoch_blocked "
+                    f"rank={rank} epoch={epoch_idx + 1}/{self.update_epochs} "
+                    f"epoch_value_loss={epoch_value_mean:.6f}",
+                    flush=True,
+                )
 
         metric_denom = metric_steps if metric_steps > 0 else 1
         avg_loss = total_loss / metric_denom if metric_denom > 0 else 0.0
@@ -3832,7 +3941,17 @@ class MAPPOTrainer:
             "value_clipfrac": avg_value_clipfrac,
             "optimizer_steps": float(actual_optimization_steps),
             "stopped_early": 1.0 if stop_early else 0.0,
-            "actor_frozen": 1.0 if actor_frozen else 0.0,
+            "critic_pretrain_active_end": 1.0 if critic_pretrain_gate else 0.0,
+            "critic_pretrain_released": (
+                1.0
+                if self._critic_pretrain_enabled() and not critic_pretrain_gate
+                else 0.0
+            ),
+            "critic_pretrain_last_value_loss": (
+                0.0
+                if not self._critic_pretrain_enabled()
+                else float(last_pretrain_value_mean)
+            ),
         }
         step_denom = (
             float(actual_optimization_steps) if actual_optimization_steps > 0 else 1.0
@@ -4259,7 +4378,9 @@ class MAPPOTrainer:
             "value_clipfrac",
             "optimizer_steps",
             "stopped_early",
-            "actor_frozen",
+            "critic_pretrain_active_end",
+            "critic_pretrain_released",
+            "critic_pretrain_last_value_loss",
             "actor_lr",
             "critic_adapter_lr",
             "value_head_lr",
@@ -4312,7 +4433,8 @@ class MAPPOTrainer:
             "agent1_adv_mean,agent1_return_mean,agent1_value_mean,agent1_explained_var,agent1_fresh_value_mean,agent1_fresh_explained_var,"
             "clipfrac,approx_kl,policy_active_clipfrac,policy_active_approx_kl,"
             "policy_active_token_clipfrac,policy_active_token_approx_kl,"
-            "kl_penalty,kl_penalty_coef,value_clipfrac,optimizer_steps,stopped_early,actor_frozen,"
+            "kl_penalty,kl_penalty_coef,value_clipfrac,optimizer_steps,stopped_early,"
+            "critic_pretrain_active_end,critic_pretrain_released,critic_pretrain_last_value_loss,"
             "actor_lr,critic_adapter_lr,value_head_lr,"
             "actor0_grad_norm,actor0_param_delta,"
             "actor1_grad_norm,actor1_param_delta,"
@@ -4340,7 +4462,9 @@ class MAPPOTrainer:
                 f"{aggregated_metrics.get('policy_active_token_clipfrac', 0.0)},{aggregated_metrics.get('policy_active_token_approx_kl', 0.0)},"
                 f"{aggregated_metrics.get('kl_penalty', 0.0)},{aggregated_metrics.get('kl_penalty_coef', 0.0)},"
                 f"{aggregated_metrics.get('value_clipfrac', 0.0)},{aggregated_metrics.get('optimizer_steps', 0.0)},"
-                f"{aggregated_metrics.get('stopped_early', 0.0)},{aggregated_metrics.get('actor_frozen', 0.0)},"
+                f"{aggregated_metrics.get('stopped_early', 0.0)},"
+                f"{aggregated_metrics.get('critic_pretrain_active_end', 0.0)},{aggregated_metrics.get('critic_pretrain_released', 0.0)},"
+                f"{aggregated_metrics.get('critic_pretrain_last_value_loss', 0.0)},"
                 f"{aggregated_metrics.get('actor_lr', 0.0)},{aggregated_metrics.get('critic_adapter_lr', 0.0)},{aggregated_metrics.get('value_head_lr', 0.0)},"
                 f"{aggregated_metrics.get('actor0_grad_norm', 0.0)},{aggregated_metrics.get('actor0_param_delta', 0.0)},"
                 f"{aggregated_metrics.get('actor1_grad_norm', 0.0)},{aggregated_metrics.get('actor1_param_delta', 0.0)},"
