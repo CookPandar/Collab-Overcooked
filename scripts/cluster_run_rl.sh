@@ -145,6 +145,17 @@ def resolve_path(raw: str, base: Path) -> Path:
     return path
 
 
+def resolve_generated_path(raw: str, repo_root: Path, experiment_root: Path) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        return (experiment_root / path).resolve()
+    try:
+        rel = path.relative_to(repo_root)
+    except ValueError:
+        return path
+    return (experiment_root / rel).resolve()
+
+
 def max_update_from_csv(path: Path) -> int:
     if not path.exists():
         return 0
@@ -182,7 +193,7 @@ def max_update_from_latest(path: Path) -> int:
     return 0
 
 
-def inspect_cfg(raw_cfg: str, repo_root: Path) -> int:
+def inspect_cfg(raw_cfg: str, repo_root: Path, experiment_root: Path) -> int:
     if not raw_cfg:
         return 0
     cfg_path = Path(raw_cfg)
@@ -196,19 +207,25 @@ def inspect_cfg(raw_cfg: str, repo_root: Path) -> int:
     best = 0
     latest_file = trainer.get("latest_model_path_file")
     if latest_file:
-        best = max(best, max_update_from_latest(resolve_path(str(latest_file), repo_root)))
+        best = max(
+            best,
+            max_update_from_latest(
+                resolve_generated_path(str(latest_file), repo_root, experiment_root)
+            ),
+        )
     output_dir = trainer.get("output_dir")
     if output_dir:
-        out = resolve_path(str(output_dir), repo_root)
+        out = resolve_generated_path(str(output_dir), repo_root, experiment_root)
         for name in ("train_curve.csv", "reward_curve.csv", "performance_curve.csv"):
             best = max(best, max_update_from_csv(out / name))
     return best
 
 
 repo_root = Path(os.environ["REPO_ROOT_ENV"]).resolve()
+experiment_root = Path(os.environ.get("RL_EXPERIMENT_ROOT", str(repo_root))).resolve()
 best = 0
 for key in ("COLLECT_CFG_ENV", "TRAIN_CFG_ENV", "EVAL_CFG_ENV"):
-    best = max(best, inspect_cfg(os.environ.get(key, ""), repo_root))
+    best = max(best, inspect_cfg(os.environ.get(key, ""), repo_root, experiment_root))
 print(best)
 PY
 }

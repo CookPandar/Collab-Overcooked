@@ -33,12 +33,12 @@ trainer:
       alpha: 16
       dropout: 0.05
   value_head_path: ./runs/value_head.pt
-  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/rollouts_kl
-  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/train
+  rollout_dir: rollouts_kl
+  output_dir: runs/rl/train
   save_interval: 1
   checkpoint_interval: 0
-  export_latest_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/export_latest
-  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/t13_t16_debug/runs/rl/latest_model.json
+  export_latest_dir: runs/rl/export_latest
+  latest_model_path_file: runs/rl/latest_model.json
   apply_latest_model_override: true
   export_interval: 1
   max_new_tokens: 512

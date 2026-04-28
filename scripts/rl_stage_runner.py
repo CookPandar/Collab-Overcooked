@@ -77,7 +77,7 @@ def _resolve_path_list_or_scalar(value, base_dir: Path):
 def _map_generated_path(path_str: str, repo_root: Path, experiment_root: Path) -> str:
     path = Path(path_str)
     if not path.is_absolute():
-        return path_str
+        return str((experiment_root / path).resolve())
     try:
         rel = path.relative_to(repo_root)
     except ValueError:
