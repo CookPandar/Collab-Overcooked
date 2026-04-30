@@ -151,6 +151,18 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
             adapter_name = value.get("adapter_name")
             if adapter_name:
                 actor_cfg[agent_key]["adapter_name"] = str(adapter_name)
+    critic_override = payload.get("critic_adapter")
+    critic_cfg = trainer.get("critic_adapter")
+    if isinstance(critic_override, dict) and isinstance(critic_cfg, dict):
+        lora_path = critic_override.get("lora_path")
+        if lora_path:
+            critic_cfg["lora_path"] = _resolve_lora_dir(str(lora_path), base_dir)
+        adapter_name = critic_override.get("adapter_name")
+        if adapter_name:
+            critic_cfg["adapter_name"] = str(adapter_name)
+    value_head_path = payload.get("value_head_path")
+    if value_head_path:
+        trainer["value_head_path"] = _resolve_path(str(value_head_path), base_dir)
 
 
 def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:

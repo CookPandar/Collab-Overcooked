@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import inspect
 import json
 import os
@@ -42,6 +43,16 @@ class ValueRequest(BaseModel):
     adapter_name: Optional[str] = None
 
 
+class ReloadAdapterSpec(BaseModel):
+    name: str
+    path: str
+
+
+class ReloadAdaptersRequest(BaseModel):
+    modules: List[ReloadAdapterSpec]
+    value_head_path: Optional[str] = None
+
+
 def _extract_logprob(entry: Any) -> Optional[float]:
     if entry is None:
         return None
@@ -62,6 +73,8 @@ class RLVLLMService:
         self.hidden_state_root.mkdir(parents=True, exist_ok=True)
 
         self.lora_modules = self._load_lora_modules()
+        self.max_loras = max(1, int(args.max_loras))
+        self._lora_generation = 0
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             trust_remote_code=True,
@@ -92,7 +105,7 @@ class RLVLLMService:
             "enable_lora": bool(self.lora_modules),
         }
         if self.lora_modules:
-            llm_kwargs["max_loras"] = max(1, int(args.max_loras))
+            llm_kwargs["max_loras"] = self.max_loras
             if int(args.max_lora_rank) > 0:
                 llm_kwargs["max_lora_rank"] = int(args.max_lora_rank)
         value_runtime_requested = self.value_head is not None and KVTransferConfig is not None
@@ -176,6 +189,14 @@ class RLVLLMService:
         if not raw:
             return {}
         payload = json.loads(raw)
+        return self._normalize_lora_modules(payload, generation=0)
+
+    def _normalize_lora_modules(
+        self,
+        payload: Any,
+        *,
+        generation: int,
+    ) -> Dict[str, Dict[str, Any]]:
         modules: Dict[str, Dict[str, Any]] = {}
         for idx, item in enumerate(payload, start=1):
             if not isinstance(item, dict):
@@ -184,7 +205,7 @@ class RLVLLMService:
             path = str(item.get("path") or "").strip()
             if not name or not path:
                 continue
-            modules[name] = {"id": idx, "path": path}
+            modules[name] = {"id": generation * 1000 + idx, "path": path}
         return modules
 
     def _load_value_head(self, path: Path) -> nn.Linear:
@@ -201,6 +222,39 @@ class RLVLLMService:
         linear.eval()
         self.value_head_dtype = getattr(torch, dtype_name.split(".")[-1], torch.float32)
         return linear
+
+    def reload_adapters(self, request: ReloadAdaptersRequest) -> Dict[str, Any]:
+        modules_payload = [
+            {"name": item.name, "path": item.path}
+            for item in request.modules
+        ]
+        if len(modules_payload) > self.max_loras:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many LoRA modules: {len(modules_payload)} > max_loras={self.max_loras}",
+            )
+        for item in modules_payload:
+            path = Path(item["path"])
+            if not (path / "adapter_config.json").exists():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"LoRA adapter_config.json not found: {path}",
+                )
+        self._lora_generation += 1
+        self.lora_modules = self._normalize_lora_modules(
+            modules_payload,
+            generation=self._lora_generation,
+        )
+        value_head_path = (request.value_head_path or "").strip()
+        if value_head_path:
+            self.value_head_path = value_head_path
+            self.value_head = self._load_value_head(Path(value_head_path))
+        return {
+            "ok": True,
+            "lora_modules": sorted(self.lora_modules.keys()),
+            "value_head": bool(self.value_head is not None),
+            "generation": self._lora_generation,
+        }
 
     def _build_lora_request(
         self,
@@ -348,6 +402,10 @@ def build_app(service: RLVLLMService) -> FastAPI:
     def value(request: ValueRequest) -> Dict[str, Any]:
         return service.value(request)
 
+    @app.post("/rl/reload_adapters")
+    def reload_adapters(request: ReloadAdaptersRequest) -> Dict[str, Any]:
+        return service.reload_adapters(request)
+
     return app
 
 
@@ -371,6 +429,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    lock_path = Path(tempfile.gettempdir()) / f"rl_vllm_port_{args.port}.lock"
+    lock_handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(
+            f"[RLVLLMService] port={args.port} is already reserved by another initializing service",
+            flush=True,
+        )
+        return 98
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
     service = RLVLLMService(args)
     app = build_app(service)
     uvicorn_run(app, host=args.host, port=args.port, log_level="info")

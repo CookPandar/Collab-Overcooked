@@ -70,6 +70,7 @@ VLLM_MODEL_PATH="${RL_VLLM_MODEL_PATH:-/mnt/volumes/ss-sai-bd-ga/zhangshuwen/mod
 VLLM_HOST="${RL_VLLM_HOST:-127.0.0.1}"
 VLLM_START_PORT="${RL_VLLM_START_PORT:-9000}"
 VLLM_START_RETRIES="${RL_VLLM_START_RETRIES:-3}"
+VLLM_PERSISTENT="${RL_VLLM_PERSISTENT:-0}"
 MASTER_PORT="${RL_MASTER_PORT:-29540}"
 GPU_MEM="${RL_VLLM_GPU_MEM:-0.70}"
 MAX_MODEL_LEN="${RL_VLLM_MAX_MODEL_LEN:-8192}"
@@ -397,7 +398,16 @@ PY
 port_is_bindable() {
     local port="$1"
     python - <<PY
+import fcntl
+import tempfile
+from pathlib import Path
 import socket, sys
+lock_path = Path(tempfile.gettempdir()) / f"rl_vllm_port_{int("$port")}.lock"
+lock_handle = lock_path.open("a+")
+try:
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(1)
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 try:
     sock.bind(("127.0.0.1", int("$port")))
@@ -638,9 +648,42 @@ start_vllm_servers() {
     done
 }
 
+vllm_servers_running() {
+    if [[ "${#VLLM_PIDS[@]}" -eq 0 ]]; then
+        return 1
+    fi
+    local pid
+    for pid in "${VLLM_PIDS[@]}"; do
+        if ! process_exists "$pid"; then
+            return 1
+        fi
+    done
+    local port
+    for port in "${VLLM_PORTS[@]}"; do
+        if ! port_is_listening "$port"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+reload_vllm_adapters() {
+    local cfg_path="$1"
+    echo "[cluster-rl] reloading vLLM adapters cfg=$cfg_path ports=${VLLM_PORTS[*]:-}"
+    "$PY_BIN" "$REPO_ROOT/scripts/reload_vllm_adapters.py" \
+        --config "$cfg_path" \
+        --host "$VLLM_HOST" \
+        --start-port "$VLLM_START_PORT" \
+        --count "$NUM_PROCS"
+}
+
 ensure_vllm_servers() {
     local cfg_path="$1"
     local stage_name="$2"
+    if [[ "$VLLM_PERSISTENT" == "1" ]] && vllm_servers_running; then
+        reload_vllm_adapters "$cfg_path"
+        return $?
+    fi
     stop_vllm_servers
     start_vllm_servers "$NUM_PROCS" "$cfg_path" "$stage_name"
 }
@@ -698,7 +741,7 @@ run_stage_workers() {
                     fi
                 fi
             done
-            if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
+            if [[ "$VLLM_PERSISTENT" != "1" && ( "$stage_name" == "collect" || "$stage_name" == "eval" ) ]]; then
                 stop_vllm_servers
             fi
             break
@@ -734,9 +777,13 @@ run_stage() {
         local next_base_port="$VLLM_START_PORT"
         local reserved_start_port=""
         while (( attempt <= VLLM_START_RETRIES )); do
-            stop_vllm_servers
-            reserve_vllm_port_block "$next_base_port" "$NUM_PROCS" || return 1
-            reserved_start_port="$VLLM_START_PORT"
+            if [[ "$VLLM_PERSISTENT" == "1" ]] && vllm_servers_running; then
+                reserved_start_port="$VLLM_START_PORT"
+            else
+                stop_vllm_servers
+                reserve_vllm_port_block "$next_base_port" "$NUM_PROCS" || return 1
+                reserved_start_port="$VLLM_START_PORT"
+            fi
             if ensure_vllm_servers "$cfg_path" "$stage_name"; then
                 break
             fi
@@ -750,7 +797,9 @@ run_stage() {
             return 1
         fi
     else
-        stop_vllm_servers
+        if [[ "$VLLM_PERSISTENT" != "1" ]]; then
+            stop_vllm_servers
+        fi
     fi
     echo "[cluster-rl] stage=$stage_name cfg=$cfg_path procs=$NUM_PROCS"
     if [[ "$stage_name" == "collect" || "$stage_name" == "eval" ]]; then
@@ -763,7 +812,9 @@ run_stage() {
         if [[ $worker_status -eq 0 ]]; then
             aggregate_stage_metrics "$stage_name" "$cfg_path" || worker_status=$?
         fi
-        stop_vllm_servers
+        if [[ "$VLLM_PERSISTENT" != "1" ]]; then
+            stop_vllm_servers
+        fi
         return $worker_status
     else
         mkdir -p "$LOG_ROOT/rl_workers"
