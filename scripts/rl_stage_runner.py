@@ -223,6 +223,12 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     if stage == "collect":
         trainer["collect_only"] = True
         trainer["train_only"] = False
+        if str(os.environ.get("RL_COLLECT_VALUE_BACKEND", "")).strip():
+            trainer["collect_value_backend"] = str(os.environ["RL_COLLECT_VALUE_BACKEND"]).strip()
+        if str(os.environ.get("RL_COMPUTE_VALUES_IN_COLLECT", "")).strip():
+            trainer["compute_values_in_collect"] = str(
+                os.environ["RL_COMPUTE_VALUES_IN_COLLECT"]
+            ).strip().lower() in {"1", "true", "yes", "on"}
     elif stage == "train":
         trainer["collect_only"] = False
         trainer["train_only"] = True

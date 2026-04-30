@@ -138,6 +138,12 @@ def _build_lora_modules(
         )
         data = json.loads(raw)
     trainer = data.setdefault("trainer", {})
+    if str(os.environ.get("RL_COLLECT_VALUE_BACKEND", "")).strip():
+        trainer["collect_value_backend"] = str(os.environ["RL_COLLECT_VALUE_BACKEND"]).strip()
+    if str(os.environ.get("RL_COMPUTE_VALUES_IN_COLLECT", "")).strip():
+        trainer["compute_values_in_collect"] = str(
+            os.environ["RL_COMPUTE_VALUES_IN_COLLECT"]
+        ).strip().lower() in {"1", "true", "yes", "on"}
     _apply_latest_override(
         trainer,
         trainer.get("latest_model_path_file"),
@@ -148,7 +154,13 @@ def _build_lora_modules(
         raise ValueError(f"trainer.model_path missing in {config_path}")
     modules: List[Tuple[str, str]] = []
     max_rank = 0
-    value_head_path = _resolve_path(trainer.get("value_head_path"), repo_root)
+    collect_value_backend = str(trainer.get("collect_value_backend", "")).strip().lower()
+    compute_values_in_collect = bool(trainer.get("compute_values_in_collect", False))
+    value_head_path = (
+        _resolve_path(trainer.get("value_head_path"), repo_root)
+        if compute_values_in_collect and collect_value_backend == "vllm"
+        else None
+    )
     actor_adapters = trainer.get("actor_adapters") or {}
     if isinstance(actor_adapters, dict):
         for key, value in sorted(actor_adapters.items()):
