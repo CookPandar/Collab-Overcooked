@@ -74,7 +74,6 @@ class RLVLLMService:
 
         self.lora_modules = self._load_lora_modules()
         self.max_loras = max(1, int(args.max_loras))
-        self._lora_generation = 0
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_path,
             trust_remote_code=True,
@@ -189,13 +188,11 @@ class RLVLLMService:
         if not raw:
             return {}
         payload = json.loads(raw)
-        return self._normalize_lora_modules(payload, generation=0)
+        return self._normalize_lora_modules(payload)
 
     def _normalize_lora_modules(
         self,
         payload: Any,
-        *,
-        generation: int,
     ) -> Dict[str, Dict[str, Any]]:
         modules: Dict[str, Dict[str, Any]] = {}
         for idx, item in enumerate(payload, start=1):
@@ -205,7 +202,7 @@ class RLVLLMService:
             path = str(item.get("path") or "").strip()
             if not name or not path:
                 continue
-            modules[name] = {"id": generation * 1000 + idx, "path": path}
+            modules[name] = {"id": idx, "path": path}
         return modules
 
     def _load_value_head(self, path: Path) -> nn.Linear:
@@ -240,11 +237,7 @@ class RLVLLMService:
                     status_code=400,
                     detail=f"LoRA adapter_config.json not found: {path}",
                 )
-        self._lora_generation += 1
-        self.lora_modules = self._normalize_lora_modules(
-            modules_payload,
-            generation=self._lora_generation,
-        )
+        self.lora_modules = self._normalize_lora_modules(modules_payload)
         value_head_path = (request.value_head_path or "").strip()
         if value_head_path:
             self.value_head_path = value_head_path
@@ -253,7 +246,6 @@ class RLVLLMService:
             "ok": True,
             "lora_modules": sorted(self.lora_modules.keys()),
             "value_head": bool(self.value_head is not None),
-            "generation": self._lora_generation,
         }
 
     def _build_lora_request(
