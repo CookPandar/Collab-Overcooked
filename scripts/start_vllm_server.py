@@ -216,7 +216,16 @@ def main() -> int:
 
     env = os.environ.copy()
     repo_root = Path(os.environ.get("RL_REPO_ROOT", str(Path.cwd()))).resolve()
-    env['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_devices:
+        visible_ids = [item.strip() for item in visible_devices.split(",") if item.strip()]
+        if 0 <= int(args.gpu) < len(visible_ids):
+            selected_gpu = visible_ids[int(args.gpu)]
+        else:
+            selected_gpu = str(args.gpu)
+    else:
+        selected_gpu = str(args.gpu)
+    env['CUDA_VISIBLE_DEVICES'] = selected_gpu
     env['VLLM_DP_RANK'] = '0'
     env['VLLM_DP_SIZE'] = '1'
     env['VLLM_DP_MASTER_IP'] = '127.0.0.1'

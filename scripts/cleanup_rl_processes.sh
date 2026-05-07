@@ -47,7 +47,7 @@ command_is_rl_related() {
     local cmd="$1"
     [[ -n "$cmd" ]] || return 1
     case "$cmd" in
-        *"$REPO_ROOT"*|*"$EXPERIMENT_ROOT"*|*serve_rl_vllm.py*|*rl_stage_runner.py*|*collab_overcooked.main_rl*)
+        *"$REPO_ROOT"*|*"$EXPERIMENT_ROOT"*|*serve_rl_vllm.py*|*start_vllm_server.py*|*rl_stage_runner.py*|*collab_overcooked.main_rl*|*VLLM::EngineCore*)
             return 0
             ;;
         *)
