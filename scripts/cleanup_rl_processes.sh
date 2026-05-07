@@ -38,9 +38,39 @@ process_exists() {
     kill -0 "$pid" >/dev/null 2>&1
 }
 
+process_command() {
+    local pid="$1"
+    ps -p "$pid" -o command= 2>/dev/null || true
+}
+
+command_is_rl_related() {
+    local cmd="$1"
+    [[ -n "$cmd" ]] || return 1
+    case "$cmd" in
+        *"$REPO_ROOT"*|*"$EXPERIMENT_ROOT"*|*serve_rl_vllm.py*|*rl_stage_runner.py*|*collab_overcooked.main_rl*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 kill_process_group() {
     local pgid="$1"
     [[ -n "$pgid" ]] || return 0
+    local matched=0
+    while read -r _pid _pgid _cmd; do
+        [[ "$_pgid" == "$pgid" ]] || continue
+        if command_is_rl_related "$_cmd"; then
+            matched=1
+            break
+        fi
+    done < <(ps -eo pid=,pgid=,command= 2>/dev/null || true)
+    if [[ "$matched" != "1" ]]; then
+        echo "[cleanup-rl] skip pgid=$pgid because it no longer looks like this RL run"
+        return 0
+    fi
     echo "[cleanup-rl] killing process group pgid=$pgid"
     kill -TERM -- "-$pgid" >/dev/null 2>&1 || true
     sleep 1
@@ -51,6 +81,12 @@ kill_pid_if_exists() {
     local pid="$1"
     [[ -n "$pid" ]] || return 0
     if process_exists "$pid"; then
+        local cmd
+        cmd="$(process_command "$pid")"
+        if ! command_is_rl_related "$cmd"; then
+            echo "[cleanup-rl] skip pid=$pid because it no longer looks like this RL run"
+            return 0
+        fi
         echo "[cleanup-rl] killing pid=$pid"
         kill "$pid" >/dev/null 2>&1 || true
         sleep 1
