@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -71,6 +72,7 @@ class RLVLLMService:
             tempfile.gettempdir()
         ) / f"rl_vllm_hidden_states_{args.port}"
         self.hidden_state_root.mkdir(parents=True, exist_ok=True)
+        self.generate_lock = threading.Lock()
 
         self.lora_modules = self._load_lora_modules()
         self.max_loras = max(1, int(args.max_loras))
@@ -288,11 +290,12 @@ class RLVLLMService:
             max_tokens=max(1, int(request.max_tokens)),
             logprobs=1,
         )
-        outputs = self.llm.generate(
-            [prompt],
-            sampling_params=sampling,
-            lora_request=self._build_lora_request(request.adapter_name, strict=True),
-        )
+        with self.generate_lock:
+            outputs = self.llm.generate(
+                [prompt],
+                sampling_params=sampling,
+                lora_request=self._build_lora_request(request.adapter_name, strict=True),
+            )
         if not outputs:
             raise HTTPException(status_code=500, detail="Empty vLLM output.")
         output = outputs[0]
@@ -351,11 +354,12 @@ class RLVLLMService:
             temperature=0.0,
             max_tokens=1,
         )
-        outputs = self.llm.generate(
-            [prompt],
-            sampling_params=sampling,
-            lora_request=self._build_lora_request(request.adapter_name, strict=False),
-        )
+        with self.generate_lock:
+            outputs = self.llm.generate(
+                [prompt],
+                sampling_params=sampling,
+                lora_request=self._build_lora_request(request.adapter_name, strict=False),
+            )
         if not outputs:
             raise HTTPException(status_code=500, detail="Empty vLLM output for value request.")
         output = outputs[0]
