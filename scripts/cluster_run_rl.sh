@@ -1101,14 +1101,11 @@ start_vllm_servers() {
                 fi
             fi
             local log_file="$LOG_ROOT/rl_vllm/vllm_${stage_name}_${role}_gpu${gpu}.log"
-            local physical_gpu
-            physical_gpu="$(physical_gpu_for_rank "$gpu")"
-            echo "[cluster-rl] starting vLLM stage=$stage_name role=$role gpu=$gpu physical_gpu=$physical_gpu port=$service_port engine_port=$service_engine_port internal_port_base=$service_internal_port_base serialize=$service_serial gpu_mem=$service_gpu_mem"
+            echo "[cluster-rl] starting vLLM stage=$stage_name role=$role gpu=$gpu port=$service_port engine_port=$service_engine_port internal_port_base=$service_internal_port_base serialize=$service_serial gpu_mem=$service_gpu_mem"
             if command -v setsid >/dev/null 2>&1; then
                 RL_VLLM_SERIALIZE_GENERATE="$service_serial" \
-                CUDA_VISIBLE_DEVICES="$physical_gpu" \
                 setsid "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
-                    --gpu 0 \
+                    --gpu "$gpu" \
                     --port "$service_port" \
                     --engine-port "$service_engine_port" \
                     --internal-port-base "$service_internal_port_base" \
@@ -1125,9 +1122,8 @@ start_vllm_servers() {
                     >"$log_file" 2>&1 &
             else
                 RL_VLLM_SERIALIZE_GENERATE="$service_serial" \
-                CUDA_VISIBLE_DEVICES="$physical_gpu" \
                 "$VLLM_PY" "$REPO_ROOT/scripts/start_vllm_server.py" \
-                    --gpu 0 \
+                    --gpu "$gpu" \
                     --port "$service_port" \
                     --engine-port "$service_engine_port" \
                     --internal-port-base "$service_internal_port_base" \
