@@ -174,7 +174,7 @@ reward:
   collab_reward_enabled: false
   paired_comm_request_positive_reward: 0.5
   paired_comm_response_positive_reward: 0.5
-  paired_comm_deny_reward: 0.2
+  paired_comm_deny_reward: 0.5
 ```
 
 This reward evaluates request-response pairs in communication:

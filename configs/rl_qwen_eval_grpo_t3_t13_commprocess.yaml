@@ -15,7 +15,7 @@ reward:
   paired_comm_request_negative_reward: -0.1
   paired_comm_response_positive_reward: 0.5
   paired_comm_response_negative_reward: -0.1
-  paired_comm_deny_reward: 0.2
+  paired_comm_deny_reward: 0.5
 trainer:
   type: grpo
   collect_only: true
