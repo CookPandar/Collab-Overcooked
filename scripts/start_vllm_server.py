@@ -41,6 +41,41 @@ def _resolve_lora_dir(raw: Optional[str], base_dir: Path) -> Optional[str]:
     return str(path)
 
 
+def _map_generated_path(path_str: str, repo_root: Path, experiment_root: Path) -> str:
+    path = Path(path_str)
+    if not path.is_absolute():
+        return str((experiment_root / path).resolve())
+    try:
+        rel = path.relative_to(repo_root)
+    except ValueError:
+        return path_str
+    return str((experiment_root / rel).resolve())
+
+
+def _rewrite_experiment_paths(trainer: Dict[str, Any], repo_root: Path) -> None:
+    experiment_root_raw = os.environ.get("RL_EXPERIMENT_ROOT", "").strip()
+    if not experiment_root_raw:
+        return
+    experiment_root = Path(experiment_root_raw).resolve()
+    for key in (
+        "rollout_dir",
+        "output_dir",
+        "export_latest_dir",
+        "latest_model_path_file",
+        "initial_rollout_cache_dir",
+    ):
+        value = trainer.get(key)
+        if isinstance(value, str) and value:
+            trainer[key] = _map_generated_path(value, repo_root, experiment_root)
+        elif isinstance(value, list):
+            trainer[key] = [
+                _map_generated_path(item, repo_root, experiment_root)
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+
+
 def _resolve_agent_index(key: Any) -> Optional[int]:
     if isinstance(key, int):
         return key
@@ -118,6 +153,8 @@ def _apply_latest_override(
 
 def _build_lora_modules(
     config_path: Path,
+    service_role: str = "both",
+    fallback_model_path: Optional[str] = None,
 ) -> Tuple[str, List[Tuple[str, str]], int, Optional[str]]:
     repo_root = Path(os.environ.get("RL_REPO_ROOT", str(Path.cwd()))).resolve()
     if yaml is not None:
@@ -138,6 +175,7 @@ def _build_lora_modules(
         )
         data = json.loads(raw)
     trainer = data.setdefault("trainer", {})
+    _rewrite_experiment_paths(trainer, repo_root)
     if str(os.environ.get("RL_COLLECT_VALUE_BACKEND", "")).strip():
         trainer["collect_value_backend"] = str(os.environ["RL_COLLECT_VALUE_BACKEND"]).strip()
     if str(os.environ.get("RL_COMPUTE_VALUES_IN_COLLECT", "")).strip():
@@ -150,6 +188,17 @@ def _build_lora_modules(
         repo_root,
     )
     model_path = _resolve_path(trainer.get("model_path"), repo_root)
+    fallback_model_path = _resolve_path(fallback_model_path, repo_root)
+    if model_path and not Path(model_path).exists() and fallback_model_path:
+        print(
+            "[start-vllm] resolved trainer.model_path does not exist; "
+            f"falling back to --model {fallback_model_path}. missing={model_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+        model_path = fallback_model_path
+    if not model_path and fallback_model_path:
+        model_path = fallback_model_path
     if not model_path:
         raise ValueError(f"trainer.model_path missing in {config_path}")
     modules: List[Tuple[str, str]] = []
@@ -161,8 +210,10 @@ def _build_lora_modules(
         if compute_values_in_collect and collect_value_backend == "vllm"
         else None
     )
+    include_actor = service_role in {"both", "actor"}
+    include_value = service_role in {"both", "value"}
     actor_adapters = trainer.get("actor_adapters") or {}
-    if isinstance(actor_adapters, dict):
+    if include_actor and isinstance(actor_adapters, dict):
         for key, value in sorted(actor_adapters.items()):
             if not isinstance(value, dict):
                 continue
@@ -182,7 +233,7 @@ def _build_lora_modules(
                 except Exception:
                     pass
     critic_adapter = trainer.get("critic_adapter") or {}
-    if isinstance(critic_adapter, dict):
+    if include_value and isinstance(critic_adapter, dict):
         critic_lora_path = _resolve_lora_dir(critic_adapter.get("lora_path"), repo_root)
         if critic_lora_path:
             critic_name = str(critic_adapter.get("adapter_name") or "critic")
@@ -194,6 +245,8 @@ def _build_lora_modules(
                     max_rank = max(max_rank, int(adapter_payload.get("r", 0) or 0))
                 except Exception:
                     pass
+    if not include_value:
+        value_head_path = None
     return model_path, modules, max_rank, value_head_path
 
 
@@ -211,6 +264,7 @@ def main() -> int:
     parser.add_argument('--api-key', required=True)
     parser.add_argument('--max-loras', type=int, default=2)
     parser.add_argument('--max-lora-rank', type=int, default=0)
+    parser.add_argument('--service-role', choices=['both', 'actor', 'value'], default='both')
     parser.add_argument('--enforce-eager', action='store_true')
     args = parser.parse_args()
 
@@ -251,10 +305,24 @@ def main() -> int:
     value_head_path: Optional[str] = None
     if args.config:
         model_path, lora_modules, inferred_max_lora_rank, value_head_path = _build_lora_modules(
-            Path(args.config).resolve()
+            Path(args.config).resolve(),
+            service_role=args.service_role,
+            fallback_model_path=args.model,
         )
+    env["RL_VLLM_SERVICE_ROLE"] = args.service_role
     if value_head_path:
         env["RL_VLLM_VALUE_HEAD_PATH"] = value_head_path
+    else:
+        env.pop("RL_VLLM_VALUE_HEAD_PATH", None)
+    if "RL_VLLM_SERIALIZE_GENERATE" in os.environ:
+        env["RL_VLLM_SERIALIZE_GENERATE"] = os.environ["RL_VLLM_SERIALIZE_GENERATE"]
+    for key in (
+        "RL_VLLM_PARALLEL_BATCH_MAX",
+        "RL_VLLM_PARALLEL_BATCH_WAIT_MS",
+        "RL_VLLM_ALLOW_UNSAFE_VALUE_BATCH",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
     if lora_modules:
         env["RL_VLLM_LORA_MODULES_JSON"] = json.dumps(
             [{"name": name, "path": path} for name, path in lora_modules]

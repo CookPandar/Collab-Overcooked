@@ -13,11 +13,10 @@ reward:
 trainer:
   type: mappo
   collect_only: true
-  off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/snapshots/one_episode_t13_t16.jsonl
-  steps_per_update: 64
+  off_policy_snapshots: runs/rl/snapshots/one_episode_t13_t16.jsonl
   rollout_dir: rollouts_kl
   output_dir: runs/rl/collect
-  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+  model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
   lora_path: null
   actor_adapters:
     agent_0:
@@ -54,7 +53,7 @@ agents:
     timeout: 180
     max_retries: 3
     role: Chef
-    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    local_model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
     cuda_visible_devices:
     - 0
     data_parallel_size: 1
@@ -68,7 +67,7 @@ agents:
     timeout: 180
     max_retries: 3
     role: Assistant
-    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    local_model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
     cuda_visible_devices:
     - 1
     data_parallel_size: 1

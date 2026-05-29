@@ -25,8 +25,11 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, A
     return json.loads(raw) if raw else {}
 
 
-def _build_payload(config: Path) -> Tuple[List[Dict[str, str]], Optional[str]]:
-    _model_path, modules, _max_rank, value_head_path = _build_lora_modules(config)
+def _build_payload(config: Path, service_role: str) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    _model_path, modules, _max_rank, value_head_path = _build_lora_modules(
+        config,
+        service_role=service_role,
+    )
     return [{"name": name, "path": path} for name, path in modules], value_head_path
 
 
@@ -36,10 +39,11 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--start-port", type=int, required=True)
     parser.add_argument("--count", type=int, required=True)
+    parser.add_argument("--service-role", choices=["both", "actor", "value"], default="both")
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
 
-    modules, value_head_path = _build_payload(Path(args.config).resolve())
+    modules, value_head_path = _build_payload(Path(args.config).resolve(), args.service_role)
     payload: Dict[str, Any] = {"modules": modules, "value_head_path": value_head_path}
     for offset in range(args.count):
         port = args.start_port + offset

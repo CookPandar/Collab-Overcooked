@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import re
 from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
@@ -30,8 +31,14 @@ class ProcessRewardTracker:
             self.settings.get("process_progress_reward", 1.0)
         )
         self.product_reward_value = float(self.settings.get("product_reward", 0.5))
-        self.format_penalty_value = -abs(self.settings.get("format_penalty", 0.1))
-        self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 0.1))
+        self.format_penalty_value = -abs(self.settings.get("format_penalty", 20.0))
+        self.validator_penalty_value = -abs(self.settings.get("validator_penalty", 10.0))
+        self.format_success_reward_value = float(
+            self.settings.get("format_success_reward", 0.05)
+        )
+        self.validator_success_reward_value = float(
+            self.settings.get("validator_success_reward", 0.05)
+        )
         self.communication_penalty_value = -abs(
             self.settings.get("communication_penalty", 0.1)
         )
@@ -74,7 +81,10 @@ class ProcessRewardTracker:
         self.penalty_queue: List[List[Dict[str, str]]] = [[], []]
         self.call_events: List[Dict] = []
         self.step_call_records: Dict[int, List[List[Dict]]] = {}
+        self.call_records_by_source: Dict[Tuple[int, int, int], Dict] = {}
+        self.reward_source_mismatch_events: List[Dict[str, Any]] = []
         self.pending_paired_comm_requests: List[List[Dict[str, Any]]] = [[], []]
+        self.rewardable_action_call_types = {"planner_main", "validator_correction"}
 
     # ------------------------------------------------------------------
     # Public API
@@ -98,6 +108,7 @@ class ProcessRewardTracker:
         self.observed_targets.clear()
         self.call_events.clear()
         self.step_call_records.clear()
+        self.reward_source_mismatch_events.clear()
         self.pending_paired_comm_requests = [[], []]
         for queue in self.penalty_queue:
             queue.clear()
@@ -218,6 +229,42 @@ class ProcessRewardTracker:
             restored = True
         return restored
 
+    def bootstrap_histories_from_ml_actions(
+        self, ml_actions: Optional[List[Optional[str]]]
+    ) -> bool:
+        """
+        Seed executed action histories from the snapshot state's current ml_actions.
+
+        Tail snapshots can start in the middle of a medium-level action. In that
+        case the environment state already reflects progress, but older snapshot
+        files may still contain an empty reward-tracker history. Treat the
+        snapshot state's active ml_actions as already-established progress so
+        ITES/TES rewards do not restart from zero after teleporting.
+        """
+        if not ml_actions:
+            return False
+        restored = False
+        for agent_idx, action in enumerate(list(ml_actions)[:2]):
+            if self.sequence_histories[agent_idx]:
+                continue
+            normalized = self._normalize_action(str(action or ""))
+            if not normalized:
+                continue
+            if normalized.lower().startswith("wait"):
+                continue
+            if self._is_collab_action(normalized):
+                continue
+            self.sequence_histories[agent_idx] = [normalized]
+            self.sequence_scores[agent_idx] = self._best_sequence_score_from_history(
+                agent_idx, [normalized]
+            )
+            self.collab_sequence_scores[agent_idx] = max(
+                self.collab_sequence_scores[agent_idx],
+                self.sequence_scores[agent_idx],
+            )
+            restored = True
+        return restored
+
     def clear_pending_penalties(self) -> None:
         """Drop unconsumed historical penalties after snapshot teleport."""
         for queue in self.penalty_queue:
@@ -238,7 +285,7 @@ class ProcessRewardTracker:
         if agent_index is None:
             return {}
 
-        normalized_action = (action_text or "").strip()
+        normalized_action = self._clean_action_text(action_text)
         is_collab = self._is_collab_action(normalized_action)
         similarity_before = self.sequence_scores[agent_index]
         similarity_after = similarity_before
@@ -259,28 +306,46 @@ class ProcessRewardTracker:
             ts=-1 if timestamp is None else int(timestamp),
             action=normalized_action,
         )
+        collab_reward = (
+            self._process_collab_reward(agent_index, normalized_action)
+            if self.enable_collab_reward
+            else 0.0
+        )
         if force_communication_penalty:
             forced_communication_reward += self.forced_communication_penalty_value
         communication_reward = (
             repeat_communication_reward + forced_communication_reward
         )
-        if is_collab:
-            seq_reward = 0.0
-        else:
-            (
-                seq_reward,
-                similarity_before,
-                similarity_after,
-                similarity_delta,
-            ) = self._process_sequence_reward(agent_index, normalized_action)
-        penalty_total, penalty_details = self._consume_penalties(agent_index)
+        # Sequence/ITES progress must be based on actions that actually executed
+        # in the environment. LLM calls can include plans, corrections, or queued
+        # actions that never execute, so progress is assigned in after_step()
+        # from ml_actions instead of here.
+        seq_reward = 0.0
+        _penalty_total, penalty_details = self._consume_penalties(agent_index)
         format_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "format")
         validator_reward = sum(entry["value"] for entry in penalty_details if entry["type"] == "validator")
-        total = seq_reward + communication_reward + paired_comm_reward + penalty_total
+        if (
+            format_reward == 0.0
+            and normalized_action
+            and normalized_action != "[EMPTY]"
+            and call_type in self.rewardable_action_call_types
+            and not is_collab
+            and not self._is_wait_action(normalized_action)
+        ):
+            format_reward += self.format_success_reward_value
+        total = (
+            seq_reward
+            + collab_reward
+            + communication_reward
+            + paired_comm_reward
+            + format_reward
+            + validator_reward
+        )
 
         ts = -1 if timestamp is None else int(timestamp)
         entry = {
             "timestamp": ts,
+            "source_timestamp": ts,
             "agent_index": agent_index,
             "agent": agent_name or f"agent_{agent_index}",
             "call_index": call_index,
@@ -291,6 +356,7 @@ class ProcessRewardTracker:
             "communication_reward": communication_reward,
             "repeat_communication_reward": repeat_communication_reward,
             "forced_communication_reward": forced_communication_reward,
+            "collab_reward": collab_reward,
             "paired_comm_reward": paired_comm_reward,
             "paired_comm_role": paired_comm_meta.get("role"),
             "paired_comm_result": paired_comm_meta.get("result"),
@@ -306,25 +372,302 @@ class ProcessRewardTracker:
             "is_collab": is_collab,
             "total": total,
         }
+        self._suppress_validator_when_format_failed(entry)
         self.call_events.append(entry)
         bucket = self.step_call_records.setdefault(ts, [[], []])
         bucket[agent_index].append(entry)
+        if call_index is not None:
+            self.call_records_by_source[(agent_index, ts, int(call_index))] = entry
         return entry
 
-    def after_step(self, timestep: int, ml_actions: Optional[List[str]], state) -> Dict:
+    @staticmethod
+    def _suppress_validator_when_format_failed(entry: Dict[str, Any]) -> None:
+        penalties = entry.get("penalties") or []
+        has_format_penalty = any(item.get("type") == "format" for item in penalties)
+        if not has_format_penalty:
+            return
+        validator_reward = float(entry.get("validator_reward", 0.0) or 0.0)
+        if validator_reward:
+            entry["validator_reward"] = 0.0
+            entry["total"] = float(entry.get("total", 0.0) or 0.0) - validator_reward
+        entry["penalties"] = [
+            item for item in penalties if item.get("type") != "validator"
+        ]
+
+    def ensure_llm_action_entry(
+        self,
+        agent_index: int,
+        timestamp: Optional[int],
+        action_text: Optional[str],
+        *,
+        agent_name: Optional[str] = None,
+        call_index: Optional[int] = None,
+        call_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict:
+        """Ensure a queued/executed action source has a reward entry.
+
+        Action sources may be created before the normal reward-event flush path,
+        especially when a communication turn is reclassified as an embodied
+        planner action and queued for a later environment step. The executed
+        source must still point to an exact reward entry for strict assignment.
+        """
+        if agent_index is None or call_index is None:
+            return {}
+        ts = -1 if timestamp is None else int(timestamp)
+        key = (int(agent_index), ts, int(call_index))
+        existing = self.call_records_by_source.get(key)
+        if existing is None:
+            return self.register_llm_action(
+                agent_index=agent_index,
+                timestamp=timestamp,
+                action_text=action_text,
+                agent_name=agent_name,
+                call_index=call_index,
+                call_type=call_type,
+                metadata=metadata,
+            )
+        return self._update_llm_action_entry(
+            existing,
+            action_text,
+            agent_name=agent_name,
+            call_type=call_type,
+        )
+
+    def register_or_update_llm_action(
+        self,
+        agent_index: int,
+        timestamp: Optional[int],
+        action_text: Optional[str],
+        *,
+        agent_name: Optional[str] = None,
+        call_index: Optional[int] = None,
+        call_type: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict:
+        """Register a call, or merge into the existing source entry once.
+
+        This prevents duplicate call records when an action source was already
+        materialized for future execution before the reward event is flushed.
+        Pending penalties are still consumed and attached to the existing entry.
+        """
+        if agent_index is None or call_index is None:
+            return self.register_llm_action(
+                agent_index=agent_index,
+                timestamp=timestamp,
+                action_text=action_text,
+                agent_name=agent_name,
+                call_index=call_index,
+                call_type=call_type,
+                metadata=metadata,
+            )
+        ts = -1 if timestamp is None else int(timestamp)
+        key = (int(agent_index), ts, int(call_index))
+        existing = self.call_records_by_source.get(key)
+        if existing is None:
+            return self.register_llm_action(
+                agent_index=agent_index,
+                timestamp=timestamp,
+                action_text=action_text,
+                agent_name=agent_name,
+                call_index=call_index,
+                call_type=call_type,
+                metadata=metadata,
+            )
+
+        updated = self._update_llm_action_entry(
+            existing,
+            action_text,
+            agent_name=agent_name,
+            call_type=call_type,
+        )
+        _penalty_total, penalty_details = self._consume_penalties(agent_index)
+        if penalty_details:
+            penalties = updated.setdefault("penalties", [])
+            penalties.extend(penalty_details)
+            format_delta = sum(
+                entry["value"] for entry in penalty_details if entry["type"] == "format"
+            )
+            has_format_penalty = format_delta != 0.0 or any(
+                entry.get("type") == "format" for entry in penalties
+            )
+            validator_delta = 0.0 if has_format_penalty else sum(
+                entry["value"]
+                for entry in penalty_details
+                if entry["type"] == "validator"
+            )
+            if has_format_penalty:
+                existing_validator = float(updated.get("validator_reward", 0.0) or 0.0)
+                if existing_validator > 0.0:
+                    validator_delta -= existing_validator
+            updated["format_reward"] = (
+                float(updated.get("format_reward", 0.0) or 0.0) + format_delta
+            )
+            updated["validator_reward"] = (
+                float(updated.get("validator_reward", 0.0) or 0.0)
+                + validator_delta
+            )
+            updated["total"] = (
+                float(updated.get("total", 0.0) or 0.0)
+                + format_delta
+                + validator_delta
+            )
+        self._suppress_validator_when_format_failed(updated)
+        return updated
+
+    def _update_llm_action_entry(
+        self,
+        entry: Dict[str, Any],
+        action_text: Optional[str],
+        *,
+        agent_name: Optional[str] = None,
+        call_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized_action = (action_text or "").strip() or "[EMPTY]"
+        previous_rewardable = (
+            entry.get("call_type") in self.rewardable_action_call_types
+            and not entry.get("is_collab")
+        )
+        entry["action"] = normalized_action
+        if agent_name:
+            entry["agent"] = agent_name
+        if call_type is not None:
+            entry["call_type"] = call_type
+        entry["is_collab"] = self._is_collab_action(normalized_action)
+        now_rewardable = (
+            entry.get("call_type") in self.rewardable_action_call_types
+            and not entry.get("is_collab")
+            and normalized_action != "[EMPTY]"
+            and not self._is_wait_action(normalized_action)
+        )
+        has_format_penalty = any(
+            item.get("type") == "format" for item in (entry.get("penalties") or [])
+        )
+        has_format_credit = float(entry.get("format_reward", 0.0) or 0.0) > 0.0
+        if (
+            now_rewardable
+            and not previous_rewardable
+            and not has_format_penalty
+            and not has_format_credit
+        ):
+            entry["format_reward"] = (
+                float(entry.get("format_reward", 0.0) or 0.0)
+                + self.format_success_reward_value
+            )
+            entry["total"] = (
+                float(entry.get("total", 0.0) or 0.0)
+                + self.format_success_reward_value
+            )
+        return entry
+
+    def after_step(
+        self,
+        timestep: int,
+        ml_actions: Optional[List[str]],
+        state,
+        executed_action_sources: Optional[List[Optional[Dict[str, Any]]]] = None,
+    ) -> Dict:
         """
         Update rewards after a control step. `ml_actions` should contain executed medium-level actions.
         """
         if ml_actions is None:
             ml_actions = [None, None]
+        if executed_action_sources is None:
+            executed_action_sources = [None, None]
 
         per_agent = []
         team_total = 0.0
 
         bucket = self.step_call_records.pop(timestep, [[], []])
         for agent_idx in range(2):
-            call_entries = bucket[agent_idx]
-            seq_reward = sum(entry["sequence_reward"] for entry in call_entries)
+            bucket_entries = bucket[agent_idx]
+            call_entries = list(bucket_entries)
+            source = (
+                executed_action_sources[agent_idx]
+                if agent_idx < len(executed_action_sources)
+                else None
+            )
+            executed_action = ml_actions[agent_idx] if agent_idx < len(ml_actions) else None
+            source_entry = None
+            if source and source.get("call_index") is not None:
+                source_entry = self._source_entry_for_executed_action(
+                    agent_idx,
+                    timestep,
+                    executed_action,
+                    source,
+                    call_entries,
+                )
+                if source_entry is not None and source_entry not in call_entries:
+                    call_entries.append(source_entry)
+                source_entry_valid = self._validate_executed_source_entry(
+                    agent_idx,
+                    timestep,
+                    executed_action,
+                    source,
+                    source_entry,
+                    call_entries,
+                )
+                if not source_entry_valid:
+                    source_entry = None
+            (
+                executed_seq_reward,
+                executed_similarity_before,
+                executed_similarity_after,
+                executed_similarity_delta,
+            ) = self._process_sequence_reward(
+                agent_idx,
+                ml_actions[agent_idx] if agent_idx < len(ml_actions) else None,
+            )
+            seq_reward = executed_seq_reward
+            validator_success_target = (
+                source_entry
+                if self._entry_can_receive_execution_reward(
+                    source_entry, executed_action, source
+                )
+                else None
+            )
+            target_has_format_penalty = any(
+                item.get("type") == "format"
+                for item in (validator_success_target.get("penalties") or [])
+            ) if validator_success_target is not None else False
+            if validator_success_target is not None and not target_has_format_penalty:
+                validator_success_target["validator_reward"] = (
+                    validator_success_target.get("validator_reward", 0.0)
+                    + self.validator_success_reward_value
+                )
+                validator_success_target["total"] = (
+                    validator_success_target.get("total", 0.0)
+                    + self.validator_success_reward_value
+                )
+            elif validator_success_target is not None:
+                self._suppress_validator_when_format_failed(validator_success_target)
+            if seq_reward:
+                target_entry = None
+                if source and source.get("call_index") is not None:
+                    target_entry = (
+                        source_entry
+                        if self._entry_can_receive_execution_reward(
+                            source_entry, executed_action, source
+                        )
+                        else None
+                    )
+                else:
+                    target_entry = self._sequence_reward_target_entry(
+                        call_entries,
+                        executed_action,
+                        None,
+                    )
+                if target_entry is not None:
+                    target_entry["sequence_reward"] = (
+                        target_entry.get("sequence_reward", 0.0) + seq_reward
+                    )
+                    target_entry["progress_reward"] = (
+                        target_entry.get("progress_reward", 0.0) + seq_reward
+                    )
+                    target_entry["total"] = target_entry.get("total", 0.0) + seq_reward
+                    target_entry["similarity_before"] = executed_similarity_before
+                    target_entry["similarity_after"] = executed_similarity_after
+                    target_entry["similarity_delta"] = executed_similarity_delta
             communication_reward = sum(
                 entry.get("communication_reward", 0.0) for entry in call_entries
             )
@@ -339,10 +682,19 @@ class ProcessRewardTracker:
             paired_comm_reward = sum(
                 entry.get("paired_comm_reward", 0.0) for entry in call_entries
             )
-            agent_total = sum(entry["total"] for entry in call_entries)
-            penalty_total = (
-                agent_total - seq_reward - communication_reward - paired_comm_reward
+            collab_reward = sum(
+                entry.get("collab_reward", 0.0) for entry in call_entries
             )
+            format_reward = sum(
+                entry.get("format_reward", 0.0) for entry in call_entries
+            )
+            validator_reward = sum(
+                entry.get("validator_reward", 0.0) for entry in call_entries
+            )
+            agent_total = sum(entry["total"] for entry in call_entries)
+            if seq_reward and not call_entries:
+                agent_total += seq_reward
+            penalty_total = format_reward + validator_reward
             penalty_details = []
             for entry in call_entries:
                 penalty_details.extend(entry["penalties"])
@@ -352,7 +704,10 @@ class ProcessRewardTracker:
                     "communication_reward": communication_reward,
                     "repeat_communication_reward": repeat_communication_reward,
                     "forced_communication_reward": forced_communication_reward,
+                    "collab_reward": collab_reward,
                     "paired_comm_reward": paired_comm_reward,
+                    "format_reward": format_reward,
+                    "validator_reward": validator_reward,
                     "penalty_total": penalty_total,
                     "penalties": penalty_details,
                     "similarity": self.sequence_scores[agent_idx],
@@ -379,6 +734,255 @@ class ProcessRewardTracker:
             "team_total": team_total,
         }
         return reward_info
+
+    def _source_entry_for_executed_action(
+        self,
+        agent_idx: int,
+        timestep: int,
+        executed_action: Optional[str],
+        source: Dict[str, Any],
+        call_entries: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the reward entry for the exact executed action source.
+
+        Multiple embodied candidates can originate from the same LLM call. In
+        that case `(agent, timestep, call_index)` alone is not unique enough:
+        later correction/queued actions may overwrite `call_records_by_source`.
+        The executed environment action must bind to an entry with the same
+        normalized action; otherwise process reward can be assigned to the wrong
+        LLM response.
+        """
+        call_index = source.get("call_index")
+        if call_index is None:
+            return None
+        source_ts = source.get("source_timestamp", source.get("timestamp", timestep))
+        try:
+            source_ts_int = int(source_ts)
+            call_index_int = int(call_index)
+        except (TypeError, ValueError):
+            return None
+        normalized_executed = self._normalize_action(str(executed_action or ""))
+        normalized_source = self._normalize_action(str(source.get("action") or ""))
+        target_action = normalized_executed or normalized_source
+        source_key = (int(agent_idx), source_ts_int, call_index_int)
+
+        def _matches(entry: Optional[Dict[str, Any]]) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            if entry.get("call_index") is not None:
+                try:
+                    if int(entry.get("call_index")) != call_index_int:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            entry_ts = entry.get("source_timestamp", entry.get("timestamp", source_ts_int))
+            try:
+                if int(entry_ts) != source_ts_int:
+                    return False
+            except (TypeError, ValueError):
+                return False
+            return self._normalize_action(str(entry.get("action") or "")) == target_action
+
+        existing = self.call_records_by_source.get(source_key)
+        if _matches(existing):
+            return existing
+        for entry in reversed(call_entries):
+            if _matches(entry):
+                self.call_records_by_source[source_key] = entry
+                return entry
+        for entry in reversed(self.call_events):
+            if (
+                isinstance(entry, dict)
+                and int(entry.get("agent_index", -1)) == int(agent_idx)
+                and _matches(entry)
+            ):
+                self.call_records_by_source[source_key] = entry
+                return entry
+
+        return existing
+
+    def _validate_executed_source_entry(
+        self,
+        agent_idx: int,
+        timestep: int,
+        executed_action: Optional[str],
+        source: Dict[str, Any],
+        source_entry: Optional[Dict[str, Any]],
+        call_entries: List[Dict[str, Any]],
+    ) -> bool:
+        normalized_executed = self._normalize_action(str(executed_action or ""))
+        if not normalized_executed or normalized_executed.lower().startswith("wait"):
+            return True
+        call_index = source.get("call_index")
+        source_action = self._normalize_action(str(source.get("action") or ""))
+        if source_entry is None:
+            available = [
+                {
+                    "call_index": entry.get("call_index"),
+                    "call_type": entry.get("call_type"),
+                    "action": entry.get("action"),
+                }
+                for entry in call_entries
+            ]
+            self._record_reward_source_mismatch(
+                "missing_reward_entry",
+                agent_idx=agent_idx,
+                timestep=timestep,
+                call_index=call_index,
+                executed_action=normalized_executed,
+                source_action=source_action,
+                source=source,
+                available_calls=available,
+            )
+            return False
+        entry_action = self._normalize_action(str(source_entry.get("action") or ""))
+        if entry_action != normalized_executed:
+            self._record_reward_source_mismatch(
+                "action_mismatch",
+                agent_idx=agent_idx,
+                timestep=timestep,
+                call_index=call_index,
+                executed_action=normalized_executed,
+                source_action=source_action,
+                entry_action=entry_action,
+                source=source,
+            )
+            return False
+        if (
+            not self._is_rewardable_execution_entry(source_entry)
+        ):
+            self._record_reward_source_mismatch(
+                "not_rewardable_entry",
+                agent_idx=agent_idx,
+                timestep=timestep,
+                call_index=call_index,
+                executed_action=normalized_executed,
+                source_action=source_action,
+                entry_action=entry_action,
+                call_type=source_entry.get("call_type"),
+                is_collab=source_entry.get("is_collab"),
+                source=source,
+            )
+            return False
+        return True
+
+    def _record_reward_source_mismatch(self, reason: str, **payload: Any) -> None:
+        event = {"reason": reason, **payload}
+        self.reward_source_mismatch_events.append(event)
+        print(f"[RewardTracker] source mismatch skipped: {event}", flush=True)
+
+    def _is_rewardable_execution_entry(self, entry: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        return (
+            entry.get("call_type") in self.rewardable_action_call_types
+            and not entry.get("is_collab")
+            and not self._is_collab_action(str(entry.get("action") or ""))
+        )
+
+    def _entry_can_receive_execution_reward(
+        self,
+        entry: Optional[Dict[str, Any]],
+        executed_action: Optional[str],
+        executed_source: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """True only for the exact LLM call whose embodied action executed."""
+        if not self._is_rewardable_execution_entry(entry):
+            return False
+        normalized_executed = self._normalize_action(str(executed_action or ""))
+        if not normalized_executed or normalized_executed.lower().startswith("wait"):
+            return False
+        if self._normalize_action(str(entry.get("action") or "")) != normalized_executed:
+            return False
+        if not executed_source or executed_source.get("call_index") is None:
+            return False
+        try:
+            if int(entry.get("call_index")) != int(executed_source.get("call_index")):
+                return False
+            source_ts = executed_source.get(
+                "source_timestamp",
+                executed_source.get("timestamp"),
+            )
+            entry_ts = entry.get("source_timestamp", entry.get("timestamp"))
+            if source_ts is not None and entry_ts is not None and int(entry_ts) != int(source_ts):
+                return False
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _sequence_reward_target_entry(
+        self,
+        call_entries: List[Dict],
+        executed_action: Optional[str],
+        executed_source: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
+        """Attach executed-action progress only to the call that produced it."""
+        normalized_executed = self._normalize_action(str(executed_action or ""))
+        if not normalized_executed:
+            return None
+        if executed_source and executed_source.get("call_index") is not None:
+            source_call_index = int(executed_source["call_index"])
+            for entry in call_entries:
+                if entry.get("call_index") is None:
+                    continue
+                if int(entry.get("call_index")) != source_call_index:
+                    continue
+                if self._normalize_action(str(entry.get("action") or "")) != normalized_executed:
+                    return None
+                if (
+                    entry.get("call_type") in self.rewardable_action_call_types
+                    and not entry.get("is_collab")
+                ):
+                    return entry
+                return None
+            return None
+        matching_entries = [
+            entry
+            for entry in call_entries
+            if self._normalize_action(str(entry.get("action") or ""))
+            == normalized_executed
+        ]
+        if not matching_entries:
+            return None
+        for entry in call_entries:
+            if (
+                entry in matching_entries
+                and entry.get("call_type") in self.rewardable_action_call_types
+                and not entry.get("is_collab")
+            ):
+                return entry
+        for entry in matching_entries:
+            if not entry.get("is_collab"):
+                return entry
+        return None
+
+    def _validator_success_target_entry(
+        self,
+        call_entries: List[Dict],
+        executed_action: Optional[str],
+        executed_source: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
+        """Attach validator success only to the planner call that actually executed."""
+        normalized_executed = self._normalize_action(str(executed_action or ""))
+        if not normalized_executed or normalized_executed.lower().startswith("wait"):
+            return None
+        if not executed_source or executed_source.get("call_index") is None:
+            return None
+        source_call_index = int(executed_source["call_index"])
+        for entry in call_entries:
+            if entry.get("call_index") is None:
+                continue
+            if int(entry.get("call_index")) != source_call_index:
+                continue
+            if self._normalize_action(str(entry.get("action") or "")) != normalized_executed:
+                return None
+            if (
+                entry.get("call_type") in self.rewardable_action_call_types
+                and not entry.get("is_collab")
+            ):
+                return entry
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # Sequence reward helpers
@@ -776,7 +1380,19 @@ class ProcessRewardTracker:
         events = self.penalty_queue[agent_index]
         total = 0.0
         details = []
+        seen = set()
+        has_format_event = any(entry.get("type") == "format" for entry in events)
         for entry in events:
+            if has_format_event and entry.get("type") == "validator":
+                continue
+            key = (entry.get("type"), entry.get("detail"))
+            if key in seen:
+                continue
+            if entry.get("type") == "format" and any(
+                item_type == "format" for item_type, _ in seen
+            ):
+                continue
+            seen.add(key)
             if entry["type"] == "format":
                 value = self.format_penalty_value
             else:
@@ -930,7 +1546,27 @@ class ProcessRewardTracker:
         return None
 
     def _normalize_action(self, action: str) -> str:
-        return action.replace(" ", "")
+        return self._clean_action_text(action).replace(" ", "")
+
+    def _clean_action_text(self, action: Optional[str]) -> str:
+        text = (action or "").strip()
+        if not text:
+            return ""
+        text = text.replace("<|im_end|>", "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text).strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+        match = re.search(
+            r"Action\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+        )
+        if match:
+            text = match.group(1).strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+        return text
 
     def _is_collab_action(self, action: str) -> bool:
         if not action:
@@ -939,3 +1575,9 @@ class ProcessRewardTracker:
         if lowered.startswith("collab("):
             return True
         return lowered.startswith(("request(", "seek(", "ack(", "deny("))
+
+    def _is_wait_action(self, action: Optional[str]) -> bool:
+        if not action:
+            return False
+        lowered = action.strip().lower()
+        return lowered == "wait" or lowered.startswith("wait(")

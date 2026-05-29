@@ -257,6 +257,13 @@ def _aggregate_performance_curve(worker_dirs: List[Path], output_dir: Path) -> N
         "avg_agent1_custom_return",
         "team_custom_return_sum",
         "avg_team_custom_return",
+        "rollout_wall_time_sec",
+        "actor_llm_calls",
+        "actor_llm_seconds",
+        "avg_actor_llm_seconds",
+        "value_llm_calls",
+        "value_llm_seconds",
+        "avg_value_llm_seconds",
     ]
     output_path = output_dir / "performance_curve.csv"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -284,6 +291,11 @@ def _aggregate_performance_curve(worker_dirs: List[Path], output_dir: Path) -> N
             agent0_custom_sum = sum(_to_float(row, "agent0_custom_return_sum") for row in rows)
             agent1_custom_sum = sum(_to_float(row, "agent1_custom_return_sum") for row in rows)
             team_custom_sum = sum(_to_float(row, "team_custom_return_sum") for row in rows)
+            rollout_wall_time = max(_to_float(row, "rollout_wall_time_sec") for row in rows)
+            actor_llm_calls = int(sum(_to_float(row, "actor_llm_calls") for row in rows))
+            actor_llm_seconds = sum(_to_float(row, "actor_llm_seconds") for row in rows)
+            value_llm_calls = int(sum(_to_float(row, "value_llm_calls") for row in rows))
+            value_llm_seconds = sum(_to_float(row, "value_llm_seconds") for row in rows)
             agg = {
                 "row_idx": row_idx,
                 "update_idx": update_idx,
@@ -306,6 +318,13 @@ def _aggregate_performance_curve(worker_dirs: List[Path], output_dir: Path) -> N
                 "avg_agent1_custom_return": (agent1_custom_sum / episodes) if episodes > 0 else 0.0,
                 "team_custom_return_sum": team_custom_sum,
                 "avg_team_custom_return": (team_custom_sum / episodes) if episodes > 0 else 0.0,
+                "rollout_wall_time_sec": rollout_wall_time,
+                "actor_llm_calls": actor_llm_calls,
+                "actor_llm_seconds": actor_llm_seconds,
+                "avg_actor_llm_seconds": (actor_llm_seconds / actor_llm_calls) if actor_llm_calls > 0 else 0.0,
+                "value_llm_calls": value_llm_calls,
+                "value_llm_seconds": value_llm_seconds,
+                "avg_value_llm_seconds": (value_llm_seconds / value_llm_calls) if value_llm_calls > 0 else 0.0,
             }
             writer.writerow(agg)
 

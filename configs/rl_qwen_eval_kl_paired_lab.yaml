@@ -1,9 +1,10 @@
 environment:
   order: baked_bell_pepper
-  horizon: 17
+  horizon: 24
 reward:
-  communication_penalty: 0.0
-  forced_communication_penalty: 0.05
+  product_reward: 0.0
+  communication_penalty: 0.1
+  forced_communication_penalty: 0.4
   paired_comm_reward_enabled: true
   paired_comm_request_positive_reward: 0.5
   paired_comm_request_negative_reward: -0.1
@@ -12,60 +13,31 @@ reward:
   paired_comm_deny_reward: 1.0
 trainer:
   type: mappo
-  train_only: true
-  collect_only: false
-  fix_mistral_regex: true
+  collect_only: true
+  train_only: false
   model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
   lora_path: null
-  lora: {}
   actor_adapters:
     agent_0:
       adapter_name: Chef
-      lora_path: ./runs/Chef
+      lora_path: null
     agent_1:
       adapter_name: Assistant
-      lora_path: ./runs/Assistant
+      lora_path: null
   critic_adapter:
     adapter_name: critic
-    lora_path: ./runs/adapter_critic/critic
+    lora_path: null
     lora_config:
-      r: 8
-      alpha: 16
+      r: 16
+      alpha: 32
       dropout: 0.05
-  value_head_path: ./runs/value_head.pt
-  rollout_dir: rollouts_kl
-  output_dir: runs/rl/train
-  save_interval: 1
-  checkpoint_interval: 0
-  export_latest_dir: runs/rl/export_latest
+  rollout_dir: rollouts_eval_kl
   latest_model_path_file: runs/rl/latest_model.json
-  apply_latest_model_override: true
-  export_interval: 1
-  max_new_tokens: 512
   generation_temperature: 0.0
-  evaluation_batch_size: 32
-  gamma: 0.99
-  gae_lambda: 0.95
-  actor_lr: 1.0e-06
-  critic_lr: 1.0e-06
-  value_head_lr: 2.0e-06
-  lr_scheduler: linear
-  lr_warmup_updates: 0
-  lr_min_ratio: 0.0
-  train_batch_size: 1
-  update_epochs: 4
-  gradient_checkpointing: true
-  gradient_accumulation_steps: 8
-  enable_fresh_value_metrics: true
-  critic_pretrain_value_loss_threshold: 0.5
-  target_kl: null
-  kl_penalty_coef: 0.05
-  clip_coef: 0.15
-  value_clip_coef: 1.0
-  entropy_coef: 0.01
-  value_coef: 1.0
-  max_grad_norm: 0.5
-  cleanup_rollouts: true
+  max_new_tokens: 512
+  evaluation_batch_size: 6
+  fix_mistral_regex: true
+  output_dir: results/rl_eval_kl
 agents:
   num_agents: 2
   agent_0:

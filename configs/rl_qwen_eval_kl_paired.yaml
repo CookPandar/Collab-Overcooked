@@ -14,7 +14,6 @@ trainer:
   type: mappo
   collect_only: true
   train_only: false
-  steps_per_update: 256
   model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
   lora_path: null
   actor_adapters:

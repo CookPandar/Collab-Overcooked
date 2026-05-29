@@ -1,0 +1,76 @@
+environment:
+  order: baked_bell_pepper   
+  horizon: 24
+
+reward:
+  communication_penalty: 0.1
+  forced_communication_penalty: 0.4
+
+
+trainer:
+  type: mappo
+  collect_only: true
+  train_only: false
+
+  # eval 需要更稳定的统计：24 太小，通常跑不出足够 episode
+  model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
+  lora_path: null
+  actor_adapters:
+    agent_0:
+      adapter_name: Chef
+      lora_path: null
+    agent_1:
+      adapter_name: Assistant
+      lora_path: null
+  critic_adapter:
+    adapter_name: critic
+    lora_path: null
+    lora_config:
+      r: 16
+      alpha: 32
+      dropout: 0.05
+
+  # 建议 eval 的 rollout 单独放，避免和训练/采样混在一起
+  rollout_dir: ./rollouts_eval
+
+  # 让 eval 自动加载训练刚导出的最新 adapter 路径
+  latest_model_path_file: runs/rl/latest_model.json
+
+  # eval 建议确定性
+  generation_temperature: 0.0
+
+  # 评估时别开太大，4096 会让一次 decision 又慢又不稳定
+  max_new_tokens: 512
+
+  # 这个名字有点误导，它更像“并行推理 batch”，eval 先用 1 稳一点
+  evaluation_batch_size: 1
+
+  fix_mistral_regex: true
+
+  # （可选）如果你想把 eval 曲线写进某个固定目录，显式指定
+  output_dir: "./results/rl_eval"
+
+agents:
+  num_agents: 2
+  agent_0:
+    type: "openai"
+    model: "qwen2.5-7B-instruct"
+    api_key: "YOUR_API_KEY"
+    base_url: "http://127.0.0.1:8000/v1"
+    model_dirname: ""
+    temperature: 0
+    max_tokens: 512
+    timeout: 30
+    max_retries: 3
+    role: "Chef"
+  agent_1:
+    type: "openai"
+    model: "qwen2.5-7B-instruct"
+    api_key: "YOUR_API_KEY"
+    base_url: "http://127.0.0.1:8001/v1"
+    model_dirname: ""
+    temperature: 0
+    max_tokens: 512
+    timeout: 30
+    max_retries: 3
+    role: "Assistant"

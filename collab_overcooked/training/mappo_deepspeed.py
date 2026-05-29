@@ -8,7 +8,6 @@ LLM can be sharded across multiple GPUs (ZeRO + tensor/pipeline parallel).
 from __future__ import annotations
 
 import json
-import math
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -389,13 +388,9 @@ class DeepSpeedMAPPOTrainer:
 
         self.gamma = trainer_cfg.get("gamma", 0.99)
         self.gae_lambda = trainer_cfg.get("gae_lambda", 0.95)
-        self.steps_per_update = trainer_cfg.get("steps_per_update", 256)
         horizon_cfg = env_config.get("horizon", 10)
         self.rollout_horizon = (
             int(horizon_cfg) if horizon_cfg is not None else None
-        )
-        self.local_steps_per_update = max(
-            1, math.ceil(self.steps_per_update / max(1, self.world_size))
         )
         self.total_updates = trainer_cfg.get("total_updates", 1000)
         self.clip_coef = trainer_cfg.get("clip_coef", 0.2)
@@ -549,9 +544,7 @@ class DeepSpeedMAPPOTrainer:
     def collect_rollout(self):
         assert self.session is not None
         self.buffer.clear()
-        step_count = 0
-        local_target = self.local_steps_per_update
-        while step_count < local_target:
+        while True:
             step_result = self.session.step()
             for record in step_result.policy_records:
                 reward = getattr(record, "reward", step_result.reward)
@@ -567,11 +560,9 @@ class DeepSpeedMAPPOTrainer:
                     agent_index=record.agent_index,
                     entropy=meta.get("entropy", 0.0),
                 )
-                step_count += 1
             if step_result.done:
                 self.session.reset()
-            if not step_result.policy_records:
-                step_count += 1
+                break
             if self._rollout_reached_horizon(step_result):
                 if not step_result.done:
                     self.session.reset()

@@ -12,12 +12,12 @@ reward:
   paired_comm_deny_reward: 1.0
 trainer:
   type: mappo
-  train_only: true
-  collect_only: false
-  fix_mistral_regex: true
+  collect_only: true
+  off_policy_snapshots: runs/rl/snapshots/one_episode_t3_t16.jsonl
+  rollout_dir: rollouts_kl
+  output_dir: runs/rl/collect
   model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
   lora_path: null
-  lora: {}
   actor_adapters:
     agent_0:
       adapter_name: Chef
@@ -29,43 +29,18 @@ trainer:
     adapter_name: critic
     lora_path: ./runs/adapter_critic/critic
     lora_config:
-      r: 8
-      alpha: 16
+      r: 16
+      alpha: 32
       dropout: 0.05
   value_head_path: ./runs/value_head.pt
-  rollout_dir: rollouts_kl
-  output_dir: runs/rl/train
-  save_interval: 1
-  checkpoint_interval: 0
-  export_latest_dir: runs/rl/export_latest
   latest_model_path_file: runs/rl/latest_model.json
-  apply_latest_model_override: true
-  export_interval: 1
+  generation_temperature: 0.7
+  evaluation_batch_size: 6
   max_new_tokens: 512
-  generation_temperature: 0.0
-  evaluation_batch_size: 32
-  gamma: 0.99
-  gae_lambda: 0.95
-  actor_lr: 1.0e-06
-  critic_lr: 1.0e-06
-  value_head_lr: 2.0e-06
-  lr_scheduler: linear
-  lr_warmup_updates: 0
-  lr_min_ratio: 0.0
-  train_batch_size: 1
-  update_epochs: 4
-  gradient_checkpointing: true
-  gradient_accumulation_steps: 8
-  enable_fresh_value_metrics: true
-  critic_pretrain_value_loss_threshold: 0.5
-  target_kl: null
-  kl_penalty_coef: 0.05
-  clip_coef: 0.15
-  value_clip_coef: 1.0
-  entropy_coef: 0.01
-  value_coef: 1.0
-  max_grad_norm: 0.5
-  cleanup_rollouts: true
+  vllm_request_timeout: 180
+  compute_values_in_collect: true
+  collect_value_backend: vllm
+  fix_mistral_regex: true
 agents:
   num_agents: 2
   agent_0:

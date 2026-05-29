@@ -17,6 +17,45 @@ PURGE_OUTPUTS="${RL_CLEANUP_PURGE_OUTPUTS:-1}"
 KILL_BY_PORT="${RL_CLEANUP_KILL_BY_PORT:-1}"
 FALLBACK_PORT_BLOCK="${RL_CLEANUP_FALLBACK_PORT_BLOCK:-0}"
 PROTECTED_PORTS_RAW="${RL_CLEANUP_PROTECTED_PORTS:-8000,8001}"
+STATE_ONLY="${RL_CLEANUP_STATE_ONLY:-0}"
+GPU_SCOPE_RAW="${RL_CLEANUP_GPU_IDS:-${RL_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-}}}"
+
+normalize_csv() {
+    local raw="$1"
+    raw="${raw// /}"
+    raw="${raw%;}"
+    raw="${raw#,}"
+    raw="${raw%,}"
+    printf '%s\n' "$raw"
+}
+
+GPU_SCOPE_RAW="$(normalize_csv "$GPU_SCOPE_RAW")"
+
+value_in_csv() {
+    local needle="$1"
+    local csv="$2"
+    [[ -n "$needle" && -n "$csv" ]] || return 1
+    local item
+    IFS=',' read -r -a items <<< "$csv"
+    for item in "${items[@]}"; do
+        [[ -n "$item" ]] || continue
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+csv_intersects() {
+    local left="$1"
+    local right="$2"
+    [[ -n "$left" && -n "$right" ]] || return 1
+    local item
+    IFS=',' read -r -a items <<< "$left"
+    for item in "${items[@]}"; do
+        [[ -n "$item" ]] || continue
+        value_in_csv "$item" "$right" && return 0
+    done
+    return 1
+}
 
 port_is_protected() {
     local port="$1"
@@ -43,6 +82,89 @@ process_command() {
     ps -p "$pid" -o command= 2>/dev/null || true
 }
 
+process_user() {
+    local pid="$1"
+    ps -p "$pid" -o user= 2>/dev/null | tr -d ' ' || true
+}
+
+process_pgid() {
+    local pid="$1"
+    ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true
+}
+
+process_cuda_visible_devices() {
+    local pid="$1"
+    [[ -r "/proc/$pid/environ" ]] || return 0
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' \
+        | head -n 1 \
+        | tr -d ' '
+}
+
+pid_matches_gpu_scope() {
+    local pid="$1"
+    [[ -n "$GPU_SCOPE_RAW" ]] || return 0
+    [[ -n "$pid" ]] || return 1
+
+    local visible
+    visible="$(process_cuda_visible_devices "$pid")"
+    if [[ -n "$visible" ]]; then
+        csv_intersects "$visible" "$GPU_SCOPE_RAW" && return 0
+        return 1
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local gpu_pid gpu_idx
+        while IFS=',' read -r gpu_pid gpu_idx; do
+            gpu_pid="$(echo "$gpu_pid" | tr -d ' ')"
+            gpu_idx="$(echo "$gpu_idx" | tr -d ' ')"
+            [[ "$gpu_pid" == "$pid" ]] || continue
+            value_in_csv "$gpu_idx" "$GPU_SCOPE_RAW" && return 0
+            return 1
+        done < <(nvidia-smi --query-compute-apps=pid,gpu_bus_id --format=csv,noheader,nounits 2>/dev/null \
+            | while IFS=',' read -r smi_pid bus_id; do
+                smi_pid="$(echo "$smi_pid" | tr -d ' ')"
+                bus_id="$(echo "$bus_id" | tr -d ' ')"
+                gpu_idx="$(nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader,nounits 2>/dev/null \
+                    | awk -F',' -v bus="$bus_id" '{gsub(/ /, "", $1); gsub(/ /, "", $2); if ($2 == bus) print $1; }' \
+                    | head -n 1)"
+                [[ -n "$smi_pid" && -n "$gpu_idx" ]] && printf '%s,%s\n' "$smi_pid" "$gpu_idx"
+            done)
+    fi
+
+    return 1
+}
+
+value_in_file() {
+    local needle="$1"
+    local path="$2"
+    [[ -n "$needle" && -f "$path" ]] || return 1
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == "$needle" ]] && return 0
+    done < "$path"
+    return 1
+}
+
+pid_is_ours_for_cleanup() {
+    local pid="$1"
+    [[ -n "$pid" ]] || return 1
+    local current_user
+    current_user="$(id -un)"
+    [[ "$(process_user "$pid")" == "$current_user" ]] || return 1
+    if ! pid_matches_gpu_scope "$pid"; then
+        return 1
+    fi
+    value_in_file "$pid" "$STATE_ROOT/worker_pids.txt" && return 0
+    value_in_file "$pid" "$STATE_ROOT/vllm_pids.txt" && return 0
+    local pgid
+    pgid="$(process_pgid "$pid")"
+    value_in_file "$pgid" "$STATE_ROOT/vllm_pgids.txt" && return 0
+    local cmd
+    cmd="$(process_command "$pid")"
+    [[ -n "$cmd" && ( "$cmd" == *"$EXPERIMENT_ROOT"* || "$cmd" == *"$STATE_ROOT"* ) ]]
+}
+
 command_is_rl_related() {
     local cmd="$1"
     [[ -n "$cmd" ]] || return 1
@@ -60,9 +182,13 @@ kill_process_group() {
     local pgid="$1"
     [[ -n "$pgid" ]] || return 0
     local matched=0
+    local current_user
+    current_user="$(id -un)"
     while read -r _pid _pgid _cmd; do
         [[ "$_pgid" == "$pgid" ]] || continue
-        if command_is_rl_related "$_cmd"; then
+        [[ "$(process_user "$_pid")" == "$current_user" ]] || continue
+        pid_matches_gpu_scope "$_pid" || continue
+        if value_in_file "$_pid" "$STATE_ROOT/vllm_pids.txt" || command_is_rl_related "$_cmd"; then
             matched=1
             break
         fi
@@ -81,10 +207,8 @@ kill_pid_if_exists() {
     local pid="$1"
     [[ -n "$pid" ]] || return 0
     if process_exists "$pid"; then
-        local cmd
-        cmd="$(process_command "$pid")"
-        if ! command_is_rl_related "$cmd"; then
-            echo "[cleanup-rl] skip pid=$pid because it no longer looks like this RL run"
+        if ! pid_is_ours_for_cleanup "$pid"; then
+            echo "[cleanup-rl] skip pid=$pid because it is not owned by this run"
             return 0
         fi
         echo "[cleanup-rl] killing pid=$pid"
@@ -107,10 +231,22 @@ kill_port_listener() {
             [[ -n "$pid" ]] && pids+=("$pid")
         done < <(lsof -tiTCP:"$port" -sTCP:LISTEN -Pn 2>/dev/null || true)
         if [[ "${#pids[@]}" -gt 0 ]]; then
-            echo "[cleanup-rl] clearing listener on port=$port pid=${pids[*]}"
-            kill "${pids[@]}" >/dev/null 2>&1 || true
+            local owned_pids=()
+            local pid
+            for pid in "${pids[@]}"; do
+                if pid_is_ours_for_cleanup "$pid"; then
+                    owned_pids+=("$pid")
+                else
+                    echo "[cleanup-rl] skip listener on port=$port pid=$pid because it is not owned by this run"
+                fi
+            done
+            if [[ "${#owned_pids[@]}" -eq 0 ]]; then
+                return 0
+            fi
+            echo "[cleanup-rl] clearing owned listener on port=$port pid=${owned_pids[*]}"
+            kill "${owned_pids[@]}" >/dev/null 2>&1 || true
             sleep 1
-            kill -9 "${pids[@]}" >/dev/null 2>&1 || true
+            kill -9 "${owned_pids[@]}" >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -256,9 +392,14 @@ echo "[cleanup-rl] state_root=$STATE_ROOT"
 echo "[cleanup-rl] kill_by_port=$KILL_BY_PORT"
 echo "[cleanup-rl] fallback_port_block=$FALLBACK_PORT_BLOCK"
 echo "[cleanup-rl] protected_ports=$PROTECTED_PORTS_RAW"
+echo "[cleanup-rl] gpu_scope=${GPU_SCOPE_RAW:-[none]}"
 
 if ! cleanup_from_state; then
-    cleanup_from_port_block
+    if [[ "$STATE_ONLY" == "1" ]]; then
+        echo "[cleanup-rl] state-only cleanup requested; skip derived port-block cleanup"
+    else
+        cleanup_from_port_block
+    fi
 fi
 
 show_recent_logs "rl_workers"

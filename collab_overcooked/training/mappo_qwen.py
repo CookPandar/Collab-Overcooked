@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import copy
@@ -62,8 +63,10 @@ class TextTransition:
     communication_reward: float = 0.0
     repeat_communication_reward: float = 0.0
     forced_communication_reward: float = 0.0
+    collab_reward: float = 0.0
     paired_comm_reward: float = 0.0
     breakdown_total_reward: float = 0.0
+    reward_source_key: Optional[Tuple[int, int, int]] = None
 
 
 @dataclass
@@ -82,12 +85,24 @@ class SnapshotRecord:
 class TextRolloutBuffer:
     def __init__(self):
         self.storage: List[TextTransition] = []
+        self._source_index: Dict[Tuple[int, int, int], int] = {}
 
     def add(self, **kwargs):
-        self.storage.append(TextTransition(**kwargs))
+        transition = TextTransition(**kwargs)
+        index = len(self.storage)
+        self.storage.append(transition)
+        if transition.reward_source_key is not None:
+            self._source_index[transition.reward_source_key] = index
+
+    def get_by_source_key(self, key: Tuple[int, int, int]) -> Optional[TextTransition]:
+        index = self._source_index.get(key)
+        if index is None or index < 0 or index >= len(self.storage):
+            return None
+        return self.storage[index]
 
     def clear(self):
         self.storage.clear()
+        self._source_index.clear()
 
 
 class LMGenerationResult:
@@ -1243,6 +1258,9 @@ class MAPPOTrainer:
             self._load_snapshot_dataset(snapshot_paths) if snapshot_paths else []
         )
         self.snapshot_cycle = bool(trainer_cfg.get("snapshot_cycle", True))
+        self.snapshot_rollout_mode = str(
+            trainer_cfg.get("snapshot_rollout_mode", "step")
+        ).strip().lower()
         self._snapshot_cursor = 0
 
         self.gamma = float(trainer_cfg.get("gamma", 0.99))
@@ -1254,13 +1272,25 @@ class MAPPOTrainer:
             trainer_cfg.get("discount_reset_per_timestep", False)
         )
         self.gae_lambda = float(trainer_cfg.get("gae_lambda", 0.95))
-        self.steps_per_update = trainer_cfg.get("steps_per_update", 256)
         horizon_cfg = env_config.get("horizon", 10)
         self.rollout_horizon = (
             int(horizon_cfg) if horizon_cfg is not None else None
         )
-        self.local_steps_per_update = max(
-            1, math.ceil(self.steps_per_update / self.accelerator.num_processes)
+        partial_success_cfg = trainer_cfg.get("partial_success") or {}
+        if isinstance(partial_success_cfg, str):
+            partial_success_cfg = {"type": partial_success_cfg}
+        elif not isinstance(partial_success_cfg, dict):
+            partial_success_cfg = {}
+        self.partial_success_type = str(partial_success_cfg.get("type", "")).strip()
+        self.partial_success_enabled = bool(self.partial_success_type)
+        self.partial_success_utensil = str(
+            partial_success_cfg.get("utensil", "oven0")
+        ).strip()
+        self.partial_success_target = str(
+            partial_success_cfg.get("target", env_config.get("order", ""))
+        ).strip()
+        self.partial_success_reward = float(
+            partial_success_cfg.get("terminal_reward", 20.0)
         )
         self.train_batch_size = int(trainer_cfg.get("train_batch_size", 32))
         self.update_epochs = int(trainer_cfg.get("update_epochs", 4))
@@ -1317,7 +1347,8 @@ class MAPPOTrainer:
             f"compute_values_in_collect={self.compute_values_in_collect} "
             f"collect_value_backend={self.collect_value_backend} "
             f"use_vllm_value_service={self.use_vllm_value_service} "
-            f"load_policy_model={self.load_policy_model}"
+            f"load_policy_model={self.load_policy_model} "
+            f"partial_success={self.partial_success_type or 'none'}"
         )
         target_kl_cfg = trainer_cfg.get("target_kl", None)
         self.target_kl = float(target_kl_cfg) if target_kl_cfg is not None else None
@@ -1557,27 +1588,27 @@ class MAPPOTrainer:
         )
 
     def _build_lr_scheduler(
-        self, steps_per_update: int
+        self, optimizer_steps_per_update: int
     ) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
         if self.lr_scheduler_name in ("", "none", "off", "disabled"):
             self.lr_scheduler = None
             return None
-        steps_per_update = max(1, int(steps_per_update))
+        optimizer_steps_per_update = max(1, int(optimizer_steps_per_update))
         round_idx = self._current_train_round_idx()
         completed_updates = max(0, round_idx - 1)
-        step_offset = completed_updates * steps_per_update
+        step_offset = completed_updates * optimizer_steps_per_update
         for group in self.optimizer.param_groups:
             group.setdefault("initial_lr", group["lr"])
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
             lr_lambda=lambda local_step: self._lr_scheduler_multiplier(
                 step_offset + int(local_step),
-                steps_per_update,
+                optimizer_steps_per_update,
             ),
         )
         for base_lr, group in zip(scheduler.base_lrs, self.optimizer.param_groups):
             group["lr"] = float(base_lr) * self._lr_scheduler_multiplier(
-                step_offset, steps_per_update
+                step_offset, optimizer_steps_per_update
             )
         self.lr_scheduler = scheduler
         return scheduler
@@ -1668,6 +1699,11 @@ class MAPPOTrainer:
             "agent0_custom_return_sum": 0.0,
             "agent1_custom_return_sum": 0.0,
             "team_custom_return_sum": 0.0,
+            "rollout_wall_time_sec": 0.0,
+            "actor_llm_calls": 0,
+            "actor_llm_seconds": 0.0,
+            "value_llm_calls": 0,
+            "value_llm_seconds": 0.0,
         }
         self._current_episode_return = 0.0
         self._current_episode_length = 0
@@ -1820,6 +1856,7 @@ class MAPPOTrainer:
         done: bool,
         policy_calls: int,
         process_reward: Optional[Dict[str, Any]] = None,
+        episode_success: Optional[bool] = None,
     ):
         stats = self._last_rollout_stats
         stats["env_steps"] += 1
@@ -1835,7 +1872,11 @@ class MAPPOTrainer:
             self._current_episode_custom_stats[key] += float(value)
         if done:
             stats["episodes_completed"] += 1
-            if abs(float(self._current_episode_return) - 20.0) < 1e-6:
+            if (
+                bool(episode_success)
+                if episode_success is not None
+                else abs(float(self._current_episode_return) - 20.0) < 1e-6
+            ):
                 stats["success_episodes"] += 1
             stats["episode_return_sum"] += float(self._current_episode_return)
             stats["episode_lengths_sum"] += int(self._current_episode_length)
@@ -1871,6 +1912,58 @@ class MAPPOTrainer:
         if timestep is None:
             return False
         return int(timestep) >= self.rollout_horizon
+
+    def _partial_success_reached(self) -> bool:
+        if not self.partial_success_enabled or self.session is None:
+            return False
+        if self.partial_success_type == "oven_cooking":
+            state = getattr(self.session.env, "state", None)
+            mdp = getattr(self.session, "mdp", None)
+            if state is None or mdp is None:
+                return False
+            try:
+                utensil_states = mdp.get_utensil_states(state)
+            except Exception:
+                return False
+            cooking = set(utensil_states.get("cooking") or [])
+            if self.partial_success_utensil not in cooking:
+                return False
+            utensil_entry = getattr(mdp, "utensil_state_dict", {}).get(
+                self.partial_success_utensil, {}
+            )
+            soup = utensil_entry.get("soup") if isinstance(utensil_entry, dict) else None
+            state_value = getattr(soup, "state", None)
+            if not state_value:
+                return True
+            food = state_value[0]
+            target = self.partial_success_target
+            if not target:
+                return True
+            if isinstance(food, (list, tuple, set)):
+                return target in food or any(str(target) in str(item) for item in food)
+            return str(target) in str(food)
+        return False
+
+    def _apply_partial_success_reward(self, records: List[Any]) -> None:
+        if not records:
+            return
+        record = records[-1]
+        try:
+            record.reward = float(getattr(record, "reward", 0.0) or 0.0) + float(
+                self.partial_success_reward
+            )
+        except Exception:
+            return
+        metadata = dict(getattr(record, "metadata", {}) or {})
+        metadata["partial_success"] = self.partial_success_type
+        metadata["partial_success_reward"] = float(self.partial_success_reward)
+        breakdown = dict(metadata.get("reward_breakdown") or {})
+        raw = dict(breakdown.get("raw") or {})
+        raw["partial_success_reward"] = float(self.partial_success_reward)
+        breakdown["raw"] = raw
+        breakdown["partial_success_reward"] = float(self.partial_success_reward)
+        metadata["reward_breakdown"] = breakdown
+        record.metadata = metadata
 
     def _extract_agent_roles(self, agents_cfg: Dict[str, Any]) -> Dict[int, str]:
         roles: Dict[int, str] = {}
@@ -2409,7 +2502,7 @@ class MAPPOTrainer:
         }
         return response_text, metadata
 
-    def _vllm_endpoint(self, path: str) -> Tuple[int, str]:
+    def _vllm_endpoint(self, path: str, *, service: str = "actor") -> Tuple[int, str]:
         rank_raw = (
             os.environ.get("RL_WORKER_RANK")
             or os.environ.get("LOCAL_RANK")
@@ -2421,7 +2514,15 @@ class MAPPOTrainer:
         except ValueError:
             rank = 0
         host = os.environ["RL_VLLM_HOST"]
-        start_port = int(os.environ["RL_VLLM_START_PORT"])
+        if service == "value":
+            start_port = int(
+                os.environ.get(
+                    "RL_VLLM_VALUE_START_PORT",
+                    os.environ["RL_VLLM_START_PORT"],
+                )
+            )
+        else:
+            start_port = int(os.environ["RL_VLLM_START_PORT"])
         return rank, f"http://{host}:{start_port + rank}{path}"
 
     def _post_json(
@@ -2458,19 +2559,22 @@ class MAPPOTrainer:
         )
         actor_adapter_name = None
         actor_spec = self.actor_adapters.get(agent_index)
-        if actor_spec is not None and actor_spec.name == model_name:
+        if actor_spec is not None:
             actor_adapter_name = actor_spec.name
         timeout = float(
             self.agents_cfg.get(f"agent_{agent_index}", {}).get(
                 "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
             )
         )
-        rank, endpoint_url = self._vllm_endpoint("/rl/generate")
+        rank, endpoint_url = self._vllm_endpoint("/rl/generate", service="actor")
         request_started = time.time()
         print(
             "[MAPPOTrainer] vllm request start "
             f"rank={rank} agent={agent_index} model={model_name} "
-            f"url={endpoint_url} timeout={timeout} messages={len(messages)}"
+            f"adapter={actor_adapter_name or 'base'} "
+            f"url={endpoint_url} timeout={timeout} "
+            f"temperature={float(temperature if temperature is not None else 0.0)} "
+            f"messages={len(messages)}"
         )
         response = self._post_json(
             endpoint_url,
@@ -2483,6 +2587,14 @@ class MAPPOTrainer:
             timeout=timeout,
         )
         elapsed = time.time() - request_started
+        if hasattr(self, "_last_rollout_stats"):
+            self._last_rollout_stats["actor_llm_calls"] = (
+                int(self._last_rollout_stats.get("actor_llm_calls", 0) or 0) + 1
+            )
+            self._last_rollout_stats["actor_llm_seconds"] = (
+                float(self._last_rollout_stats.get("actor_llm_seconds", 0.0) or 0.0)
+                + float(elapsed)
+            )
         response_text = str(response.get("text") or "")
         token_logprobs = [
             float(item) for item in (response.get("response_log_probs") or [])
@@ -2493,6 +2605,7 @@ class MAPPOTrainer:
         print(
             "[MAPPOTrainer] vllm request done "
             f"rank={rank} agent={agent_index} model={model_name} "
+            f"adapter={actor_adapter_name or 'base'} "
             f"elapsed={elapsed:.2f}s response_tokens={len(response_tokens)}"
         )
         return response_text, {
@@ -2503,7 +2616,7 @@ class MAPPOTrainer:
         }
 
     def _query_vllm_value(self, critic_prompt: str, timeout: float) -> float:
-        rank, endpoint_url = self._vllm_endpoint("/rl/value")
+        rank, endpoint_url = self._vllm_endpoint("/rl/value", service="value")
         request_started = time.time()
         print(
             "[MAPPOTrainer] vllm value start "
@@ -2518,6 +2631,14 @@ class MAPPOTrainer:
             timeout=timeout,
         )
         elapsed = time.time() - request_started
+        if hasattr(self, "_last_rollout_stats"):
+            self._last_rollout_stats["value_llm_calls"] = (
+                int(self._last_rollout_stats.get("value_llm_calls", 0) or 0) + 1
+            )
+            self._last_rollout_stats["value_llm_seconds"] = (
+                float(self._last_rollout_stats.get("value_llm_seconds", 0.0) or 0.0)
+                + float(elapsed)
+            )
         value = float(response.get("value", 0.0))
         print(
             "[MAPPOTrainer] vllm value done "
@@ -2637,9 +2758,28 @@ class MAPPOTrainer:
                 )
             self._reset_rollout_stats()
             self.collect_rollout()
-            self.log_performance(update_idx)
-            self.log_rewards(update_idx, self.buffer.storage)
+            print(
+                "[Collect] before save_rollout "
+                f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                f"update={update_idx} transitions={len(self.buffer.storage)}",
+                flush=True,
+            )
             self.save_rollout(self.buffer.storage, update_idx)
+            print(
+                "[Collect] after save_rollout "
+                f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                f"update={update_idx}",
+                flush=True,
+            )
+            try:
+                self.log_performance(update_idx)
+                self.log_rewards(update_idx, self.buffer.storage)
+            except Exception as exc:
+                print(
+                    "[Collect] metric logging failed; rollout already saved: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             self.buffer.clear()
             self.accelerator.wait_for_everyone()
             self.accelerator.print(f"[Collect] saved rollout u{update_idx:05d}")
@@ -2810,15 +2950,29 @@ class MAPPOTrainer:
 
     # ------------------------------------------------------------------
     def collect_rollout(self):
+        rollout_started = time.time()
+        try:
+            self._last_rollout_stats["rollout_wall_time_sec"] = 0.0
+        except Exception:
+            pass
         if self.snapshot_paths_configured and not self.snapshot_records:
             raise RuntimeError(
                 "trainer.off_policy_snapshots was configured, but no snapshot states were loaded. "
                 "Please verify the snapshot path exists on the server and is readable."
             )
-        if self.snapshot_records:
-            self._collect_snapshot_rollout()
-        else:
-            self._collect_env_rollout()
+        try:
+            if self.snapshot_records:
+                if self.snapshot_rollout_mode in {"autoregressive", "auto", "env"}:
+                    self._collect_snapshot_autoregressive_rollout()
+                else:
+                    self._collect_snapshot_rollout()
+            else:
+                self._collect_env_rollout()
+        finally:
+            if hasattr(self, "_last_rollout_stats"):
+                self._last_rollout_stats["rollout_wall_time_sec"] = (
+                    time.time() - rollout_started
+                )
 
     def _append_policy_records(
         self,
@@ -2858,6 +3012,10 @@ class MAPPOTrainer:
                 or 0.0
             )
             paired_comm_reward = float(breakdown.get("paired_comm_reward", 0.0) or 0.0)
+            collab_reward = float(
+                breakdown.get("collab_reward", raw_entry.get("collab_reward", 0.0))
+                or 0.0
+            )
             breakdown_total_reward = float(
                 raw_entry.get(
                     "total",
@@ -2865,6 +3023,7 @@ class MAPPOTrainer:
                     + fmt_reward
                     + validator_reward
                     + communication_reward
+                    + collab_reward
                     + paired_comm_reward,
                 )
                 or (
@@ -2872,10 +3031,26 @@ class MAPPOTrainer:
                     + fmt_reward
                     + validator_reward
                     + communication_reward
+                    + collab_reward
                     + paired_comm_reward
                 )
             )
             process_reward = seq_reward
+            source_key = self._record_source_key(record)
+            if source_key is not None:
+                self._backfill_existing_transition_from_record(
+                    source_key,
+                    reward=float(reward),
+                    format_reward=fmt_reward,
+                    validator_reward=validator_reward,
+                    sequence_reward=seq_reward,
+                    communication_reward=communication_reward,
+                    repeat_communication_reward=repeat_communication_reward,
+                    forced_communication_reward=forced_communication_reward,
+                    collab_reward=collab_reward,
+                    paired_comm_reward=paired_comm_reward,
+                    breakdown_total_reward=breakdown_total_reward,
+                )
             self.buffer.add(
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
@@ -2896,26 +3071,81 @@ class MAPPOTrainer:
                 communication_reward=communication_reward,
                 repeat_communication_reward=repeat_communication_reward,
                 forced_communication_reward=forced_communication_reward,
+                collab_reward=collab_reward,
                 paired_comm_reward=paired_comm_reward,
                 breakdown_total_reward=breakdown_total_reward,
+                reward_source_key=source_key,
             )
             added += 1
         return added
+
+    @staticmethod
+    def _record_source_key(record: Any) -> Optional[Tuple[int, int, int]]:
+        try:
+            agent_idx = int(record.agent_index)
+            timestep = int(record.timestep)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        raw_call_index = (getattr(record, "metadata", None) or {}).get("call_index")
+        if raw_call_index is None:
+            raw_call_index = getattr(record, "micro_step", None)
+        try:
+            return agent_idx, timestep, int(raw_call_index)
+        except (TypeError, ValueError):
+            return None
+
+    def _backfill_existing_transition_from_record(
+        self,
+        source_key: Tuple[int, int, int],
+        *,
+        reward: float,
+        format_reward: float,
+        validator_reward: float,
+        sequence_reward: float,
+        communication_reward: float,
+        repeat_communication_reward: float,
+        forced_communication_reward: float,
+        collab_reward: float,
+        paired_comm_reward: float,
+        breakdown_total_reward: float,
+    ) -> None:
+        existing = self.buffer.get_by_source_key(source_key)
+        if existing is None:
+            return
+        if sequence_reward == 0.0 and validator_reward == 0.0 and reward == 0.0:
+            return
+        existing.reward = float(reward)
+        existing.format_reward = float(format_reward)
+        existing.validator_reward = float(validator_reward)
+        existing.process_reward = float(sequence_reward)
+        existing.sequence_reward = float(sequence_reward)
+        existing.communication_reward = float(communication_reward)
+        existing.repeat_communication_reward = float(repeat_communication_reward)
+        existing.forced_communication_reward = float(forced_communication_reward)
+        existing.collab_reward = float(collab_reward)
+        existing.paired_comm_reward = float(paired_comm_reward)
+        existing.breakdown_total_reward = float(breakdown_total_reward)
 
     def _collect_env_rollout(self):
         if self.session is None:
             raise RuntimeError("Environment session not initialized.")
         self.buffer.clear()
-        step_count = 0
-        local_target = self.local_steps_per_update
-        while step_count < local_target:
+        while True:
             step_result = self.session.step()
+            partial_success = self._partial_success_reached()
+            done_for_rollout = bool(step_result.done or partial_success)
+            reward_for_rollout = (
+                self.partial_success_reward
+                if partial_success and not step_result.done
+                else step_result.reward
+            )
             records = step_result.policy_records or []
             self._update_rollout_stats(
-                step_reward=step_result.reward,
-                done=bool(step_result.done),
+                step_reward=reward_for_rollout,
+                done=done_for_rollout,
                 policy_calls=len(records),
                 process_reward=step_result.process_reward,
+                episode_success=True if partial_success else None,
             )
             if (
                 self.max_records_per_step
@@ -2927,15 +3157,14 @@ class MAPPOTrainer:
                     )
                     self._record_cap_warned = True
                 records = records[: self.max_records_per_step]
+            if partial_success:
+                self._apply_partial_success_reward(records)
             added = self._append_policy_records(
-                records, step_result.reward, step_result.done
+                records, reward_for_rollout, done_for_rollout
             )
-            if step_result.done:
+            if done_for_rollout:
                 self.session.reset()
-            if added == 0:
-                step_count += 1
-            else:
-                step_count += added
+                break
             if self._rollout_reached_horizon(step_result):
                 if not step_result.done:
                     self.session.reset()
@@ -2947,9 +3176,7 @@ class MAPPOTrainer:
         if not self.snapshot_records:
             raise RuntimeError("Snapshot dataset is empty.")
         self.buffer.clear()
-        step_count = 0
-        local_target = self.local_steps_per_update
-        while step_count < local_target:
+        while True:
             snapshot_record = self._next_snapshot_record()
             if snapshot_record is None:
                 if self.accelerator.is_main_process:
@@ -2968,12 +3195,20 @@ class MAPPOTrainer:
             if self.session.env.is_done():
                 continue
             step_result = self.session.step()
+            partial_success = self._partial_success_reached()
+            done_for_rollout = bool(step_result.done or partial_success)
+            reward_for_rollout = (
+                self.partial_success_reward
+                if partial_success and not step_result.done
+                else step_result.reward
+            )
             records = step_result.policy_records or []
             self._update_rollout_stats(
-                step_reward=step_result.reward,
-                done=bool(step_result.done),
+                step_reward=reward_for_rollout,
+                done=done_for_rollout,
                 policy_calls=len(records),
                 process_reward=step_result.process_reward,
+                episode_success=True if partial_success else None,
             )
             if (
                 self.max_records_per_step
@@ -2985,13 +3220,66 @@ class MAPPOTrainer:
                     )
                     self._record_cap_warned = True
                 records = records[: self.max_records_per_step]
+            if partial_success:
+                self._apply_partial_success_reward(records)
             added = self._append_policy_records(
-                records, step_result.reward, step_result.done
+                records, reward_for_rollout, done_for_rollout
             )
-            if added == 0:
-                step_count += 1
-            else:
-                step_count += added
+            if done_for_rollout:
+                break
+            if self._rollout_reached_horizon(step_result):
+                break
+
+    def _collect_snapshot_autoregressive_rollout(self):
+        if self.session is None:
+            raise RuntimeError("Environment session not initialized.")
+        if not self.snapshot_records:
+            raise RuntimeError("Snapshot dataset is empty.")
+        self.buffer.clear()
+        snapshot_record = self._next_snapshot_record()
+        if snapshot_record is None:
+            if self.accelerator.is_main_process:
+                self.accelerator.print("[MAPPO] Snapshot dataset exhausted.")
+            return
+        self.session.load_snapshot(snapshot_record.snapshot)
+        while True:
+            if self.rollout_horizon is not None:
+                snapshot_ts = getattr(self.session.env.state, "timestep", None)
+                if snapshot_ts is not None and int(snapshot_ts) >= self.rollout_horizon:
+                    break
+            if self.session.env.is_done():
+                break
+            step_result = self.session.step()
+            partial_success = self._partial_success_reached()
+            done_for_rollout = bool(step_result.done or partial_success)
+            reward_for_rollout = (
+                self.partial_success_reward
+                if partial_success and not step_result.done
+                else step_result.reward
+            )
+            records = step_result.policy_records or []
+            self._update_rollout_stats(
+                step_reward=reward_for_rollout,
+                done=done_for_rollout,
+                policy_calls=len(records),
+                process_reward=step_result.process_reward,
+                episode_success=True if partial_success else None,
+            )
+            if (
+                self.max_records_per_step
+                and len(records) > self.max_records_per_step
+            ):
+                if not self._record_cap_warned and self.accelerator.is_main_process:
+                    self.accelerator.print(
+                        f"[MAPPO] policy_records per step超过{self.max_records_per_step}，将被截断。"
+                    )
+                    self._record_cap_warned = True
+                records = records[: self.max_records_per_step]
+            if partial_success:
+                self._apply_partial_success_reward(records)
+            self._append_policy_records(records, reward_for_rollout, done_for_rollout)
+            if done_for_rollout:
+                break
             if self._rollout_reached_horizon(step_result):
                 break
 
@@ -4486,6 +4774,11 @@ class MAPPOTrainer:
         agent0_custom_sum_local = float(stats.get("agent0_custom_return_sum", 0.0) or 0.0)
         agent1_custom_sum_local = float(stats.get("agent1_custom_return_sum", 0.0) or 0.0)
         team_custom_sum_local = float(stats.get("team_custom_return_sum", 0.0) or 0.0)
+        rollout_wall_time_local = float(stats.get("rollout_wall_time_sec", 0.0) or 0.0)
+        actor_llm_calls_local = float(stats.get("actor_llm_calls", 0) or 0)
+        actor_llm_seconds_local = float(stats.get("actor_llm_seconds", 0.0) or 0.0)
+        value_llm_calls_local = float(stats.get("value_llm_calls", 0) or 0)
+        value_llm_seconds_local = float(stats.get("value_llm_seconds", 0.0) or 0.0)
 
         # Aggregate across ranks so curves reflect full multi-proc sampling throughput.
         packed = torch.tensor(
@@ -4501,6 +4794,11 @@ class MAPPOTrainer:
                 agent0_custom_sum_local,
                 agent1_custom_sum_local,
                 team_custom_sum_local,
+                rollout_wall_time_local,
+                actor_llm_calls_local,
+                actor_llm_seconds_local,
+                value_llm_calls_local,
+                value_llm_seconds_local,
             ],
             device=self.device,
             dtype=torch.float64,
@@ -4541,6 +4839,11 @@ class MAPPOTrainer:
             agent0_custom_sum,
             agent1_custom_sum,
             team_custom_sum,
+            rollout_wall_time_sum,
+            actor_llm_calls_f,
+            actor_llm_seconds,
+            value_llm_calls_f,
+            value_llm_seconds,
         ) = [float(x) for x in summed.tolist()]
         env_steps = int(env_steps_f)
         episodes = int(episodes_f)
@@ -4548,9 +4851,17 @@ class MAPPOTrainer:
         pos_steps = int(pos_steps_f)
         policy_calls = int(policy_calls_f)
         ep_len_sum = int(ep_len_sum_f)
+        actor_llm_calls = int(actor_llm_calls_f)
+        value_llm_calls = int(value_llm_calls_f)
 
         avg_step_reward = env_reward_sum / env_steps if env_steps > 0 else 0.0
         avg_calls_per_step = policy_calls / env_steps if env_steps > 0 else 0.0
+        avg_actor_llm_seconds = (
+            actor_llm_seconds / actor_llm_calls if actor_llm_calls > 0 else 0.0
+        )
+        avg_value_llm_seconds = (
+            value_llm_seconds / value_llm_calls if value_llm_calls > 0 else 0.0
+        )
         avg_episode_return = ep_return_sum / episodes if episodes > 0 else 0.0
         avg_episode_len = ep_len_sum / episodes if episodes > 0 else 0.0
         success_rate = successes / episodes if episodes > 0 else 0.0
@@ -4582,7 +4893,9 @@ class MAPPOTrainer:
             "episode_return_sum,avg_episode_return,avg_episode_len,"
             "agent0_custom_return_sum,avg_agent0_custom_return,"
             "agent1_custom_return_sum,avg_agent1_custom_return,"
-            "team_custom_return_sum,avg_team_custom_return"
+            "team_custom_return_sum,avg_team_custom_return,"
+            "rollout_wall_time_sec,actor_llm_calls,actor_llm_seconds,avg_actor_llm_seconds,"
+            "value_llm_calls,value_llm_seconds,avg_value_llm_seconds"
         )
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as f:
@@ -4593,7 +4906,9 @@ class MAPPOTrainer:
                 f"{ep_return_sum},{avg_episode_return},{avg_episode_len},"
                 f"{agent0_custom_sum},{avg_agent0_custom_return},"
                 f"{agent1_custom_sum},{avg_agent1_custom_return},"
-                f"{team_custom_sum},{avg_team_custom_return}\n"
+                f"{team_custom_sum},{avg_team_custom_return},"
+                f"{rollout_wall_time_sum},{actor_llm_calls},{actor_llm_seconds},{avg_actor_llm_seconds},"
+                f"{value_llm_calls},{value_llm_seconds},{avg_value_llm_seconds}\n"
             )
 
     # ------------------------------------------------------------------
@@ -4754,6 +5069,7 @@ class MAPPOTrainer:
             "communication_reward": t.communication_reward,
             "repeat_communication_reward": t.repeat_communication_reward,
             "forced_communication_reward": t.forced_communication_reward,
+            "collab_reward": t.collab_reward,
             "paired_comm_reward": t.paired_comm_reward,
             "breakdown_total_reward": t.breakdown_total_reward,
         }
@@ -4787,6 +5103,7 @@ class MAPPOTrainer:
             forced_communication_reward=float(
                 d.get("forced_communication_reward", 0.0)
             ),
+            collab_reward=float(d.get("collab_reward", 0.0)),
             paired_comm_reward=float(d.get("paired_comm_reward", 0.0)),
             breakdown_total_reward=float(
                 d.get(
@@ -4802,6 +5119,48 @@ class MAPPOTrainer:
         path = self.rollout_dir / f"rollout_rank{self._runtime_worker_id()}_u{update_idx:05d}.pt"
         payload = [self._transition_to_dict(t) for t in transitions]
         torch.save(payload, path)
+        self._save_rollout_archive(payload, update_idx)
+
+    def _save_rollout_archive(self, payload: List[Dict[str, Any]], update_idx: int) -> None:
+        phase = self._runtime_stage_phase("collect")
+        worker_id = self._runtime_worker_id()
+        loop_round = self._runtime_loop_round_idx()
+        archive_dir = (
+            self.rollout_dir
+            / "archive"
+            / phase
+            / f"update_{int(update_idx):05d}"
+            / f"worker_{worker_id}"
+        )
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        timestamp_ms = int(time.time() * 1000)
+        unique_seed = (
+            f"{socket.gethostname()}:{os.getpid()}:{timestamp_ms}:"
+            f"{phase}:{loop_round}:{worker_id}:{update_idx}"
+        )
+        suffix = hashlib.sha1(unique_seed.encode("utf-8")).hexdigest()[:8]
+        archive_path = (
+            archive_dir
+            / f"loop{loop_round:05d}_{timestamp_ms}_{suffix}.pt"
+        )
+        torch.save(payload, archive_path)
+        meta_path = archive_path.with_suffix(".json")
+        meta = {
+            "phase": phase,
+            "loop_round_idx": loop_round,
+            "update_idx": int(update_idx),
+            "worker_id": int(worker_id),
+            "num_transitions": len(payload),
+            "canonical_path": str(
+                self.rollout_dir
+                / f"rollout_rank{worker_id}_u{int(update_idx):05d}.pt"
+            ),
+            "archive_path": str(archive_path),
+            "timestamp_ms": timestamp_ms,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _initial_cache_path(self, update_idx: int, rank: Optional[int] = None) -> Path:
         use_rank = self._runtime_worker_id() if rank is None else int(rank)

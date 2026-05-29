@@ -26,6 +26,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     DeepSpeedMAPPOTrainer = None  # type: ignore
 
+try:
+    from Grpo.trainer import GRPOTrainer
+except ImportError:  # pragma: no cover - optional dependency
+    GRPOTrainer = None  # type: ignore
+
 
 def _maybe_run_trainer(config: Dict[str, Any]) -> bool:
     """Return True if a trainer was executed."""
@@ -39,14 +44,21 @@ def _maybe_run_trainer(config: Dict[str, Any]) -> bool:
         trainer_cls = MAPPOTrainer
     elif trainer_type in {"mappo_deepspeed", "deepspeed_mappo", "ds_mappo"}:
         trainer_cls = DeepSpeedMAPPOTrainer
+    elif trainer_type in {"grpo", "marshal_grpo"}:
+        trainer_cls = GRPOTrainer
     else:
         raise ValueError(
             f"Unsupported trainer type '{trainer_type}'. "
-            "Expected 'mappo' or 'mappo_deepspeed'."
+            "Expected 'mappo', 'mappo_deepspeed', or 'grpo'."
         )
 
     if trainer_cls is None:
-        missing = "MAPPOTrainer" if trainer_type.startswith("mappo") and "deepspeed" not in trainer_type else "DeepSpeedMAPPOTrainer"
+        if trainer_type in {"grpo", "marshal_grpo"}:
+            missing = "GRPOTrainer"
+        elif trainer_type.startswith("mappo") and "deepspeed" not in trainer_type:
+            missing = "MAPPOTrainer"
+        else:
+            missing = "DeepSpeedMAPPOTrainer"
         raise ImportError(f"{missing} is unavailable. Ensure dependencies are installed.")
 
     env_cfg = config.get("environment", {})

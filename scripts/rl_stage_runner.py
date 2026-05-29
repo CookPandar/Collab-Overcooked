@@ -130,7 +130,12 @@ def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
     if not isinstance(payload, dict):
         return
     if payload.get("model_path"):
-        trainer["model_path"] = _resolve_path(str(payload["model_path"]), base_dir)
+        resolved_model_path = _resolve_path(str(payload["model_path"]), base_dir)
+        fallback_model_path = os.environ.get("RL_VLLM_MODEL_PATH", "").strip()
+        if Path(resolved_model_path).exists():
+            trainer["model_path"] = resolved_model_path
+        elif fallback_model_path:
+            trainer["model_path"] = _resolve_path(fallback_model_path, base_dir)
     actor_override = payload.get("actor_adapters")
     actor_cfg = trainer.get("actor_adapters")
     if isinstance(actor_override, dict) and isinstance(actor_cfg, dict):
@@ -215,6 +220,7 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
             )
         else:
             trainer["output_dir"] = str(Path(base_output) / "__stage_workers__" / stage / "worker_unknown")
+        Path(trainer["output_dir"]).mkdir(parents=True, exist_ok=True)
 
     model_path = trainer.get("model_path")
     if not isinstance(model_path, str) or not model_path.startswith("/"):
@@ -235,6 +241,9 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     elif stage == "eval":
         trainer["collect_only"] = True
         trainer["train_only"] = False
+        trainer["generation_temperature"] = 0.0
+        trainer["compute_values_in_collect"] = False
+        trainer["collect_value_backend"] = "none"
 
     for agent_key, agent in (data.get("agents") or {}).items():
         if not isinstance(agent, dict) or not agent_key.startswith("agent_"):
@@ -251,6 +260,8 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
         agent["local_model_path"] = trainer["model_path"]
         agent["cuda_visible_devices"] = [rank]
         agent["data_parallel_size"] = 1
+        if stage == "eval":
+            agent["temperature"] = 0
         if adapter_name:
             agent["model"] = adapter_name
         agent.pop("model_dirname", None)

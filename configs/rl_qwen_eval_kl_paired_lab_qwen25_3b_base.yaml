@@ -2,8 +2,9 @@ environment:
   order: baked_bell_pepper
   horizon: 24
 reward:
-  communication_penalty: 0.0
-  forced_communication_penalty: 0.05
+  product_reward: 0.0
+  communication_penalty: 0.1
+  forced_communication_penalty: 0.4
   paired_comm_reward_enabled: true
   paired_comm_request_positive_reward: 0.5
   paired_comm_request_negative_reward: -0.1
@@ -13,38 +14,35 @@ reward:
 trainer:
   type: mappo
   collect_only: true
-  off_policy_snapshots: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked/runs/rl/snapshots/one_episode.jsonl
-  rollout_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/rollouts_kl
-  output_dir: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/runs/rl/collect
-  model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+  train_only: false
+  model_path: /datacache/LLMs/Qwen2.5-3B-Instruct
   lora_path: null
   actor_adapters:
     agent_0:
       adapter_name: Chef
-      lora_path: ./runs/Chef
+      lora_path: null
     agent_1:
       adapter_name: Assistant
-      lora_path: ./runs/Assistant
+      lora_path: null
   critic_adapter:
     adapter_name: critic
-    lora_path: ./runs/adapter_critic/critic
+    lora_path: null
     lora_config:
       r: 16
       alpha: 32
       dropout: 0.05
-  value_head_path: ./runs/value_head.pt
-  latest_model_path_file: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/Collab-Overcooked-exp/full_episode_all_reward_debug/runs/rl/latest_model.json
-  generation_temperature: 0.7
-  evaluation_batch_size: 32
+  rollout_dir: rollouts_eval_kl_qwen25_3b_base
+  latest_model_path_file: null
+  generation_temperature: 0.0
   max_new_tokens: 512
-  compute_values_in_collect: true
-  collect_value_backend: vllm
+  evaluation_batch_size: 6
   fix_mistral_regex: true
+  output_dir: results/rl_eval_kl_qwen25_3b_base
 agents:
   num_agents: 2
   agent_0:
     type: vllm
-    model: qwen2.5-7B-instruct
+    model: qwen2.5-3B-instruct
     api_key: YOUR_API_KEY
     base_url: http://127.0.0.1:9000/v1
     temperature: 0
@@ -52,13 +50,13 @@ agents:
     timeout: 180
     max_retries: 3
     role: Chef
-    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    local_model_path: /datacache/LLMs/Qwen2.5-3B-Instruct
     cuda_visible_devices:
     - 0
     data_parallel_size: 1
   agent_1:
     type: vllm
-    model: qwen2.5-7B-instruct
+    model: qwen2.5-3B-instruct
     api_key: YOUR_API_KEY
     base_url: http://127.0.0.1:9001/v1
     temperature: 0
@@ -66,7 +64,7 @@ agents:
     timeout: 180
     max_retries: 3
     role: Assistant
-    local_model_path: /mnt/volumes/ss-sai-bd-ga/zhangshuwen/models/qwen2.5-7b
+    local_model_path: /datacache/LLMs/Qwen2.5-3B-Instruct
     cuda_visible_devices:
     - 1
     data_parallel_size: 1

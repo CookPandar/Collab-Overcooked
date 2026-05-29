@@ -90,7 +90,13 @@ def load_session_snapshot(session, snapshot: Dict[str, Any]):
         session.reward_tracker.import_state(tracker_state)
     agents_payload = snapshot.get("agents", {})
     if isinstance(agents_payload, dict) and session.reward_tracker:
+        session.reward_tracker.bootstrap_histories_from_ml_actions(
+            getattr(new_state, "ml_actions", None)
+        )
         session.reward_tracker.bootstrap_histories_from_snapshot(agents_payload)
+        session.reward_tracker.bootstrap_histories_from_ml_actions(
+            getattr(new_state, "ml_actions", None)
+        )
         session.reward_tracker.clear_pending_penalties()
     if isinstance(agents_payload, dict):
         for idx, agent in enumerate(getattr(session.team, "agents", [])):

@@ -139,6 +139,14 @@ class LLMAgents(LLMPair):
         self._pending_reward_event = None
         self._last_reward_entry = None
         self._forced_action_override = None
+        self._pending_action_sources = queue.Queue()
+        self._current_action_source = None
+        self._active_action_source = None
+        self._locked_action_source = None
+        self.last_executed_action_source = None
+        self._locked_action_source = None
+        self._last_communication_plan_call_index = None
+        self._last_validation_failed_format = False
         self.communication_turn_limit = 3
         self._communication_turn_counter = 0
         self._communication_turn_timestamp = None
@@ -170,8 +178,12 @@ class LLMAgents(LLMPair):
             "collab_ack_consumed": self._collab_ack_consumed,
             "current_ml_action": self.current_ml_action,
             "current_ml_action_steps": self.current_ml_action_steps,
+            "active_action_source": copy.deepcopy(self._active_action_source),
+            "current_action_source": copy.deepcopy(self._current_action_source),
+            "locked_action_source": copy.deepcopy(self._locked_action_source),
             "time_to_wait": self.time_to_wait,
             "action_wait_queue": list(self.action_wait_parse.queue),
+            "pending_action_sources": list(self._pending_action_sources.queue),
             "failed_history": copy.deepcopy(self.failed_history),
         }
 
@@ -208,6 +220,12 @@ class LLMAgents(LLMPair):
         self._collab_ack_consumed = bool(data.get("collab_ack_consumed", False))
         self.current_ml_action = data.get("current_ml_action")
         self.current_ml_action_steps = int(data.get("current_ml_action_steps", 0) or 0)
+        active_source = data.get("active_action_source")
+        self._active_action_source = copy.deepcopy(active_source) if isinstance(active_source, dict) else None
+        current_source = data.get("current_action_source")
+        self._current_action_source = copy.deepcopy(current_source) if isinstance(current_source, dict) else None
+        locked_source = data.get("locked_action_source")
+        self._locked_action_source = copy.deepcopy(locked_source) if isinstance(locked_source, dict) else None
         self.time_to_wait = int(data.get("time_to_wait", 0) or 0)
         queue_items = data.get("action_wait_queue")
         if isinstance(queue_items, list):
@@ -215,6 +233,12 @@ class LLMAgents(LLMPair):
                 self.action_wait_parse.get()
             for item in queue_items:
                 self.action_wait_parse.put(item)
+        pending_sources = data.get("pending_action_sources")
+        if isinstance(pending_sources, list):
+            self._clear_pending_action_sources()
+            for source in pending_sources:
+                if isinstance(source, dict):
+                    self._pending_action_sources.put(copy.deepcopy(source))
         failed_history = data.get("failed_history")
         if isinstance(failed_history, list):
             self.failed_history = copy.deepcopy(failed_history)
@@ -366,6 +390,10 @@ class LLMAgents(LLMPair):
         self.teammate = teammate
         self._pending_reward_event = None
         self._last_reward_entry = None
+        self._current_action_source = None
+        self._active_action_source = None
+        self.last_executed_action_source = None
+        self._clear_pending_action_sources()
 
     def set_agent_index(self, agent_index):
         self.agent_index = agent_index
@@ -709,6 +737,7 @@ class LLMAgents(LLMPair):
             current_ml_action_done = self.teammate.check_current_ml_action_done(state)
             if current_ml_action_done:
                 self.teammate.current_ml_action = None
+                self.teammate._clear_active_action_source_after_completion()
 
         if state.ml_actions[1 - self.agent_index] != None:
             self.teammate_ml_actions.append(
@@ -733,13 +762,12 @@ class LLMAgents(LLMPair):
                 # generate a new ml action
                 self.generate_success_feedback(state)
                 self.current_ml_action = None
+                self._clear_active_action_source_after_completion()
                 self.current_ml_action = self.generate_ml_action(state)
         count = 0
         if self.current_ml_action_steps == 0:
             self.failed_message = self.validate_current_ml_action(state)
-            self._ensure_penalty_reward_entry(self.current_ml_action)
-            self._handle_validator_failure(self.failed_message)
-            self._flush_reward_event()
+            self._record_validation_reward(self.failed_message)
             if "success" in self.failed_message and self.test_mode:
                 self.test_ml_action.popleft()
             # only try to self-correct 1 time
@@ -761,19 +789,19 @@ class LLMAgents(LLMPair):
                         self.current_ml_action, self.failed_message
                     )
                     self.change_correct_prompt()
-                    self.turn_statistics_dict["statistical_data"]["error"][
-                        self.agent_index
-                    ]["validator_error"]["error_num"] += 1
-                    self.turn_statistics_dict["statistical_data"]["error"][
-                        self.agent_index
-                    ]["validator_error"]["error_message"].append(self.failed_message)
+                    if not getattr(self, "_last_validation_failed_format", False):
+                        self.turn_statistics_dict["statistical_data"]["error"][
+                            self.agent_index
+                        ]["validator_error"]["error_num"] += 1
+                        self.turn_statistics_dict["statistical_data"]["error"][
+                            self.agent_index
+                        ]["validator_error"]["error_message"].append(self.failed_message)
                     self.current_ml_action = self.generate_ml_action(state)
                     count += 1
                 self.failed_message = self.validate_current_ml_action(state)
-                self._ensure_penalty_reward_entry(self.current_ml_action)
-                self._ensure_penalty_reward_entry(self.current_ml_action)
-                self._handle_validator_failure(self.failed_message)
-                self._flush_reward_event()
+                self._record_validation_reward(self.failed_message)
+        if self.current_ml_action_steps == 0:
+            self._set_active_action_source_from_current()
         # generate rethink if the problem is solved and not just 'wait(1)'
         if not self.trace and count < 1:
             self.turn_statistics_dict["statistical_data"]["error_correction"][
@@ -906,6 +934,7 @@ class LLMAgents(LLMPair):
                 params[index] = params[index].replace(" ", "")
                 params[index] = params[index].replace("'", "")
                 params[index] = params[index].replace('"', "")
+            params = [p for p in params if p != ""]
             if len(params) > 1 and ("put_obj_in_utensil" in function_name):
                 params = [params[1]]
         elif "NOTHING" in action or "nothing" in action:
@@ -957,6 +986,10 @@ class LLMAgents(LLMPair):
         collab_primitives = ("request(", "seek(", "ack(", "deny(")
         return any(lowered.startswith(prefix) for prefix in collab_primitives)
 
+    def _is_wait_action(self, action_text: Optional[str]) -> bool:
+        normalized = self._sanitize_action_text(self._strip_action_prefix(action_text or ""))
+        return bool(re.fullmatch(r"wait\s*(?:\(\s*\d*\s*\))?", normalized.strip().lower()))
+
     def _preview_primary_action(self, action_block: Optional[str]) -> str:
         body = self._strip_action_prefix(action_block or "")
         body = self._sanitize_action_text(body)
@@ -969,16 +1002,61 @@ class LLMAgents(LLMPair):
     def _split_action_tokens(self, action_block: Optional[str]) -> List[str]:
         body = self._strip_action_prefix(action_block or "")
         body = self._sanitize_action_text(body)
-        return [token.strip() for token in body.split(";") if token.strip()]
+        tokens: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for char in body:
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth > 0:
+                depth -= 1
+            if char == ";" and depth == 0:
+                token = "".join(current).strip()
+                if token:
+                    tokens.append(token)
+                current = []
+                continue
+            current.append(char)
+        token = "".join(current).strip()
+        if token:
+            tokens.append(token)
+        return tokens
+
+    def _token_has_trailing_text(self, token: str) -> bool:
+        stripped = (token or "").strip()
+        if not stripped:
+            return False
+        depth = 0
+        saw_open = False
+        for index, char in enumerate(stripped):
+            if char == "(":
+                depth += 1
+                saw_open = True
+            elif char == ")" and depth > 0:
+                depth -= 1
+                if saw_open and depth == 0:
+                    return bool(stripped[index + 1 :].strip())
+        return False
 
     def _inspect_action_mode(self, action_block: Optional[str]) -> Dict[str, Any]:
         tokens = self._split_action_tokens(action_block)
         collab_tokens = [token for token in tokens if self._is_collab_action(token)]
         embodied_tokens = [token for token in tokens if not self._is_collab_action(token)]
-        if not tokens:
+        malformed_tokens = [
+            token
+            for token in tokens
+            if "```" in token
+            or re.search(r"(?i)\bpython\b", token)
+            or self._token_has_trailing_text(token)
+        ]
+        if malformed_tokens:
+            mode = "malformed"
+        elif not tokens:
             mode = "empty"
         elif collab_tokens and embodied_tokens:
             mode = "mixed"
+        elif len(embodied_tokens) > 1:
+            mode = "multi_embodied"
         elif collab_tokens:
             mode = "communication"
         else:
@@ -988,6 +1066,7 @@ class LLMAgents(LLMPair):
             "tokens": tokens,
             "collab_tokens": collab_tokens,
             "embodied_tokens": embodied_tokens,
+            "malformed_tokens": malformed_tokens,
         }
 
     def _strip_code_fences(self, text: str) -> str:
@@ -997,11 +1076,16 @@ class LLMAgents(LLMPair):
         if not stripped.startswith("```"):
             return stripped
         content = stripped[3:]
+        closing = content.rfind("```")
+        if closing != -1:
+            content = content[:closing]
+        content = content.strip()
         if "\n" in content:
-            _, remainder = content.split("\n", 1)
-        else:
-            remainder = ""
-        closing = remainder.rfind("```")
+            first_line, remainder = content.split("\n", 1)
+            # Drop a markdown fence language tag, but keep a one-line action.
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]*", first_line.strip()):
+                content = remainder
+        return content.strip()
         if closing != -1:
             remainder = remainder[:closing]
         return remainder.strip()
@@ -1041,12 +1125,266 @@ class LLMAgents(LLMPair):
             "force_communication_penalty": force_communication_penalty,
         }
 
+    def _make_action_source(
+        self,
+        action_text: Optional[str],
+        call_index: Optional[int],
+        call_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        if call_index is None:
+            return None
+        source = {
+            "agent_index": self.agent_index,
+            "agent": self.name,
+            "timestamp": getattr(self, "current_timestep", None),
+            "source_timestamp": getattr(self, "current_timestep", None),
+            "micro_step": int(call_index),
+            "call_index": int(call_index),
+            "call_type": call_type,
+            "action": (action_text or "").strip(),
+        }
+        return source
+
+    def _sync_reward_entry_for_action_source(
+        self,
+        action_text: Optional[str],
+        call_index: Optional[int],
+        call_type: str,
+    ) -> None:
+        reward_tracker = getattr(self, "reward_tracker", None)
+        if call_index is None or not reward_tracker or self.agent_index is None:
+            return
+        timestamp = getattr(self, "current_timestep", None)
+        if timestamp is None:
+            return
+        try:
+            key = (int(self.agent_index), int(timestamp), int(call_index))
+        except (TypeError, ValueError):
+            return
+        entry = getattr(reward_tracker, "call_records_by_source", {}).get(key)
+        if not isinstance(entry, dict):
+            ensure_entry = getattr(reward_tracker, "ensure_llm_action_entry", None)
+            if ensure_entry is None:
+                return
+            ensure_entry(
+                agent_index=self.agent_index,
+                timestamp=timestamp,
+                action_text=action_text,
+                agent_name=self.name,
+                call_index=call_index,
+                call_type=call_type,
+            )
+            return
+        normalized = (action_text or "").strip() or "[EMPTY]"
+        was_rewardable = (
+            entry.get("call_type") in reward_tracker.rewardable_action_call_types
+            and not entry.get("is_collab")
+        )
+        entry["action"] = normalized
+        entry["call_type"] = call_type
+        entry["is_collab"] = self._is_collab_action(normalized)
+        now_rewardable = (
+            call_type in reward_tracker.rewardable_action_call_types
+            and not entry.get("is_collab")
+            and normalized != "[EMPTY]"
+            and not self._is_wait_action(normalized)
+        )
+        has_format_penalty = any(
+            item.get("type") == "format" for item in (entry.get("penalties") or [])
+        )
+        if now_rewardable and not was_rewardable and not has_format_penalty:
+            entry["format_reward"] = (
+                float(entry.get("format_reward", 0.0) or 0.0)
+                + reward_tracker.format_success_reward_value
+            )
+            entry["total"] = (
+                float(entry.get("total", 0.0) or 0.0)
+                + reward_tracker.format_success_reward_value
+            )
+
+    def _queue_action_source(
+        self,
+        action_text: Optional[str],
+        call_index: Optional[int],
+        call_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        source = self._make_action_source(action_text, call_index, call_type)
+        if source is None:
+            return None
+        self._sync_reward_entry_for_action_source(action_text, call_index, call_type)
+        self._current_action_source = source
+        self._active_action_source = dict(source)
+        self._locked_action_source = dict(source)
+        self.last_executed_action_source = None
+        return source
+
+    def _queue_pending_action_source(
+        self,
+        action_text: Optional[str],
+        call_index: Optional[int],
+        call_type: str,
+    ) -> None:
+        source = self._make_action_source(action_text, call_index, call_type)
+        if source is not None:
+            self._sync_reward_entry_for_action_source(action_text, call_index, call_type)
+            self._pending_action_sources.put(source)
+
+    def _pop_next_action_source(self, action_text: Optional[str]) -> Optional[Dict[str, Any]]:
+        if self._pending_action_sources.empty():
+            return None
+        source = self._pending_action_sources.get()
+        source = dict(source)
+        source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
+        source.setdefault("action", (action_text or "").strip())
+        self._current_action_source = source
+        if not (
+            getattr(self, "current_ml_action_steps", 0) > 0
+            and isinstance(getattr(self, "_locked_action_source", None), dict)
+        ):
+            self._active_action_source = dict(source)
+        self.last_executed_action_source = None
+        return source
+
+    def _normalize_source_action(self, action_text: Optional[str]) -> str:
+        normalized = self._strip_action_prefix(action_text or "").strip()
+        normalized = re.sub(r"\s+", "", normalized)
+        return normalized
+
+    def _action_source_matches(self, source: Optional[Dict[str, Any]], action_text: Optional[str]) -> bool:
+        if not isinstance(source, dict):
+            return False
+        source_action = self._normalize_source_action(source.get("action"))
+        current_action = self._normalize_source_action(action_text)
+        return bool(source_action and current_action and source_action == current_action)
+
+    def _take_matching_pending_action_source(self, action_text: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not hasattr(self, "_pending_action_sources") or self._pending_action_sources.empty():
+            return None
+        kept = queue.Queue()
+        matched = None
+        while not self._pending_action_sources.empty():
+            source = self._pending_action_sources.get()
+            if matched is None and self._action_source_matches(source, action_text):
+                matched = dict(source)
+                continue
+            kept.put(source)
+        self._pending_action_sources = kept
+        if matched is None:
+            return None
+        matched["timestamp"] = getattr(self, "current_timestep", matched.get("timestamp"))
+        self._current_action_source = dict(matched)
+        if not (
+            getattr(self, "current_ml_action_steps", 0) > 0
+            and isinstance(getattr(self, "_locked_action_source", None), dict)
+        ):
+            self._active_action_source = dict(matched)
+        self.last_executed_action_source = None
+        return matched
+
+    def _resolve_executed_action_source(self, action_text: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not action_text or self._is_collab_action(action_text):
+            return None
+        for attr in ("_active_action_source", "_locked_action_source", "_current_action_source"):
+            source = getattr(self, attr, None)
+            if self._action_source_matches(source, action_text):
+                source = dict(source)
+                source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
+                self._current_action_source = dict(source)
+                self._active_action_source = dict(source)
+                self._locked_action_source = dict(source)
+                return source
+        source = self._take_matching_pending_action_source(action_text)
+        if source is not None:
+            return source
+        self._active_action_source = None
+        if self._current_action_source is not None and not self._action_source_matches(
+            self._current_action_source, action_text
+        ):
+            self._current_action_source = None
+        return None
+
+    def _clear_pending_action_sources(self) -> None:
+        while hasattr(self, "_pending_action_sources") and not self._pending_action_sources.empty():
+            self._pending_action_sources.get()
+
+    def _set_active_action_source_from_current(self) -> None:
+        source = getattr(self, "_current_action_source", None)
+        if isinstance(source, dict):
+            current_action = getattr(self, "current_ml_action", source.get("action"))
+            active = getattr(self, "_active_action_source", None)
+            if self._is_collab_action(str(current_action or "")):
+                if self._action_source_matches(active, active.get("action") if isinstance(active, dict) else None):
+                    return
+                self._active_action_source = None
+                return
+            if isinstance(active, dict) and active.get("action") and active.get("call_index") is not None:
+                if self._action_source_matches(active, current_action):
+                    return
+                self._active_action_source = None
+            if not self._action_source_matches(source, current_action):
+                source = self._take_matching_pending_action_source(current_action)
+                if source is None:
+                    self._current_action_source = None
+                    return
+            source = dict(source)
+            source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
+            source["action"] = current_action
+            self._active_action_source = source
+            self._locked_action_source = dict(source)
+            self.last_executed_action_source = None
+
+    def _clear_active_action_source(self) -> None:
+        self._active_action_source = None
+        self._current_action_source = None
+        self._locked_action_source = None
+
+    def _clear_active_action_source_after_completion(self) -> None:
+        """Keep an executed source alive until CollabMainSession consumes it.
+
+        Environment success is visible to the agent at the next decision state,
+        but the RL session consumes `last_executed_action_source` only after the
+        previous `env.step()` reports `obs.ml_actions`. Clearing here can drop
+        the source before process reward is backfilled to the LLM call that
+        produced the action.
+        """
+        if isinstance(getattr(self, "last_executed_action_source", None), dict):
+            return
+        self._clear_active_action_source()
+
+    def _replace_pending_action_plan(
+        self,
+        plan_tokens: List[str],
+        call_index: Optional[int],
+        call_type: str,
+        *,
+        include_primary: bool,
+    ) -> None:
+        while not self.action_wait_parse.empty():
+            self.action_wait_parse.get()
+        self._clear_pending_action_sources()
+        for index, action in enumerate(plan_tokens):
+            if not action or self._is_collab_action(action):
+                continue
+            if index == 0 and not include_primary:
+                continue
+            self.action_wait_parse.put(action)
+            self._queue_pending_action_source(action, call_index, call_type)
+
     def _apply_penalty_to_last_entry(self, penalty_type: str, detail: str) -> bool:
         if not self.reward_tracker or self.agent_index is None:
             return False
         entry = getattr(self, "_last_reward_entry", None)
         if not entry:
             return False
+        if self.pending_llm_logs:
+            current_call_index = self.pending_llm_logs[-1].get("call_index")
+            entry_call_index = entry.get("call_index")
+            if (
+                current_call_index is not None
+                and entry_call_index is not None
+                and int(current_call_index) != int(entry_call_index)
+            ):
+                return False
         if penalty_type == "format":
             value = self.reward_tracker.format_penalty_value
             reward_key = "format_reward"
@@ -1059,13 +1397,45 @@ class LLMAgents(LLMPair):
         if penalties is None:
             penalties = []
             entry["penalties"] = penalties
+        if penalty_type == "format" and any(
+            item.get("type") == "format" for item in penalties
+        ):
+            existing_validator = float(entry.get("validator_reward", 0.0) or 0.0)
+            if existing_validator:
+                entry["validator_reward"] = 0.0
+                entry["total"] = entry.get("total", 0.0) - existing_validator
+                entry["penalties"] = [
+                    item for item in penalties if item.get("type") != "validator"
+                ]
+            return True
+        if penalty_type == "validator" and any(
+            item.get("type") == "format" for item in penalties
+        ):
+            existing_validator = float(entry.get("validator_reward", 0.0) or 0.0)
+            if existing_validator > 0.0:
+                entry["validator_reward"] = existing_validator - existing_validator
+                entry["total"] = entry.get("total", 0.0) - existing_validator
+            return True
+        if any(
+            item.get("type") == penalty_type and item.get("detail") == detail
+            for item in penalties
+        ):
+            return True
         penalties.append({"type": penalty_type, "detail": detail, "value": value})
         entry[reward_key] = entry.get(reward_key, 0.0) + value
         entry["total"] = entry.get("total", 0.0) + value
+        if penalty_type == "format":
+            existing_validator = float(entry.get("validator_reward", 0.0) or 0.0)
+            if existing_validator:
+                entry["validator_reward"] = 0.0
+                entry["total"] = entry.get("total", 0.0) - existing_validator
+                entry["penalties"] = [
+                    item for item in penalties if item.get("type") != "validator"
+                ]
         return True
 
     def _ensure_penalty_reward_entry(self, action_text: Optional[str], call_type: str = "planner_main"):
-        if self._pending_reward_event is not None or self._last_reward_entry is not None:
+        if self._pending_reward_event is not None:
             return
         if not self.reward_tracker or self.agent_index is None:
             return
@@ -1075,6 +1445,12 @@ class LLMAgents(LLMPair):
         call_index = entry.get("call_index")
         if call_index is None:
             return
+        last_entry = getattr(self, "_last_reward_entry", None)
+        if last_entry is not None:
+            last_call_index = last_entry.get("call_index")
+            if last_call_index is not None and int(last_call_index) == int(call_index):
+                return
+            self._last_reward_entry = None
         call_type_entry = entry.get("call_type") or call_type
         normalized = self._strip_action_prefix(action_text or "").strip()
         if not normalized:
@@ -1121,7 +1497,12 @@ class LLMAgents(LLMPair):
             self._last_reward_entry = None
             return
         event = self._pending_reward_event
-        entry = self.reward_tracker.register_llm_action(
+        register_action = getattr(
+            self.reward_tracker,
+            "register_or_update_llm_action",
+            self.reward_tracker.register_llm_action,
+        )
+        entry = register_action(
             agent_index=self.agent_index,
             timestamp=event.get("timestamp", self.current_timestep),
             action_text=event.get("action"),
@@ -1177,7 +1558,11 @@ class LLMAgents(LLMPair):
         self._communication_turn_counter += 1
         return self._communication_turn_counter
 
-    def _set_action_override_from_plan(self, plan_tokens: List[str]):
+    def _set_action_override_from_plan(
+        self,
+        plan_tokens: List[str],
+        call_index: Optional[int] = None,
+    ):
         primary = ""
         for token in plan_tokens:
             if token and not self._is_collab_action(token):
@@ -1185,8 +1570,9 @@ class LLMAgents(LLMPair):
                 break
         if not primary:
             return
-        call_index = len(self.pending_llm_logs) - 1
-        if call_index < 0:
+        if call_index is None:
+            call_index = len(self.pending_llm_logs) - 1
+        if call_index is None or call_index < 0:
             return
         self._relabel_last_llm_call("planner_main")
         self._forced_action_override = {"call_index": call_index, "action": primary}
@@ -1208,8 +1594,9 @@ class LLMAgents(LLMPair):
     def _sanitize_action_text(self, text: Optional[str]) -> str:
         if not isinstance(text, str):
             return ""
-        cleaned = text.replace("```", "").replace("```]", "")
-        cleaned = cleaned.replace("[```", "").replace("```", "")
+        cleaned = self._strip_code_fences(text)
+        cleaned = cleaned.replace("```]", "")
+        cleaned = cleaned.replace("[```", "")
         cleaned = cleaned.strip()
         # Many LLMs emit one action per line / code fence; treat newlines as action separators.
         cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
@@ -1219,12 +1606,30 @@ class LLMAgents(LLMPair):
         cleaned = cleaned.rstrip("]")
         return cleaned
 
-    def append_conversation_line(self, speaker, message: str, propagate: bool = True):
+    def _action_body_for_conversation(self, action_text: Optional[str]) -> str:
+        text = self._strip_action_prefix(action_text or "").strip()
+        text = self._sanitize_action_text(text)
+        return text or "[EMPTY]"
+
+    def _implicit_action_conversation(self, action_text: Optional[str]) -> str:
+        action_body = self._action_body_for_conversation(action_text)
+        return f"Your teammate did not reply to you, but directly generated an action: {action_body}"
+
+    def append_conversation_line(
+        self,
+        speaker,
+        message: str,
+        propagate: bool = True,
+        timestamp: Optional[int] = None,
+    ):
         text = (message or "").strip()
         if not text or text == "[NOTHING]":
             return
-        if self.current_timestep is not None:
-            self._ensure_conversation_timestamp(self.current_timestep)
+        if timestamp is None:
+            timestamp = self.current_timestep
+        if timestamp is not None:
+            self.current_timestep = int(timestamp)
+            self._ensure_conversation_timestamp(int(timestamp))
         line = f"{speaker}: {text}"
         self.conversation_history.append(line)
         if len(self.conversation_history) > 30:
@@ -1256,7 +1661,12 @@ class LLMAgents(LLMPair):
         if propagate and getattr(self, "teammate", None) is not None:
             teammate_history = getattr(self.teammate, "conversation_history", None)
             if teammate_history is not None:
-                self.teammate.append_conversation_line(speaker, message, propagate=False)
+                self.teammate.append_conversation_line(
+                    speaker,
+                    message,
+                    propagate=False,
+                    timestamp=timestamp,
+                )
 
     def format_conversation_history(self) -> str:
         if not self.current_turn_conversation:
@@ -1329,13 +1739,20 @@ class LLMAgents(LLMPair):
         )
         return info
 
-    def _handle_format_issues(self, issues: List[str]):
+    def _handle_format_issues(
+        self,
+        issues: List[str],
+        action_text: Optional[str] = None,
+        call_type: str = "planner_main",
+    ):
         if not issues:
             return
         self._annotate_last_log_metadata(format_issues=issues, has_failure_context=True)
         if self.reward_tracker and self.agent_index is not None:
+            self._ensure_penalty_reward_entry(action_text, call_type)
             for issue in issues:
-                self.reward_tracker.register_format_error(self.agent_index, issue)
+                self._register_penalty("format", issue)
+            self._flush_reward_event()
 
     def _handle_validator_failure(self, message: Optional[str]):
         if not message:
@@ -1348,9 +1765,21 @@ class LLMAgents(LLMPair):
         )
         self._register_penalty("validator", normalized)
 
+    def _record_validation_reward(self, failed_message: Optional[str]):
+        if getattr(self, "_last_validation_failed_format", False):
+            self._flush_reward_event()
+            return
+        if self._is_collab_action(getattr(self, "current_ml_action", None)):
+            self._flush_reward_event()
+            return
+        self._ensure_penalty_reward_entry(self.current_ml_action)
+        self._handle_validator_failure(failed_message)
+        self._flush_reward_event()
+
     def _report_action_format_error(self, detail: str, action_text: Optional[str] = None, call_type: str = "planner_main"):
         self._ensure_penalty_reward_entry(action_text, call_type)
         self._register_penalty("format", detail)
+        self._flush_reward_event()
 
     def _rewrite_mixed_action_response(self, last_response: str):
         base_prompt = self.planner.current_user_message.get("content", "")
@@ -1389,20 +1818,21 @@ class LLMAgents(LLMPair):
         ]["format_correction"]["correction_tokens"].append(correction_tokens)
         return response, correction_tokens
 
-    def _ensure_pure_action_response(self, response: str):
+    def _ensure_pure_action_response(self, response: str, call_type: str = "planner_main"):
         action_text = self.parse_response(response, "action")
         action_info = self._annotate_last_action_mode(action_text)
         extra_tokens = 0
-        if action_info["mode"] != "mixed":
+        if action_info["mode"] not in {"mixed", "multi_embodied", "malformed"}:
             return response, extra_tokens, action_info
 
-        self._handle_format_issues(["mixed_action_types"])
+        issue = action_info["mode"] + "_action_types"
+        self._handle_format_issues([issue], action_text, call_type)
         response, correction_tokens = self._rewrite_mixed_action_response(response)
         extra_tokens += correction_tokens
         corrected_action = self.parse_response(response, "action")
         corrected_info = self._annotate_last_action_mode(corrected_action)
-        if corrected_info["mode"] == "mixed":
-            self._handle_format_issues(["mixed_action_types"])
+        if corrected_info["mode"] in {"mixed", "multi_embodied", "malformed"}:
+            self._handle_format_issues([corrected_info["mode"] + "_action_types"], corrected_action, "format_correction")
         return response, extra_tokens, corrected_info
     
     def _format_food_description(self, food_state):
@@ -1501,6 +1931,18 @@ class LLMAgents(LLMPair):
         return base + extra
 
     def _finalize_action_return(self, chosen_action, interaction_param):
+        source = None
+        if chosen_action == Action.INTERACT:
+            source = self._resolve_executed_action_source(getattr(self, "current_ml_action", None))
+        if isinstance(source, dict):
+            source = dict(source)
+            source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
+            source["env_action"] = chosen_action
+            source["interaction_param"] = interaction_param
+            source["submitted_action"] = getattr(self, "current_ml_action", None)
+            self.last_executed_action_source = source
+        else:
+            self.last_executed_action_source = None
         logs_copy = copy.deepcopy(getattr(self, "pending_llm_logs", []))
         original_log = self.turn_statistics_dict["content"].get("original_log")
         if not isinstance(original_log, list):
@@ -1534,6 +1976,10 @@ class LLMAgents(LLMPair):
                 detail,
             )
         if self.parse_action == "place_obj_on_counter":
+            if len(params) != 0:
+                detail = "Wrong place_obj_on_counter() params. It should have 0 params."
+                self._report_action_format_error(detail, action_string)
+                return False, detail
             ml_action = "place_obj_on_counter()"
         elif self.parse_action == "pickup":
             if len(params) != 2:
@@ -1857,6 +2303,7 @@ class LLMAgents(LLMPair):
                 self.planner.dialog_history_list,
             )
             self.teammate.current_timestep = state.timestep
+            self.teammate.planner.current_timestep = state.timestep
             self.teammate.state_prompt = self.teammate.generate_state_prompt(state)
             print(
                 self._append_with_newline(
@@ -1881,6 +2328,7 @@ class LLMAgents(LLMPair):
                 self.teammate.planner.dialog_history_list,
             )
             self.current_timestep = state.timestep
+            self.planner.current_timestep = state.timestep
             self.state_prompt = self.generate_state_prompt(state)
             print(
                 self._append_with_newline(
@@ -1998,14 +2446,6 @@ class LLMAgents(LLMPair):
             proxy=self.proxy, stop="Scene", trace=True
         )
         extra_tokens = 0
-        collab_violation_response = None
-        collab_violation_logged = False
-        if role == "team" and self.pending_collab_reply:
-            preview_talk, _ = self.parse_response(response, "talk")
-            if "collab(" not in (preview_talk or "").lower():
-                collab_violation_response = response
-                response, correction_tokens = self.enforce_collab_reply(response)
-                extra_tokens += correction_tokens
         self._log_llm_call(
             "communication",
             self.planner.current_user_message["content"],
@@ -2013,14 +2453,8 @@ class LLMAgents(LLMPair):
             tokens_num + extra_tokens,
             {"role": role},
         )
-        response, purity_tokens, action_info = self._ensure_pure_action_response(response)
+        response, purity_tokens, action_info = self._ensure_pure_action_response(response, "communication")
         extra_tokens += purity_tokens
-        if collab_violation_response is not None:
-            violation_action = self.parse_response(collab_violation_response, "action")
-            self._record_communication_penalty(
-                violation_action, "missing_initial_collab_reply"
-            )
-            collab_violation_logged = True
         format_issues: List[str] = []
         think_text = self.parse_response(response, "think")
         if think_text == "":
@@ -2037,32 +2471,30 @@ class LLMAgents(LLMPair):
         action_text = self.parse_response(response, "action")
         if action_text == "":
             format_issues.append("missing_action")
-        elif action_info["mode"] == "mixed":
-            format_issues.append("mixed_action_types")
+        elif action_info["mode"] in {"mixed", "multi_embodied", "malformed"}:
+            format_issues.append(action_info["mode"] + "_action_types")
         recent_goal_text = self.parse_response(response, "recent_goal")
         if recent_goal_text == "":
             format_issues.append("missing_recent_goal")
         self.update_recent_goal_text(recent_goal_text)
         recent_goal_entry = recent_goal_text or self.current_recent_goal_text
+        implicit_talk_override = None
         collab_reply_missing = (
             role == "team"
             and self.pending_collab_reply
             and "collab(" not in (parse_talk or "").lower()
         )
         if collab_reply_missing:
-            if not collab_violation_logged:
-                self._record_communication_penalty(
-                    action_text, "missing_initial_collab_reply"
-                )
-                collab_violation_logged = True
-            parse_talk = f"Collab(ack({self.teammate.name}))"
-            end_talk = False
+            implicit_talk_override = self._implicit_action_conversation(action_text)
+            parse_talk = implicit_talk_override
+            end_talk = not self._is_collab_action(action_text)
+            self.pending_collab_reply = False
         if role == "team" and "collab(" in (parse_talk or "").lower():
             self._collab_ack_consumed = True
             self.pending_collab_reply = False
         self.planner.dialog_history_list.append({"role": "think", "content": think_text})
         total_tokens = tokens_num + extra_tokens
-        self._handle_format_issues(format_issues)
+        self._handle_format_issues(format_issues, action_text, "communication")
 
         # statistic
         if role == "you":
@@ -2102,11 +2534,14 @@ class LLMAgents(LLMPair):
                 }
             )
 
-        if parse_talk == "":
+        if implicit_talk_override is None and parse_talk == "":
             parse_talk, response = self.important_part_no_create(1, "talk", response)
-        parse_talk, end_talk = self.parse_response(response, "talk")
-        if parse_talk == "[NOTHING]" and end_talk:
-            parse_talk = "OK.<END>"
+        if implicit_talk_override is None:
+            parse_talk, end_talk = self.parse_response(response, "talk")
+            if parse_talk == "[NOTHING]" and end_talk:
+                parse_talk = "OK.<END>"
+        else:
+            parse_talk = implicit_talk_override
         self.planner.dialog_history_list.append({"role": "talk", "content": parse_talk})
 
         # check if there is action
@@ -2117,20 +2552,37 @@ class LLMAgents(LLMPair):
         if matches:
             return end_talk, response
         if self._is_collab_action(new_plan):
+            call_index = None
+            if self.pending_llm_logs:
+                call_index = self.pending_llm_logs[-1].get("call_index")
+            self._last_communication_plan_call_index = None
+            self._queue_reward_event(new_plan, call_index, "communication")
+            self._flush_reward_event()
             return end_talk, response
 
+        communication_plan_call_index = None
         new_plan = self.parse_ml_action_top(new_plan, False)
         if new_plan:
-            self._set_action_override_from_plan(new_plan)
+            communication_plan_call_index = self._relabel_last_llm_call(
+                "planner_main",
+                {"reclassified_from": "communication", "produced_actions": list(new_plan)},
+            )
+            self._last_communication_plan_call_index = communication_plan_call_index
+            clean_plan = [a for a in new_plan if not self._is_collab_action(a)]
+            if not clean_plan or communication_plan_call_index is None:
+                clean_plan = []
+        else:
+            self._last_communication_plan_call_index = None
+            clean_plan = []
         # When correct, new action should also replace the old action list.
         if not self.trace:
-            while not self.action_wait_parse.empty():
-                self.action_wait_parse.get()
-
-            clean_plan = [a for a in new_plan if not self._is_collab_action(a)]
-            for index, a in enumerate(clean_plan):
-                if index > 0:
-                    self.action_wait_parse.put(a)
+            if clean_plan and communication_plan_call_index is not None:
+                self._replace_pending_action_plan(
+                    clean_plan,
+                    communication_plan_call_index,
+                    "planner_main",
+                    include_primary=True,
+                )
             v = list(self.action_wait_parse.queue)
             # rprint(f"[red][CORRECT][/red]Generate new correct action list <{v}>\n")
             return end_talk, response
@@ -2139,18 +2591,39 @@ class LLMAgents(LLMPair):
         # If the number of action to do = 1: self.action_wait_parse.qsize() = 0 ,add it to the sequence
         # If the number of action to do >2 : new generated action may not follow the timestep in the queue actions, it will perform badly.
 
-        if self.action_wait_parse.qsize() == 0:
-            clean_plan = [a for a in new_plan if not self._is_collab_action(a)]
+        if clean_plan and communication_plan_call_index is not None and self.action_wait_parse.qsize() == 0:
             v = clean_plan
             print(f"\nGenerate new action list <{v}>\n")
-            for p in clean_plan:
-                self.action_wait_parse.put(p)
-                # rprint(f"[green][ADD][/green]:Add new plan {p}\n")
+            self._set_action_override_from_plan(clean_plan, communication_plan_call_index)
+            self._replace_pending_action_plan(
+                clean_plan,
+                communication_plan_call_index,
+                "planner_main",
+                include_primary=True,
+            )
         elif self.action_wait_parse.qsize() >= 1:
-            pass
             rprint(
                 f"[yellow][ADD][/yellow]:Current action are too much. Does not add <{new_plan}> in queue\n"
             )
+            # The generated plan is deliberately ignored because an older action
+            # is already pending. Still record the producing LLM call: it is a
+            # valid-format embodied action, but invalid at this timing.
+            if (
+                clean_plan
+                and communication_plan_call_index is not None
+                and not self._is_wait_action(clean_plan[0])
+            ):
+                ignored_action = clean_plan[0]
+                self._queue_reward_event(
+                    ignored_action,
+                    communication_plan_call_index,
+                    "planner_main",
+                )
+                self._register_penalty(
+                    "validator",
+                    "Generated an embodied action while another action is already pending; the action was ignored.",
+                )
+                self._flush_reward_event()
 
         return end_talk, response
 
@@ -2348,11 +2821,14 @@ class LLMAgents(LLMPair):
         think_output = ""
         recent_goal_entry = self.current_recent_goal_text
         planner_call_index = None
+        reward_call_type = "planner_main"
         if self.action_wait_parse.empty() or (not self.trace):
             state_prompt = self.generate_state_prompt(state)
+            is_validator_correction = False
             # Error checking
             for index, s in enumerate(self.planner.dialog_history_list):
                 if s["role"] == "failure_explanation":
+                    is_validator_correction = True
                     # Multi failed message
                     if failure_message != "":
                         failure_message += (
@@ -2368,7 +2844,6 @@ class LLMAgents(LLMPair):
 
             print(f"\n\n### Observation module to " + self.name + "\n")
 
-            state_prompt = self.generate_state_prompt(state)
             self.state_prompt = state_prompt
             state_message = {
                 "role": "user",
@@ -2389,7 +2864,11 @@ class LLMAgents(LLMPair):
 
             print(f"\n\n\n### GPT Planner module\n")
             print("====== GPT Query ======")
-            self._set_planner_call_context("planner_main")
+            query_call_type = (
+                "validator_correction" if is_validator_correction else "planner_main"
+            )
+            reward_call_type = query_call_type
+            self._set_planner_call_context(query_call_type)
             response, tokens_num = self.planner.query(
                 proxy=self.proxy,
                 stop="Scene",
@@ -2397,7 +2876,7 @@ class LLMAgents(LLMPair):
                 map=self.mdp.state_string(self.state).replace("ø", "o"),
             )
             self._log_llm_call(
-                "planner_main",
+                query_call_type,
                 state_message["content"],
                 response,
                 tokens_num,
@@ -2422,8 +2901,8 @@ class LLMAgents(LLMPair):
             )
             if action_text_block == "":
                 format_issues.append("missing_action")
-            elif action_info["mode"] == "mixed":
-                format_issues.append("mixed_action_types")
+            elif action_info["mode"] in {"mixed", "multi_embodied", "malformed"}:
+                format_issues.append(action_info["mode"] + "_action_types")
             think_output = think_text
             if think_text == "":
                 print("\n\n\n******No Think Part, Correcting*********\n\n\n")
@@ -2437,7 +2916,7 @@ class LLMAgents(LLMPair):
             if action_text_block == "":
                 print("\n\n\n******No Action Part, Correcting**********\n\n\n")
                 action_text_block, response = self.important_part_no_create(1, "action", response)
-            self._handle_format_issues(format_issues)
+            self._handle_format_issues(format_issues, action_text_block, reward_call_type)
             self.update_recent_goal_text(recent_goal_text)
             recent_goal_entry = self.current_recent_goal_text
             # If important keyword still miss, this timestamp is failed.
@@ -2447,7 +2926,11 @@ class LLMAgents(LLMPair):
                 )
                 ml_action = "wait(1)"
                 if planner_call_index is not None:
-                    self._queue_reward_event(ml_action, planner_call_index, "planner_main")
+                    self._queue_reward_event(
+                        ml_action,
+                        planner_call_index,
+                        reward_call_type,
+                    )
                 return ml_action
 
             self.planner.add_msg_to_dialog_history(
@@ -2479,9 +2962,17 @@ class LLMAgents(LLMPair):
                         self.error_correct[self.current_timestep] = False
                         ml_action = "wait(1)"
                     else:
-                        ml_action = self.parse_ml_action_top(action_text_block, True)
+                        ml_action = self.parse_ml_action_top(
+                            action_text_block,
+                            True,
+                            source_call_index=planner_call_index,
+                        )
                 else:
-                    ml_action = self.parse_ml_action_top(action_text_block, True)
+                    ml_action = self.parse_ml_action_top(
+                        action_text_block,
+                        True,
+                        source_call_index=planner_call_index,
+                    )
             elif ("[NOTHING]" not in communicate_response) and (
                 "[EMPTY]" not in communicate_response
             ):
@@ -2499,7 +2990,13 @@ class LLMAgents(LLMPair):
                         planner_call_index = forced_idx
                     ml_action = forced_action
                 else:
-                    self._relabel_last_llm_call("communication")
+                    communication_call_index = self._relabel_last_llm_call("communication")
+                    self._queue_reward_event(
+                        communicate_response,
+                        communication_call_index,
+                        "communication",
+                    )
+                    self._flush_reward_event()
                     planner_call_index = None
                     self.planner.add_msg_to_dialog_history(
                         {"role": "talk", "content": communicate_response}
@@ -2515,9 +3012,20 @@ class LLMAgents(LLMPair):
                     self.turn_statistics_dict["statistical_data"]["communication"][
                         self.agent_index
                     ]["call"] += 1
+                    self._last_communication_plan_call_index = None
                     response = self.communication(communicate_response, state)
+                    communication_plan_call_index = getattr(
+                        self, "_last_communication_plan_call_index", None
+                    )
+                    if communication_plan_call_index is not None:
+                        planner_call_index = communication_plan_call_index
+                        reward_call_type = "planner_main"
             elif ("[NOTHING]" not in action_text_block) and (action_text_block != ""):
-                ml_action = self.parse_ml_action_top(action_text_block, True)
+                ml_action = self.parse_ml_action_top(
+                    action_text_block,
+                    True,
+                    source_call_index=planner_call_index,
+                )
             else:
                 # No action and no communication content, wait
                 ml_action == "wait(1)"
@@ -2526,20 +3034,38 @@ class LLMAgents(LLMPair):
                 f"planner_call_index={planner_call_index}"
             )
         else:
-            temp_list = []
+            temp_pairs = []
             while not self.action_wait_parse.empty():
                 item = self.action_wait_parse.get()
-                temp_list.append(item)
-            actionable_list = [
-                act for act in temp_list if not self._is_collab_action(act)
+                source = (
+                    self._pending_action_sources.get()
+                    if not self._pending_action_sources.empty()
+                    else None
+                )
+                temp_pairs.append((item, source))
+            actionable_pairs = [
+                (act, source)
+                for act, source in temp_pairs
+                if not self._is_collab_action(act)
             ]
-            for index, t in enumerate(actionable_list):
+            for index, (t, source) in enumerate(actionable_pairs):
                 if index == 0:
                     continue
                 self.action_wait_parse.put(t)
-            if actionable_list:
-                print(f"\n\n\n### Already have action sequence in pre-communication:\n {actionable_list}")
-                response = f"Action: {';'.join(actionable_list)}"
+                if source is not None:
+                    self._pending_action_sources.put(source)
+            if actionable_pairs:
+                ml_action, source = actionable_pairs[0]
+                if source is not None:
+                    source = dict(source)
+                    source["action"] = ml_action
+                    source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
+                    self._current_action_source = source
+                print(
+                    "\n\n\n### Already have action sequence in pre-communication:\n "
+                    f"{[act for act, _ in actionable_pairs]}"
+                )
+                response = f"Action: {ml_action}"
             else:
                 response = ""
             recent_goal_entry = self.current_recent_goal_text
@@ -2550,8 +3076,26 @@ class LLMAgents(LLMPair):
                 self.teammate.planner.dialog_history_list
             )
         self.del_dialog_history()
+        override = getattr(self, "_forced_action_override", None)
+        if (
+            ml_action == ""
+            and override
+            and isinstance(override, dict)
+            and override.get("action")
+        ):
+            ml_action = override["action"]
+            self._queue_action_source(
+                ml_action,
+                override.get("call_index"),
+                reward_call_type,
+            )
         if ml_action == "":
-            ml_action = self.parse_ml_action_top(response, True)
+            ml_action = self.parse_ml_action_top(
+                response,
+                True,
+                source_call_index=planner_call_index,
+                source_call_type=reward_call_type,
+            )
         self.current_ml_action_steps = 0
         failed_message_value = getattr(self, "failed_message", "success")
         if isinstance(failed_message_value, str):
@@ -2563,7 +3107,6 @@ class LLMAgents(LLMPair):
         self.record_history_entry(
                 think_output, self.current_recent_goal_text, ml_action, cleaned_failure
         )
-        override = getattr(self, "_forced_action_override", None)
         reward_call_index = planner_call_index
         reward_action = ml_action or self._preview_primary_action(action_text_block)
         if override and isinstance(override, dict):
@@ -2576,12 +3119,18 @@ class LLMAgents(LLMPair):
         if reward_call_index is not None:
             if not reward_action:
                 reward_action = "[EMPTY]"
-            self._queue_reward_event(reward_action, reward_call_index, "planner_main")
+            self._queue_reward_event(reward_action, reward_call_index, reward_call_type)
         self._forced_action_override = None
         return ml_action
 
     # parse ml_action from  response and self correct
-    def parse_ml_action_top(self, response, add_to_queue):
+    def parse_ml_action_top(
+        self,
+        response,
+        add_to_queue,
+        source_call_index: Optional[int] = None,
+        source_call_type: str = "planner_main",
+    ):
         # add_to_queue: if replace the old action_wait_parse with  new action list.
         print("\n===== Parser =====\n")
         normalized_input = (response or "").strip()
@@ -2595,25 +3144,61 @@ class LLMAgents(LLMPair):
             return "wait(1)" if add_to_queue else ["wait(1)"]
         action_body = self._strip_action_prefix(action_string)
         action_body = self._sanitize_action_text(action_body)
-        lowered_action_string = action_body.lower()
         action_tokens = [
-            token.strip()
-            for token in lowered_action_string.split(";")
-            if token.strip()
+            token.strip() for token in self._split_action_tokens(action_body) if token.strip()
         ]
-        non_collab_tokens = [
+        raw_non_collab_tokens = [
             token for token in action_tokens if not self._is_collab_action(token)
         ]
+        if len(raw_non_collab_tokens) > 1:
+            detail = (
+                "Only one embodied action is allowed in one Action field. "
+                "Multiple Collab(...) actions are allowed, but embodied actions must not be chained."
+            )
+            print(f"[Parser] invalid action format: {detail}")
+            self._report_action_format_error(detail, action_body, source_call_type)
+            if add_to_queue:
+                while not self.action_wait_parse.empty():
+                    self.action_wait_parse.get()
+                self._clear_pending_action_sources()
+                self._current_action_source = None
+                self._active_action_source = None
+                self._locked_action_source = None
+                self.time_to_wait = self.parse_wait_string("wait(1)")
+                return "wait(1)"
+            return []
+        non_collab_tokens = []
+        for token in raw_non_collab_tokens:
+            format_valid, parsed_action = self.parse_ml_action(token)
+            if format_valid is False:
+                error_message = parsed_action
+                print(f"[Parser] invalid action format: {error_message}")
+                continue
+            if parsed_action:
+                non_collab_tokens.append(parsed_action)
         ml_action = non_collab_tokens[0] if non_collab_tokens else ""
         if ml_action == "":
             ml_action = "wait(1)"
-            non_collab_tokens = ["wait(1)"]
         if add_to_queue:
             while not self.action_wait_parse.empty():
                 self.action_wait_parse.get()
+            self._clear_pending_action_sources()
             for index, a in enumerate(non_collab_tokens):
-                if index > 0:
-                    self.action_wait_parse.put(a)
+                if index == 0:
+                    self._queue_action_source(
+                        a,
+                        source_call_index,
+                        source_call_type,
+                    )
+                    continue
+                source = self._make_action_source(
+                    a,
+                    source_call_index,
+                    source_call_type,
+                )
+                if source is not None:
+                    self._pending_action_sources.put(source)
+                self.action_wait_parse.put(a)
             if "wait" in ml_action:
                 self.time_to_wait = self.parse_wait_string(ml_action)
         if "wait" not in ml_action:
@@ -2689,6 +3274,7 @@ class LLMAgents(LLMPair):
         make sure the current_ml_action exists and is valid
         return: success, or failed reason.
         """
+        self._last_validation_failed_format = False
         failed_message = "success"
         if self.current_ml_action is None:
             return f"There is no action for {self.actor}.\n"
@@ -2708,6 +3294,7 @@ class LLMAgents(LLMPair):
             self.current_ml_action
         )
         if not format_valide:
+            self._last_validation_failed_format = True
             return format_error_message
         elif "wait" in format_error_message:
             self.current_ml_action = format_error_message

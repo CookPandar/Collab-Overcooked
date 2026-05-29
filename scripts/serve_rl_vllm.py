@@ -6,9 +6,12 @@ import fcntl
 import inspect
 import json
 import os
+import queue
 import tempfile
 import threading
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +57,21 @@ class ReloadAdaptersRequest(BaseModel):
     value_head_path: Optional[str] = None
 
 
+class SleepRequest(BaseModel):
+    level: int = 1
+    mode: str = "abort"
+
+
+@dataclass
+class _GenerateWorkItem:
+    prompt: str
+    sampling_params: SamplingParams
+    lora_request: Optional[LoRARequest]
+    event: threading.Event
+    outputs: Optional[List[Any]] = None
+    error: Optional[BaseException] = None
+
+
 def _extract_logprob(entry: Any) -> Optional[float]:
     if entry is None:
         return None
@@ -68,11 +86,32 @@ class RLVLLMService:
     def __init__(self, args: argparse.Namespace):
         self.model_path = args.model
         self.served_model_name = args.served_model_name
+        self.service_role = str(
+            os.environ.get("RL_VLLM_SERVICE_ROLE", "both")
+        ).strip().lower()
+        if self.service_role not in {"both", "actor", "value"}:
+            self.service_role = "both"
         self.hidden_state_root = Path(
             tempfile.gettempdir()
         ) / f"rl_vllm_hidden_states_{args.port}"
         self.hidden_state_root.mkdir(parents=True, exist_ok=True)
         self.generate_lock = threading.Lock()
+        requested_serialize_generate = str(
+            os.environ.get("RL_VLLM_SERIALIZE_GENERATE", "1")
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        self.serialize_generate = requested_serialize_generate
+        self.parallel_batch_max = max(
+            1,
+            int(os.environ.get("RL_VLLM_PARALLEL_BATCH_MAX", "8")),
+        )
+        self.parallel_batch_wait_ms = max(
+            0.0,
+            float(os.environ.get("RL_VLLM_PARALLEL_BATCH_WAIT_MS", "10")),
+        )
+        self._generate_queue: "queue.Queue[_GenerateWorkItem]" = queue.Queue()
+        self._batcher_thread: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
+        self._sleeping = False
 
         self.lora_modules = self._load_lora_modules()
         self.max_loras = max(1, int(args.max_loras))
@@ -98,6 +137,9 @@ class RLVLLMService:
             "dtype": "auto",
             "max_model_len": int(args.max_model_len),
             "gpu_memory_utilization": float(args.gpu_memory_utilization),
+            "enable_sleep_mode": str(
+                os.environ.get("RL_VLLM_ENABLE_SLEEP_MODE", "1")
+            ).strip().lower() not in {"0", "false", "no", "off"},
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
             "disable_log_stats": True,
@@ -156,17 +198,44 @@ class RLVLLMService:
                 self.llm = LLM(**filtered_llm_kwargs)
             else:
                 raise
+        allow_unsafe_value_batch = str(
+            os.environ.get("RL_VLLM_ALLOW_UNSAFE_VALUE_BATCH", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if (
+            not requested_serialize_generate
+            and self.value_runtime_enabled
+            and not allow_unsafe_value_batch
+        ):
+            self.serialize_generate = True
+            print(
+                "[RLVLLMService] forcing serialize_generate=True because "
+                "vLLM V1 hidden-state value runtime uses speculative hidden-state "
+                "extraction and is not safe to batch with LoRA/Punica in this setup. "
+                "Set RL_VLLM_ALLOW_UNSAFE_VALUE_BATCH=1 only for debugging.",
+                flush=True,
+            )
         print(
             "[RLVLLMService] init "
             f"model={self.model_path} "
+            f"service_role={self.service_role} "
             f"lora_modules={sorted(self.lora_modules.keys())} "
             f"enable_lora={bool(filtered_llm_kwargs.get('enable_lora', False))} "
             f"max_loras={filtered_llm_kwargs.get('max_loras')} "
             f"max_lora_rank={filtered_llm_kwargs.get('max_lora_rank')} "
             f"value_head={bool(self.value_head is not None)} "
-            f"value_runtime_enabled={self.value_runtime_enabled}",
+            f"value_runtime_enabled={self.value_runtime_enabled} "
+            f"serialize_generate={self.serialize_generate} "
+            f"parallel_batch_max={self.parallel_batch_max} "
+            f"parallel_batch_wait_ms={self.parallel_batch_wait_ms}",
             flush=True,
         )
+        if not self.serialize_generate:
+            self._batcher_thread = threading.Thread(
+                target=self._batch_generate_loop,
+                name="rl-vllm-generate-batcher",
+                daemon=True,
+            )
+            self._batcher_thread.start()
 
     @staticmethod
     def _filter_llm_kwargs(llm_kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,6 +292,7 @@ class RLVLLMService:
         return linear
 
     def reload_adapters(self, request: ReloadAdaptersRequest) -> Dict[str, Any]:
+        self.wake_up()
         modules_payload = [
             {"name": item.name, "path": item.path}
             for item in request.modules
@@ -250,6 +320,41 @@ class RLVLLMService:
             "value_head": bool(self.value_head is not None),
         }
 
+    def sleep(self, level: int = 1, mode: str = "abort") -> Dict[str, Any]:
+        if not hasattr(self.llm, "sleep"):
+            raise HTTPException(status_code=501, detail="vLLM LLM.sleep() is unavailable.")
+        sleep_level = int(level)
+        if self.lora_modules and sleep_level > 1:
+            print(
+                "[RLVLLMService] downgrading sleep level to 1 because vLLM "
+                "level>1 discards model weights and corrupts LoRA generation "
+                "after wake_up in this runtime.",
+                flush=True,
+            )
+            sleep_level = 1
+        normalized_mode = str(mode or "abort").strip().lower()
+        if normalized_mode not in {"abort", "wait", "keep"}:
+            normalized_mode = "abort"
+        with self.generate_lock:
+            with self._state_lock:
+                if self._sleeping:
+                    return {"ok": True, "sleeping": True, "already": True}
+                self.llm.sleep(level=sleep_level, mode=normalized_mode)
+                torch.cuda.empty_cache()
+                self._sleeping = True
+        return {"ok": True, "sleeping": True, "level": sleep_level, "mode": normalized_mode}
+
+    def wake_up(self) -> Dict[str, Any]:
+        if not hasattr(self.llm, "wake_up"):
+            raise HTTPException(status_code=501, detail="vLLM LLM.wake_up() is unavailable.")
+        with self.generate_lock:
+            with self._state_lock:
+                if not self._sleeping:
+                    return {"ok": True, "sleeping": False, "already": True}
+                self.llm.wake_up()
+                self._sleeping = False
+        return {"ok": True, "sleeping": False}
+
     def _build_lora_request(
         self,
         adapter_name: Optional[str],
@@ -268,6 +373,106 @@ class RLVLLMService:
             return None
         return LoRARequest(adapter_name, int(spec["id"]), str(spec["path"]))
 
+    @staticmethod
+    def _lora_key(lora_request: Optional[LoRARequest]) -> tuple:
+        if lora_request is None:
+            return ("", 0, "")
+        return (
+            str(getattr(lora_request, "lora_name", "")),
+            int(getattr(lora_request, "lora_int_id", 0)),
+            str(getattr(lora_request, "lora_path", "")),
+        )
+
+    @staticmethod
+    def _sampling_key(sampling_params: SamplingParams) -> tuple:
+        return (
+            float(getattr(sampling_params, "temperature", 0.0)),
+            int(getattr(sampling_params, "max_tokens", 0)),
+            int(getattr(sampling_params, "logprobs", 0) or 0),
+        )
+
+    @classmethod
+    def _batch_key(cls, item: _GenerateWorkItem) -> tuple:
+        return (cls._lora_key(item.lora_request), cls._sampling_key(item.sampling_params))
+
+    def _direct_generate(
+        self,
+        prompts: List[str],
+        sampling_params: SamplingParams | List[SamplingParams],
+        lora_request: Optional[LoRARequest] | List[Optional[LoRARequest]],
+    ) -> List[Any]:
+        return self.llm.generate(
+            prompts,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+        )
+
+    def _submit_generate(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest],
+    ) -> List[Any]:
+        if self.serialize_generate:
+            with self.generate_lock:
+                return self._direct_generate([prompt], sampling_params, lora_request)
+
+        item = _GenerateWorkItem(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+            event=threading.Event(),
+        )
+        self._generate_queue.put(item)
+        item.event.wait()
+        if item.error is not None:
+            raise item.error
+        return item.outputs or []
+
+    def _batch_generate_loop(self) -> None:
+        while True:
+            first = self._generate_queue.get()
+            batch = [first]
+            batch_key = self._batch_key(first)
+            wait_seconds = self.parallel_batch_wait_ms / 1000.0
+            deadline = time.monotonic() + wait_seconds
+            while wait_seconds > 0 and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    item = self._generate_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if self._batch_key(item) == batch_key and len(batch) < self.parallel_batch_max:
+                    batch.append(item)
+                else:
+                    self._generate_queue.put(item)
+                    break
+            while len(batch) < self.parallel_batch_max:
+                try:
+                    item = self._generate_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if self._batch_key(item) == batch_key:
+                    batch.append(item)
+                else:
+                    self._generate_queue.put(item)
+                    break
+            try:
+                prompts = [item.prompt for item in batch]
+                outputs = self._direct_generate(
+                    prompts,
+                    sampling_params=first.sampling_params,
+                    lora_request=first.lora_request,
+                )
+                for item, output in zip(batch, outputs):
+                    item.outputs = [output]
+            except BaseException as exc:
+                for item in batch:
+                    item.error = exc
+            finally:
+                for item in batch:
+                    item.event.set()
+
     def _apply_chat_template(self, messages: List[Dict[str, str]]) -> str:
         if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
             return self.tokenizer.apply_chat_template(
@@ -284,18 +489,21 @@ class RLVLLMService:
         return "\n".join(parts)
 
     def generate(self, request: GenerateRequest) -> Dict[str, Any]:
+        if self.service_role == "value":
+            raise HTTPException(status_code=404, detail="Actor generation is disabled on value service.")
+        if self._sleeping:
+            self.wake_up()
         prompt = self._apply_chat_template(request.messages)
         sampling = SamplingParams(
             temperature=float(request.temperature),
             max_tokens=max(1, int(request.max_tokens)),
             logprobs=1,
         )
-        with self.generate_lock:
-            outputs = self.llm.generate(
-                [prompt],
-                sampling_params=sampling,
-                lora_request=self._build_lora_request(request.adapter_name, strict=True),
-            )
+        outputs = self._submit_generate(
+            prompt,
+            sampling,
+            self._build_lora_request(request.adapter_name, strict=True),
+        )
         if not outputs:
             raise HTTPException(status_code=500, detail="Empty vLLM output.")
         output = outputs[0]
@@ -347,19 +555,22 @@ class RLVLLMService:
         return last_hidden.detach().cpu().to(dtype=torch.float32)
 
     def value(self, request: ValueRequest) -> Dict[str, Any]:
+        if self.service_role == "actor":
+            return {"value": 0.0, "available": False}
         if self.value_head is None or not self.value_runtime_enabled:
             return {"value": 0.0, "available": False}
+        if self._sleeping:
+            self.wake_up()
         prompt = request.critic_text
         sampling = SamplingParams(
             temperature=0.0,
             max_tokens=1,
         )
-        with self.generate_lock:
-            outputs = self.llm.generate(
-                [prompt],
-                sampling_params=sampling,
-                lora_request=self._build_lora_request(request.adapter_name, strict=False),
-            )
+        outputs = self._submit_generate(
+            prompt,
+            sampling,
+            self._build_lora_request(request.adapter_name, strict=False),
+        )
         if not outputs:
             raise HTTPException(status_code=500, detail="Empty vLLM output for value request.")
         output = outputs[0]
@@ -385,9 +596,16 @@ def build_app(service: RLVLLMService) -> FastAPI:
         return {
             "ok": True,
             "model": service.served_model_name,
+            "service_role": service.service_role,
             "lora_modules": sorted(service.lora_modules.keys()),
             "value_head": bool(service.value_head is not None),
             "value_runtime_enabled": bool(service.value_runtime_enabled),
+            "serialize_generate": bool(service.serialize_generate),
+            "parallel_batch_max": int(service.parallel_batch_max),
+            "parallel_batch_wait_ms": float(service.parallel_batch_wait_ms),
+            "sleeping": bool(service._sleeping),
+            "sleep_supported": bool(hasattr(service.llm, "sleep")),
+            "wake_supported": bool(hasattr(service.llm, "wake_up")),
         }
 
     @app.post("/rl/generate")
@@ -401,6 +619,14 @@ def build_app(service: RLVLLMService) -> FastAPI:
     @app.post("/rl/reload_adapters")
     def reload_adapters(request: ReloadAdaptersRequest) -> Dict[str, Any]:
         return service.reload_adapters(request)
+
+    @app.post("/rl/sleep")
+    def sleep(request: SleepRequest) -> Dict[str, Any]:
+        return service.sleep(level=request.level, mode=request.mode)
+
+    @app.post("/rl/wake_up")
+    def wake_up() -> Dict[str, Any]:
+        return service.wake_up()
 
     return app
 

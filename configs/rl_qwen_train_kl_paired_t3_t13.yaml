@@ -1,6 +1,6 @@
 environment:
   order: baked_bell_pepper
-  horizon: 17
+  horizon: 18
 reward:
   communication_penalty: 0.0
   forced_communication_penalty: 0.05

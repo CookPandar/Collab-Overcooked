@@ -1,21 +1,32 @@
 environment:
   order: baked_bell_pepper
-  horizon: 17
+  horizon: 18
 reward:
   communication_penalty: 0.0
   forced_communication_penalty: 0.05
+  format_penalty: 0.2
+  validator_penalty: 0.1
+  collab_reward_enabled: true
+  sequence_metric: lcs
+  sequence_weight: 0.2
   paired_comm_reward_enabled: true
-  paired_comm_request_positive_reward: 0.5
+  paired_comm_request_positive_reward: 0.2
   paired_comm_request_negative_reward: -0.1
-  paired_comm_response_positive_reward: 0.5
+  paired_comm_response_positive_reward: 0.2
   paired_comm_response_negative_reward: -0.1
-  paired_comm_deny_reward: 1.0
+  paired_comm_deny_reward: 0.2
 trainer:
-  type: mappo
+  type: grpo
   collect_only: true
-  off_policy_snapshots: runs/rl/snapshots/one_episode_t13_t16.jsonl
-  rollout_dir: rollouts_kl
-  output_dir: runs/rl/collect
+  off_policy_snapshots: runs/rl/snapshots/one_episode_t3_t13.jsonl
+  snapshot_rollout_mode: autoregressive
+  partial_success:
+    type: oven_cooking
+    utensil: oven0
+    target: baked_bell_pepper
+    terminal_reward: 20.0
+  rollout_dir: rollouts_grpo
+  output_dir: runs/grpo/collect
   model_path: /datacache/LLMs/Qwen2.5-7B-Instruct
   lora_path: null
   actor_adapters:
@@ -25,22 +36,18 @@ trainer:
     agent_1:
       adapter_name: Assistant
       lora_path: ./runs/Assistant
-  critic_adapter:
-    adapter_name: critic
-    lora_path: ./runs/adapter_critic/critic
-    lora_config:
-      r: 16
-      alpha: 32
-      dropout: 0.05
-  value_head_path: ./runs/value_head.pt
-  latest_model_path_file: runs/rl/latest_model.json
+  latest_model_path_file: runs/grpo/latest_model.json
   generation_temperature: 0.7
   evaluation_batch_size: 6
   max_new_tokens: 512
   vllm_request_timeout: 180
-  compute_values_in_collect: true
-  collect_value_backend: vllm
+  compute_values_in_collect: false
   fix_mistral_regex: true
+  grpo:
+    norm_scope: agent
+    normalize: mean_std
+    gamma: 1.0
+    advantage_clip: 10.0
 agents:
   num_agents: 2
   agent_0:
