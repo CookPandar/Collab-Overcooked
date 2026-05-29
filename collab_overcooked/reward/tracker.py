@@ -1141,24 +1141,19 @@ class ProcessRewardTracker:
         if not self.enable_paired_comm_reward or not action:
             return 0.0, {}
 
-        total_reward = 0.0
-        meta: Dict[str, Any] = {}
-
         response_reward, response_meta = self._resolve_paired_comm_response(
             agent_index, action
         )
         if response_meta:
-            total_reward += response_reward
-            meta = response_meta
+            return response_reward, response_meta
 
         request_reward, request_meta = self._register_paired_comm_requests(
             agent_index, ts, action
         )
         if request_meta:
-            total_reward += request_reward
-            meta = request_meta
+            return request_reward, request_meta
 
-        return total_reward, meta
+        return 0.0, {}
 
     def _resolve_paired_comm_response(
         self, agent_index: int, action: str

@@ -3585,6 +3585,42 @@ class RewardAssignmentTest(unittest.TestCase):
         self.assertAlmostEqual(assistant_call["sequence_reward"], 0.0)
         self.assertAlmostEqual(assistant_call["collab_reward"], 0.0)
 
+    def test_paired_comm_call_is_not_scored_as_responder_and_initiator(self):
+        tracker = self.build_tracker(
+            order="soup",
+            refs_agent0=["pickup(onion,counter)"],
+            refs_agent1=["place_obj_on_counter()"],
+            paired_comm_reward_enabled=True,
+            paired_comm_request_positive_reward=0.2,
+            paired_comm_request_negative_reward=-0.1,
+            paired_comm_response_positive_reward=0.2,
+            paired_comm_response_negative_reward=-0.1,
+            paired_comm_deny_reward=0.2,
+        )
+        first = tracker.register_llm_action(
+            agent_index=0,
+            timestamp=3,
+            action_text="Collab(request(Assistant,place_obj_on_counter()))",
+            agent_name="Chef",
+            call_index=0,
+            call_type="communication",
+        )
+        self.assertAlmostEqual(first["paired_comm_reward"], 0.2)
+
+        second = tracker.register_llm_action(
+            agent_index=1,
+            timestamp=3,
+            action_text="Collab(request(Chef,wrong_action()))",
+            agent_name="Assistant",
+            call_index=1,
+            call_type="communication",
+        )
+
+        self.assertEqual(second["paired_comm_role"], "responder")
+        self.assertEqual(second["paired_comm_result"], "helpful_request_rejected_or_missed")
+        self.assertAlmostEqual(second["paired_comm_reward"], -0.1)
+        self.assertEqual(tracker.pending_paired_comm_requests[0], [])
+
     def test_session_strips_execution_reward_from_semantic_communication_record(self):
         session = CollabMainSession.__new__(CollabMainSession)
         session._pending_reward_records = {}
