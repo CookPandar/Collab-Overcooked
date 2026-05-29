@@ -36,7 +36,7 @@ Common transition fields:
 Field: `sequence_reward`
 
 Default value per successful progress step: `process_progress_reward`, default
-`1.0`.
+`1.0`. The current t3-t13 comm-process GRPO configs set it to `2.0`.
 
 The progress reward is only assigned when an embodied action is actually
 executed by the environment. Merely generating an action in an LLM response is
@@ -166,12 +166,14 @@ reward:
   paired_comm_deny_reward: 1.0
 ```
 
-For the comm-process configs the positive values are intentionally smaller:
+For the current t3-t13 comm-process configs:
 
 ```yaml
 reward:
-  paired_comm_request_positive_reward: 0.2
-  paired_comm_response_positive_reward: 0.2
+  process_progress_reward: 2.0
+  collab_reward_enabled: false
+  paired_comm_request_positive_reward: 0.5
+  paired_comm_response_positive_reward: 0.5
   paired_comm_deny_reward: 0.2
 ```
 
@@ -190,7 +192,7 @@ This reward evaluates request-response pairs in communication:
 This signal is independent of whether the requested action is eventually
 executed. Actual execution progress is still handled by `sequence_reward`.
 
-## Collaborative Process Reward
+## Deprecated Collab Reward
 
 Field: `collab_reward`
 
@@ -201,6 +203,13 @@ reward:
   collab_reward_enabled: true
   sequence_metric: lcs
   sequence_weight: 0.2
+```
+
+The current t3-t13 comm-process experiment does not use this signal:
+
+```yaml
+reward:
+  collab_reward_enabled: false
 ```
 
 When disabled or absent, `collab_reward` is always `0.0`.
