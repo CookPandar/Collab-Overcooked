@@ -3478,6 +3478,113 @@ class RewardAssignmentTest(unittest.TestCase):
         self.assertAlmostEqual(communication["validator_reward"], 0.0)
         self.assertAlmostEqual(communication["sequence_reward"], 0.0)
 
+    def test_collab_reward_goes_to_requester_and_executor_when_request_is_executed(self):
+        tracker = self.build_tracker(
+            order="soup",
+            refs_agent0=[],
+            refs_agent1=["place_obj_on_counter()"],
+            collab_reward_enabled=True,
+            sequence_metric="lcs",
+            sequence_weight=0.2,
+            format_success_reward=0.05,
+            validator_success_reward=0.05,
+        )
+        request = tracker.register_llm_action(
+            agent_index=0,
+            timestamp=3,
+            action_text="Collab(request(Assistant,place_obj_on_counter()))",
+            agent_name="Chef",
+            call_index=0,
+            call_type="communication",
+        )
+        self.assertAlmostEqual(request["collab_reward"], 0.2)
+
+        executed = tracker.register_llm_action(
+            agent_index=1,
+            timestamp=3,
+            action_text="place_obj_on_counter()",
+            agent_name="Assistant",
+            call_index=1,
+            call_type="planner_main",
+        )
+        reward_info = tracker.after_step(
+            timestep=3,
+            ml_actions=[None, "place_obj_on_counter()"],
+            state=FakeState(),
+            executed_action_sources=[
+                None,
+                {
+                    "agent_index": 1,
+                    "agent": "Assistant",
+                    "timestamp": 3,
+                    "source_timestamp": 3,
+                    "call_index": 1,
+                    "call_type": "planner_main",
+                    "action": "place_obj_on_counter()",
+                    "env_action": "interact",
+                    "submitted_action": "place_obj_on_counter()",
+                },
+            ],
+        )
+
+        assistant_call = reward_info["per_agent"][1]["calls"][0]
+        self.assertEqual(assistant_call, executed)
+        self.assertAlmostEqual(assistant_call["sequence_reward"], 1.0)
+        self.assertAlmostEqual(assistant_call["validator_reward"], 0.05)
+        self.assertAlmostEqual(assistant_call["collab_reward"], 0.2)
+        self.assertEqual(
+            assistant_call["collab_execution_source"]["initiator_agent"],
+            0,
+        )
+
+    def test_collab_execution_reward_requires_executed_sequence_reward(self):
+        tracker = self.build_tracker(
+            order="soup",
+            refs_agent0=[],
+            refs_agent1=["place_obj_on_counter()"],
+            collab_reward_enabled=True,
+            sequence_metric="lcs",
+            sequence_weight=0.2,
+        )
+        tracker.register_llm_action(
+            agent_index=0,
+            timestamp=3,
+            action_text="Collab(request(Assistant,place_obj_on_counter()))",
+            agent_name="Chef",
+            call_index=0,
+            call_type="communication",
+        )
+        executed = tracker.register_llm_action(
+            agent_index=1,
+            timestamp=3,
+            action_text="pickup(onion,counter)",
+            agent_name="Assistant",
+            call_index=1,
+            call_type="planner_main",
+        )
+        reward_info = tracker.after_step(
+            timestep=3,
+            ml_actions=[None, "pickup(onion,counter)"],
+            state=FakeState(),
+            executed_action_sources=[
+                None,
+                {
+                    "agent_index": 1,
+                    "agent": "Assistant",
+                    "timestamp": 3,
+                    "source_timestamp": 3,
+                    "call_index": 1,
+                    "call_type": "planner_main",
+                    "action": "pickup(onion,counter)",
+                },
+            ],
+        )
+
+        assistant_call = reward_info["per_agent"][1]["calls"][0]
+        self.assertEqual(assistant_call, executed)
+        self.assertAlmostEqual(assistant_call["sequence_reward"], 0.0)
+        self.assertAlmostEqual(assistant_call["collab_reward"], 0.0)
+
     def test_session_strips_execution_reward_from_semantic_communication_record(self):
         session = CollabMainSession.__new__(CollabMainSession)
         session._pending_reward_records = {}

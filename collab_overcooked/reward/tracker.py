@@ -84,6 +84,7 @@ class ProcessRewardTracker:
         self.call_records_by_source: Dict[Tuple[int, int, int], Dict] = {}
         self.reward_source_mismatch_events: List[Dict[str, Any]] = []
         self.pending_paired_comm_requests: List[List[Dict[str, Any]]] = [[], []]
+        self.pending_collab_execution_requests: List[List[Dict[str, Any]]] = [[], []]
         self.rewardable_action_call_types = {"planner_main", "validator_correction"}
 
     # ------------------------------------------------------------------
@@ -110,6 +111,7 @@ class ProcessRewardTracker:
         self.step_call_records.clear()
         self.reward_source_mismatch_events.clear()
         self.pending_paired_comm_requests = [[], []]
+        self.pending_collab_execution_requests = [[], []]
         for queue in self.penalty_queue:
             queue.clear()
 
@@ -124,6 +126,9 @@ class ProcessRewardTracker:
             "penalty_queue": copy.deepcopy(self.penalty_queue),
             "pending_paired_comm_requests": copy.deepcopy(
                 self.pending_paired_comm_requests
+            ),
+            "pending_collab_execution_requests": copy.deepcopy(
+                self.pending_collab_execution_requests
             ),
         }
 
@@ -170,6 +175,14 @@ class ProcessRewardTracker:
             ]
         else:
             self.pending_paired_comm_requests = [[], []]
+        pending_collab_exec = data.get("pending_collab_execution_requests")
+        if isinstance(pending_collab_exec, list) and len(pending_collab_exec) == 2:
+            self.pending_collab_execution_requests = [
+                list(queue) if isinstance(queue, list) else []
+                for queue in pending_collab_exec
+            ]
+        else:
+            self.pending_collab_execution_requests = [[], []]
         self.call_events.clear()
         self.step_call_records.clear()
 
@@ -668,6 +681,26 @@ class ProcessRewardTracker:
                     target_entry["similarity_before"] = executed_similarity_before
                     target_entry["similarity_after"] = executed_similarity_after
                     target_entry["similarity_delta"] = executed_similarity_delta
+                    exec_collab_reward, exec_collab_meta = (
+                        self._process_collab_execution_reward(
+                            agent_idx,
+                            executed_action,
+                            sequence_reward=seq_reward,
+                        )
+                    )
+                    if exec_collab_reward:
+                        target_entry["collab_reward"] = (
+                            target_entry.get("collab_reward", 0.0)
+                            + exec_collab_reward
+                        )
+                        target_entry["total"] = (
+                            target_entry.get("total", 0.0) + exec_collab_reward
+                        )
+                        target_entry["collab_execution_reward"] = (
+                            target_entry.get("collab_execution_reward", 0.0)
+                            + exec_collab_reward
+                        )
+                        target_entry["collab_execution_source"] = exec_collab_meta
             communication_reward = sum(
                 entry.get("communication_reward", 0.0) for entry in call_entries
             )
@@ -1050,7 +1083,43 @@ class ProcessRewardTracker:
             if delta > 0:
                 self.collab_sequence_scores[target_idx] = new_score
                 reward += delta * self.sequence_weight
+                self.pending_collab_execution_requests[target_idx].append(
+                    {
+                        "initiator_agent": agent_index,
+                        "target_agent": target_idx,
+                        "action": self._normalize_action(actions[0]),
+                        "score_delta": delta,
+                        "request_reward": delta * self.sequence_weight,
+                    }
+                )
         return reward
+
+    def _process_collab_execution_reward(
+        self,
+        agent_index: int,
+        executed_action: Optional[str],
+        *,
+        sequence_reward: float,
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not self.enable_collab_reward or sequence_reward <= 0.0:
+            return 0.0, {}
+        normalized = self._normalize_action(str(executed_action or ""))
+        if not normalized or self._is_wait_action(normalized):
+            return 0.0, {}
+        queue = self.pending_collab_execution_requests[agent_index]
+        for idx, request in enumerate(list(queue)):
+            if self._normalize_action(str(request.get("action") or "")) != normalized:
+                continue
+            matched = queue.pop(idx)
+            reward = float(matched.get("request_reward", 0.0) or 0.0)
+            return reward, {
+                "role": "executor",
+                "initiator_agent": matched.get("initiator_agent"),
+                "target_agent": matched.get("target_agent"),
+                "action": normalized,
+                "score_delta": matched.get("score_delta"),
+            }
+        return 0.0, {}
 
     def _process_communication_reward(
         self, agent_index: int, action: str, *, suppress_penalty: bool = False

@@ -205,18 +205,32 @@ reward:
 
 When disabled or absent, `collab_reward` is always `0.0`.
 
-When enabled, the tracker parses `Collab(request(...))` actions. For each request
-to the teammate, it temporarily appends the requested embodied actions to the
-teammate's executed-action history and recomputes reference progress. If this
-improves the teammate's best progress score, the requester receives:
+When enabled, the tracker parses `Collab(request(...))` actions. For each
+request to the teammate, it temporarily appends the requested embodied actions
+to the teammate's executed-action history and recomputes reference progress. If
+this improves the teammate's best progress score, the requester receives:
 
 ```text
 collab_reward = progress_delta * sequence_weight
 ```
 
-This is meant to credit communication that proposes useful next embodied
-actions, even before the teammate executes them. It is a communication-process
-reward, not an execution reward.
+The same useful request is also kept as a pending collaborative execution
+request for the receiver. If the receiver later executes that exact requested
+embodied action and the execution receives `sequence_reward`, the receiver's
+execution-source call receives the same `collab_reward` scale. This encourages
+the receiver to obtain useful actions through communication and then actually
+execute them, instead of only rewarding the requester.
+
+Receiver-side collaborative reward is gated by execution progress:
+
+- no execution means no receiver-side `collab_reward`,
+- executing a different action means no receiver-side `collab_reward`,
+- executing the requested action without `sequence_reward` means no
+  receiver-side `collab_reward`.
+
+This signal credits the collaborative process around useful embodied actions.
+It is separate from `paired_comm_reward`, which scores request/response behavior
+such as accepting, denying, or following requests.
 
 The base GRPO t3-t13 configs leave this disabled. The
 `*_commprocess.yaml` configs enable it so the communication-process experiment
