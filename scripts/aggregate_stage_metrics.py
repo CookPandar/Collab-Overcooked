@@ -8,6 +8,20 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+
+REWARD_COMPONENTS = [
+    "rl",
+    "format",
+    "validator",
+    "sequence",
+    "comm",
+    "comm_repeat",
+    "comm_forced",
+    "paired_comm",
+    "breakdown_total",
+    "legacy_process",
+]
+
 def _extract_yaml_scalar_block(config_text: str, block_name: str, key: str) -> str:
     in_block = False
     block_indent = 0
@@ -79,63 +93,18 @@ def _aggregate_reward_curve(worker_dirs: List[Path], output_dir: Path) -> None:
         "num_transitions",
         "agent0_n",
         "agent1_n",
-        "agent0_rl_sum",
-        "agent0_rl_mean",
-        "agent0_rl_nonzero_count",
-        "agent0_rl_nonzero_ratio",
-        "agent0_format_sum",
-        "agent0_format_mean",
-        "agent0_format_nonzero_count",
-        "agent0_format_nonzero_ratio",
-        "agent0_validator_sum",
-        "agent0_validator_mean",
-        "agent0_validator_nonzero_count",
-        "agent0_validator_nonzero_ratio",
-        "agent0_sequence_sum",
-        "agent0_sequence_mean",
-        "agent0_sequence_nonzero_count",
-        "agent0_sequence_nonzero_ratio",
-        "agent0_comm_sum",
-        "agent0_comm_mean",
-        "agent0_comm_nonzero_count",
-        "agent0_comm_nonzero_ratio",
-        "agent0_breakdown_total_sum",
-        "agent0_breakdown_total_mean",
-        "agent0_breakdown_total_nonzero_count",
-        "agent0_breakdown_total_nonzero_ratio",
-        "agent0_legacy_process_sum",
-        "agent0_legacy_process_mean",
-        "agent0_legacy_process_nonzero_count",
-        "agent0_legacy_process_nonzero_ratio",
-        "agent1_rl_sum",
-        "agent1_rl_mean",
-        "agent1_rl_nonzero_count",
-        "agent1_rl_nonzero_ratio",
-        "agent1_format_sum",
-        "agent1_format_mean",
-        "agent1_format_nonzero_count",
-        "agent1_format_nonzero_ratio",
-        "agent1_validator_sum",
-        "agent1_validator_mean",
-        "agent1_validator_nonzero_count",
-        "agent1_validator_nonzero_ratio",
-        "agent1_sequence_sum",
-        "agent1_sequence_mean",
-        "agent1_sequence_nonzero_count",
-        "agent1_sequence_nonzero_ratio",
-        "agent1_comm_sum",
-        "agent1_comm_mean",
-        "agent1_comm_nonzero_count",
-        "agent1_comm_nonzero_ratio",
-        "agent1_breakdown_total_sum",
-        "agent1_breakdown_total_mean",
-        "agent1_breakdown_total_nonzero_count",
-        "agent1_breakdown_total_nonzero_ratio",
-        "agent1_legacy_process_sum",
-        "agent1_legacy_process_mean",
-        "agent1_legacy_process_nonzero_count",
-        "agent1_legacy_process_nonzero_ratio",
     ]
+    for agent_idx in (0, 1):
+        for component in REWARD_COMPONENTS:
+            prefix = f"agent{agent_idx}_{component}"
+            header.extend(
+                [
+                    f"{prefix}_sum",
+                    f"{prefix}_mean",
+                    f"{prefix}_nonzero_count",
+                    f"{prefix}_nonzero_ratio",
+                ]
+            )
     output_path = output_dir / "reward_curve.csv"
     output_dir.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -156,74 +125,21 @@ def _aggregate_reward_curve(worker_dirs: List[Path], output_dir: Path) -> None:
                 "agent0_n": agent0_n,
                 "agent1_n": agent1_n,
             }
-            sum_fields = [
-                "agent0_rl_sum",
-                "agent0_rl_nonzero_count",
-                "agent0_format_sum",
-                "agent0_format_nonzero_count",
-                "agent0_validator_sum",
-                "agent0_validator_nonzero_count",
-                "agent0_sequence_sum",
-                "agent0_sequence_nonzero_count",
-                "agent0_comm_sum",
-                "agent0_comm_nonzero_count",
-                "agent0_breakdown_total_sum",
-                "agent0_breakdown_total_nonzero_count",
-                "agent0_legacy_process_sum",
-                "agent0_legacy_process_nonzero_count",
-                "agent1_rl_sum",
-                "agent1_rl_nonzero_count",
-                "agent1_format_sum",
-                "agent1_format_nonzero_count",
-                "agent1_validator_sum",
-                "agent1_validator_nonzero_count",
-                "agent1_sequence_sum",
-                "agent1_sequence_nonzero_count",
-                "agent1_comm_sum",
-                "agent1_comm_nonzero_count",
-                "agent1_breakdown_total_sum",
-                "agent1_breakdown_total_nonzero_count",
-                "agent1_legacy_process_sum",
-                "agent1_legacy_process_nonzero_count",
-            ]
-            for key in sum_fields:
-                agg[key] = sum(_to_float(row, key) for row in rows)
-            agg["agent0_rl_mean"] = agg["agent0_rl_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_rl_nonzero_ratio"] = agg["agent0_rl_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_format_mean"] = agg["agent0_format_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_format_nonzero_ratio"] = agg["agent0_format_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_validator_mean"] = agg["agent0_validator_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_validator_nonzero_ratio"] = agg["agent0_validator_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_sequence_mean"] = agg["agent0_sequence_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_sequence_nonzero_ratio"] = agg["agent0_sequence_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_comm_mean"] = agg["agent0_comm_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_comm_nonzero_ratio"] = agg["agent0_comm_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_breakdown_total_mean"] = agg["agent0_breakdown_total_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_breakdown_total_nonzero_ratio"] = (
-                agg["agent0_breakdown_total_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            )
-            agg["agent0_legacy_process_mean"] = agg["agent0_legacy_process_sum"] / agent0_n if agent0_n > 0 else 0.0
-            agg["agent0_legacy_process_nonzero_ratio"] = (
-                agg["agent0_legacy_process_nonzero_count"] / agent0_n if agent0_n > 0 else 0.0
-            )
-            agg["agent1_rl_mean"] = agg["agent1_rl_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_rl_nonzero_ratio"] = agg["agent1_rl_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_format_mean"] = agg["agent1_format_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_format_nonzero_ratio"] = agg["agent1_format_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_validator_mean"] = agg["agent1_validator_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_validator_nonzero_ratio"] = agg["agent1_validator_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_sequence_mean"] = agg["agent1_sequence_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_sequence_nonzero_ratio"] = agg["agent1_sequence_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_comm_mean"] = agg["agent1_comm_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_comm_nonzero_ratio"] = agg["agent1_comm_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_breakdown_total_mean"] = agg["agent1_breakdown_total_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_breakdown_total_nonzero_ratio"] = (
-                agg["agent1_breakdown_total_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            )
-            agg["agent1_legacy_process_mean"] = agg["agent1_legacy_process_sum"] / agent1_n if agent1_n > 0 else 0.0
-            agg["agent1_legacy_process_nonzero_ratio"] = (
-                agg["agent1_legacy_process_nonzero_count"] / agent1_n if agent1_n > 0 else 0.0
-            )
+            for agent_idx, agent_n in ((0, agent0_n), (1, agent1_n)):
+                for component in REWARD_COMPONENTS:
+                    prefix = f"agent{agent_idx}_{component}"
+                    sum_key = f"{prefix}_sum"
+                    nonzero_key = f"{prefix}_nonzero_count"
+                    agg[sum_key] = sum(_to_float(row, sum_key) for row in rows)
+                    agg[nonzero_key] = sum(
+                        _to_float(row, nonzero_key) for row in rows
+                    )
+                    agg[f"{prefix}_mean"] = (
+                        agg[sum_key] / agent_n if agent_n > 0 else 0.0
+                    )
+                    agg[f"{prefix}_nonzero_ratio"] = (
+                        agg[nonzero_key] / agent_n if agent_n > 0 else 0.0
+                    )
             writer.writerow(agg)
 
 

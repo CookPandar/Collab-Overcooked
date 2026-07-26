@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import inspect
 import json
 import os
@@ -13,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -40,6 +41,7 @@ class GenerateRequest(BaseModel):
     adapter_name: Optional[str] = None
     temperature: float = 0.0
     max_tokens: int = 512
+    stop: Optional[Union[str, List[str]]] = None
 
 
 class ValueRequest(BaseModel):
@@ -50,6 +52,7 @@ class ValueRequest(BaseModel):
 class ReloadAdapterSpec(BaseModel):
     name: str
     path: str
+    id: Optional[int] = None
 
 
 class ReloadAdaptersRequest(BaseModel):
@@ -261,20 +264,53 @@ class RLVLLMService:
         payload = json.loads(raw)
         return self._normalize_lora_modules(payload)
 
+    @classmethod
     def _normalize_lora_modules(
-        self,
+        cls,
         payload: Any,
     ) -> Dict[str, Dict[str, Any]]:
         modules: Dict[str, Dict[str, Any]] = {}
-        for idx, item in enumerate(payload, start=1):
+        used_ids: set[int] = set()
+        for item in payload:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
             path = str(item.get("path") or "").strip()
             if not name or not path:
                 continue
-            modules[name] = {"id": idx, "path": path}
+            module_id = cls._coerce_lora_id(item.get("id"))
+            if module_id is None:
+                module_id = cls._stable_lora_id(name, path)
+            while module_id in used_ids:
+                module_id += 1
+                if module_id > 0x7FFFFFFF:
+                    module_id = 1
+            used_ids.add(module_id)
+            modules[name] = {"id": module_id, "path": path}
         return modules
+
+    @staticmethod
+    def _coerce_lora_id(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            module_id = int(value)
+        except (TypeError, ValueError):
+            return None
+        return module_id if module_id > 0 else None
+
+    @staticmethod
+    def _stable_lora_id(name: str, path: str) -> int:
+        canonical_path = str(Path(path).expanduser().resolve(strict=False))
+        key = f"{name}\0{canonical_path}".encode("utf-8")
+        digest = hashlib.blake2s(key, digest_size=4).digest()
+        return max(1, int.from_bytes(digest, "big") & 0x7FFFFFFF)
+
+    def _lora_module_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {"name": name, "id": int(spec["id"]), "path": str(spec["path"])}
+            for name, spec in sorted(self.lora_modules.items())
+        ]
 
     def _load_value_head(self, path: Path) -> nn.Linear:
         payload = torch.load(path, map_location="cpu")
@@ -294,7 +330,7 @@ class RLVLLMService:
     def reload_adapters(self, request: ReloadAdaptersRequest) -> Dict[str, Any]:
         self.wake_up()
         modules_payload = [
-            {"name": item.name, "path": item.path}
+            {"name": item.name, "path": item.path, "id": item.id}
             for item in request.modules
         ]
         if len(modules_payload) > self.max_loras:
@@ -317,6 +353,7 @@ class RLVLLMService:
         return {
             "ok": True,
             "lora_modules": sorted(self.lora_modules.keys()),
+            "lora_module_specs": self._lora_module_specs(),
             "value_head": bool(self.value_head is not None),
         }
 
@@ -385,10 +422,18 @@ class RLVLLMService:
 
     @staticmethod
     def _sampling_key(sampling_params: SamplingParams) -> tuple:
+        stop = getattr(sampling_params, "stop", None)
+        if isinstance(stop, str):
+            stop_key = (stop,)
+        elif stop is None:
+            stop_key = ()
+        else:
+            stop_key = tuple(str(item) for item in stop)
         return (
             float(getattr(sampling_params, "temperature", 0.0)),
             int(getattr(sampling_params, "max_tokens", 0)),
             int(getattr(sampling_params, "logprobs", 0) or 0),
+            stop_key,
         )
 
     @classmethod
@@ -494,10 +539,16 @@ class RLVLLMService:
         if self._sleeping:
             self.wake_up()
         prompt = self._apply_chat_template(request.messages)
+        stop = request.stop
+        if isinstance(stop, str):
+            stop = [stop]
+        elif stop is not None:
+            stop = [str(item) for item in stop if str(item)]
         sampling = SamplingParams(
             temperature=float(request.temperature),
             max_tokens=max(1, int(request.max_tokens)),
             logprobs=1,
+            stop=stop,
         )
         outputs = self._submit_generate(
             prompt,
@@ -535,6 +586,7 @@ class RLVLLMService:
             text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
         return {
             "text": text,
+            "response_token_ids": token_ids,
             "response_tokens": token_texts,
             "response_log_probs": token_logprobs,
             "log_prob": float(sum(token_logprobs)),
@@ -598,6 +650,7 @@ def build_app(service: RLVLLMService) -> FastAPI:
             "model": service.served_model_name,
             "service_role": service.service_role,
             "lora_modules": sorted(service.lora_modules.keys()),
+            "lora_module_specs": service._lora_module_specs(),
             "value_head": bool(service.value_head is not None),
             "value_runtime_enabled": bool(service.value_runtime_enabled),
             "serialize_generate": bool(service.serialize_generate),

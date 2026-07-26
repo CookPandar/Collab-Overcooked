@@ -8,7 +8,7 @@ advantage values separately per player/agent.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -22,6 +22,10 @@ class GrpoAdvantageConfig:
     gamma: float = 1.0
     eps: float = 1e-6
     clip: Optional[float] = None
+    whiten_advantages: bool = False
+    positive_advantage_requires_positive_return: bool = False
+    positive_return_threshold: float = 0.0
+    positive_only_advantages: bool = False
 
 
 def _as_float_tensor(values: Sequence[float]) -> torch.Tensor:
@@ -32,17 +36,22 @@ def discounted_returns(
     rewards: Sequence[float],
     *,
     agent_indices: Sequence[int],
+    trajectory_ids: Optional[Sequence[Any]] = None,
     gamma: float = 1.0,
 ) -> torch.Tensor:
-    """Compute per-agent reward-to-go over the collected transition order."""
+    """Compute per-agent reward-to-go inside each rollout trajectory."""
 
     rewards_t = _as_float_tensor(rewards)
     returns = torch.zeros_like(rewards_t)
-    running: Dict[int, float] = {}
+    if trajectory_ids is not None and len(trajectory_ids) != len(rewards):
+        raise ValueError("trajectory_ids must have the same length as rewards.")
+    running: Dict[Tuple[Any, int], float] = {}
     for idx in reversed(range(len(rewards))):
         agent = int(agent_indices[idx])
-        returns[idx] = float(rewards_t[idx].item()) + float(gamma) * running.get(agent, 0.0)
-        running[agent] = float(returns[idx].item())
+        trajectory = trajectory_ids[idx] if trajectory_ids is not None else 0
+        key = (trajectory, agent)
+        returns[idx] = float(rewards_t[idx].item()) + float(gamma) * running.get(key, 0.0)
+        running[key] = float(returns[idx].item())
     return returns
 
 
@@ -107,6 +116,15 @@ def normalize_unique_values_by_agent(
     return output
 
 
+def whiten_values(values: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
+    if values.numel() == 0:
+        return values.clone()
+    if values.numel() == 1:
+        return torch.zeros_like(values)
+    std = values.std(unbiased=False).clamp(min=float(eps))
+    return (values - values.mean()) / std
+
+
 def _unique_return_counts_by_agent(
     returns: torch.Tensor,
     agent_indices: Sequence[int],
@@ -123,6 +141,8 @@ def compute_grpo_advantages(
     rewards: Sequence[float],
     agent_indices: Sequence[int],
     timesteps: Sequence[Optional[int]],
+    trajectory_ids: Optional[Sequence[Any]] = None,
+    positive_return_rewards: Optional[Sequence[float]] = None,
     config: GrpoAdvantageConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """Return `(advantages, returns, metrics)` for Collab-Overcooked transitions.
@@ -134,6 +154,10 @@ def compute_grpo_advantages(
 
     if not (len(rewards) == len(agent_indices) == len(timesteps)):
         raise ValueError("rewards, agent_indices and timesteps must have the same length.")
+    if trajectory_ids is not None and len(trajectory_ids) != len(rewards):
+        raise ValueError("trajectory_ids must have the same length as rewards.")
+    if positive_return_rewards is not None and len(positive_return_rewards) != len(rewards):
+        raise ValueError("positive_return_rewards must have the same length as rewards.")
     if not rewards:
         empty = torch.empty(0, dtype=torch.float32)
         return empty, empty, {"grpo/norm_bucket_count": 0.0}
@@ -141,6 +165,7 @@ def compute_grpo_advantages(
     returns = discounted_returns(
         rewards,
         agent_indices=agent_indices,
+        trajectory_ids=trajectory_ids,
         gamma=float(config.gamma),
     )
     advantages = normalize_unique_values_by_agent(
@@ -150,17 +175,46 @@ def compute_grpo_advantages(
         normalize=config.normalize,
         eps=float(config.eps),
     )
+    if config.whiten_advantages:
+        advantages = whiten_values(advantages, eps=float(config.eps))
+    zeroed_positive_advantages = 0
+    zeroed_negative_advantages = 0
+    positive_gate_returns = returns
+    if positive_return_rewards is not None:
+        positive_gate_returns = discounted_returns(
+            positive_return_rewards,
+            agent_indices=agent_indices,
+            trajectory_ids=trajectory_ids,
+            gamma=float(config.gamma),
+        )
+    if config.positive_advantage_requires_positive_return:
+        zero_mask = (
+            positive_gate_returns <= float(config.positive_return_threshold)
+        ) & (advantages > 0.0)
+        zeroed_positive_advantages = int(zero_mask.sum().item())
+        advantages = torch.where(zero_mask, torch.zeros_like(advantages), advantages)
+    if config.positive_only_advantages:
+        negative_mask = advantages < 0.0
+        zeroed_negative_advantages = int(negative_mask.sum().item())
+        advantages = torch.where(negative_mask, torch.zeros_like(advantages), advantages)
     if config.clip is not None:
         clip = abs(float(config.clip))
         advantages = torch.clamp(advantages, min=-clip, max=clip)
 
     unique_counts = _unique_return_counts_by_agent(returns, agent_indices)
+    trajectory_count = (
+        float(len({str(item) for item in trajectory_ids}))
+        if trajectory_ids is not None
+        else 1.0
+    )
     agent_scoped = (config.norm_scope or "agent").strip().lower() in {
         "agent",
         "player",
         "agent_specific",
     }
     metrics = {
+        "grpo/global_transition_count": float(len(rewards)),
+        "grpo/trajectory_count": trajectory_count,
         "grpo/norm_bucket_count": (
             float(sum(unique_counts.values()))
             if agent_scoped
@@ -168,8 +222,14 @@ def compute_grpo_advantages(
         ),
         "grpo/return_mean": float(returns.mean().item()),
         "grpo/return_std": float(returns.std(unbiased=False).item()) if returns.numel() > 1 else 0.0,
+        "grpo/positive_gate_return_mean": float(positive_gate_returns.mean().item()),
         "grpo/adv_mean": float(advantages.mean().item()),
         "grpo/adv_std": float(advantages.std(unbiased=False).item()) if advantages.numel() > 1 else 0.0,
+        "grpo/nonpositive_return_positive_adv_zeroed": float(zeroed_positive_advantages),
+        "grpo/negative_adv_zeroed": float(zeroed_negative_advantages),
+        "grpo/positive_adv_count": float((advantages > 0.0).sum().item()),
+        "grpo/negative_adv_count": float((advantages < 0.0).sum().item()),
+        "grpo/zero_adv_count": float((advantages == 0.0).sum().item()),
     }
     for agent, count in unique_counts.items():
         metrics[f"grpo/agent{agent}_unique_return_count"] = float(count)

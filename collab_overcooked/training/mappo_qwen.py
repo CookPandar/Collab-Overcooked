@@ -34,6 +34,22 @@ from .main_session import CollabMainSession
 from ..main import convert_yaml_to_variant
 
 
+def _strip_action_code_fence(action: str) -> str:
+    stripped = (action or "").strip()
+    if not stripped.startswith("```"):
+        return stripped.strip("`").strip()
+    content = stripped[3:]
+    closing = content.rfind("```")
+    if closing != -1:
+        content = content[:closing]
+    content = content.strip()
+    if "\n" in content:
+        first_line, remainder = content.split("\n", 1)
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]*", first_line.strip()):
+            content = remainder
+    return content.strip().strip("`").strip()
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Text generation actor-critic
@@ -65,8 +81,19 @@ class TextTransition:
     forced_communication_reward: float = 0.0
     collab_reward: float = 0.0
     paired_comm_reward: float = 0.0
+    partial_success_reward: float = 0.0
+    paired_comm_role: Optional[str] = None
+    paired_comm_result: Optional[str] = None
+    paired_comm_target: Optional[int] = None
+    paired_comm_request_action: Optional[str] = None
+    paired_comm_request_helpful: Optional[bool] = None
+    paired_comm_consumed_requests: Optional[List[Dict[str, Any]]] = None
+    paired_comm_registered_requests: Optional[List[Dict[str, Any]]] = None
     breakdown_total_reward: float = 0.0
     reward_source_key: Optional[Tuple[int, int, int]] = None
+    action_mode: Optional[str] = None
+    rollout_id: Optional[str] = None
+    rollout_file: Optional[str] = None
 
 
 @dataclass
@@ -85,20 +112,27 @@ class SnapshotRecord:
 class TextRolloutBuffer:
     def __init__(self):
         self.storage: List[TextTransition] = []
-        self._source_index: Dict[Tuple[int, int, int], int] = {}
+        self._source_index: Dict[Tuple[int, int, int], List[int]] = {}
 
     def add(self, **kwargs):
         transition = TextTransition(**kwargs)
         index = len(self.storage)
         self.storage.append(transition)
         if transition.reward_source_key is not None:
-            self._source_index[transition.reward_source_key] = index
+            self._source_index.setdefault(transition.reward_source_key, []).append(index)
 
     def get_by_source_key(self, key: Tuple[int, int, int]) -> Optional[TextTransition]:
-        index = self._source_index.get(key)
-        if index is None or index < 0 or index >= len(self.storage):
-            return None
-        return self.storage[index]
+        for index in reversed(self._source_index.get(key, [])):
+            if 0 <= index < len(self.storage):
+                return self.storage[index]
+        return None
+
+    def get_all_by_source_key(self, key: Tuple[int, int, int]) -> List[TextTransition]:
+        return [
+            self.storage[index]
+            for index in self._source_index.get(key, [])
+            if 0 <= index < len(self.storage)
+        ]
 
     def clear(self):
         self.storage.clear()
@@ -1230,9 +1264,76 @@ class MAPPOTrainer:
         )
         self.rollout_dir = Path(trainer_cfg.get("rollout_dir", "rollouts"))
         self.cleanup_rollouts = bool(trainer_cfg.get("cleanup_rollouts", True))
+        success_replay_cfg = trainer_cfg.get("success_replay", {}) or {}
+        if not isinstance(success_replay_cfg, dict):
+            success_replay_cfg = {"enabled": bool(success_replay_cfg)}
+        self.success_replay_enabled = bool(
+            success_replay_cfg.get(
+                "enabled",
+                trainer_cfg.get("success_replay_enabled", False),
+            )
+        )
+        self.success_replay_max_episodes = max(
+            0,
+            int(
+                success_replay_cfg.get(
+                    "max_episodes",
+                    trainer_cfg.get("success_replay_max_episodes", 20),
+                )
+            ),
+        )
+        self.success_replay_sample_episodes = max(
+            0,
+            int(
+                success_replay_cfg.get(
+                    "sample_episodes",
+                    trainer_cfg.get("success_replay_sample_episodes", 4),
+                )
+            ),
+        )
+        self.success_replay_min_partial_success_reward = float(
+            success_replay_cfg.get(
+                "min_partial_success_reward",
+                trainer_cfg.get(
+                    "success_replay_min_partial_success_reward",
+                    max(1e-9, float(trainer_cfg.get("partial_success", {}).get("terminal_reward", 20.0)))
+                    if isinstance(trainer_cfg.get("partial_success", {}), dict)
+                    else 20.0,
+                ),
+            )
+        )
+        self.success_replay_mode = str(
+            success_replay_cfg.get(
+                "mode",
+                trainer_cfg.get("success_replay_mode", "append"),
+            )
+        ).strip().lower()
+        self.success_replay_bc_weight = float(
+            success_replay_cfg.get(
+                "bc_weight",
+                trainer_cfg.get("success_replay_bc_weight", 0.0),
+            )
+        )
+        self._pending_success_replay_transitions: List[TextTransition] = []
+        success_replay_dir_cfg = success_replay_cfg.get(
+            "dir",
+            trainer_cfg.get("success_replay_dir", None),
+        )
+        self.success_replay_dir = (
+            Path(success_replay_dir_cfg)
+            if success_replay_dir_cfg
+            else self.rollout_dir / "success_replay"
+        )
+        if self.success_replay_enabled:
+            self.success_replay_dir.mkdir(parents=True, exist_ok=True)
         self.agents_cfg = full_config.get("agents", {})
         self.agent_roles = self._extract_agent_roles(self.agents_cfg)
         self.critic_role_prompt = self._load_critic_role_prompt()
+        reward_cfg = full_config.get("reward", {}) if isinstance(full_config, dict) else {}
+        self.format_penalty_value = -abs(float(reward_cfg.get("format_penalty", 20.0)))
+        self.validator_penalty_value = -abs(
+            float(reward_cfg.get("validator_penalty", 10.0))
+        )
 
         if (
             self.apply_latest_model_override
@@ -1289,8 +1390,58 @@ class MAPPOTrainer:
         self.partial_success_target = str(
             partial_success_cfg.get("target", env_config.get("order", ""))
         ).strip()
+        try:
+            self.partial_success_agent_index = int(
+                partial_success_cfg.get(
+                    "agent_index",
+                    partial_success_cfg.get("agent", 0),
+                )
+            )
+        except (TypeError, ValueError):
+            self.partial_success_agent_index = 0
+        self.partial_success_item = str(
+            partial_success_cfg.get("item", self.partial_success_target)
+        ).strip()
         self.partial_success_reward = float(
             partial_success_cfg.get("terminal_reward", 20.0)
+        )
+        self.partial_success_shared_terminal_reward = bool(
+            partial_success_cfg.get(
+                "shared_terminal_reward",
+                partial_success_cfg.get("share_terminal_reward", False),
+            )
+        )
+        policy_filter_cfg = trainer_cfg.get("grpo", {}) or {}
+        if not isinstance(policy_filter_cfg, dict):
+            policy_filter_cfg = {}
+        train_action_modes = policy_filter_cfg.get(
+            "train_action_modes",
+            trainer_cfg.get("train_action_modes", None),
+        )
+        if train_action_modes is None:
+            self.policy_train_action_modes: Optional[set[str]] = None
+        elif isinstance(train_action_modes, str):
+            self.policy_train_action_modes = {
+                item.strip().lower()
+                for item in train_action_modes.split(",")
+                if item.strip()
+            }
+        else:
+            self.policy_train_action_modes = {
+                str(item).strip().lower()
+                for item in train_action_modes
+                if str(item).strip()
+            }
+        if self.policy_train_action_modes and (
+            "all" in self.policy_train_action_modes
+            or "*" in self.policy_train_action_modes
+        ):
+            self.policy_train_action_modes = None
+        self.policy_include_rewarded_filtered_actions = bool(
+            policy_filter_cfg.get(
+                "include_rewarded_filtered_actions",
+                trainer_cfg.get("include_rewarded_filtered_actions", True),
+            )
         )
         self.train_batch_size = int(trainer_cfg.get("train_batch_size", 32))
         self.update_epochs = int(trainer_cfg.get("update_epochs", 4))
@@ -1942,28 +2093,546 @@ class MAPPOTrainer:
             if isinstance(food, (list, tuple, set)):
                 return target in food or any(str(target) in str(item) for item in food)
             return str(target) in str(food)
+        if self.partial_success_type in {"agent_holds", "held_object"}:
+            state = getattr(self.session.env, "state", None)
+            players = getattr(state, "players", None) if state is not None else None
+            if not players:
+                return False
+            agent_idx = self.partial_success_agent_index
+            if agent_idx < 0 or agent_idx >= len(players):
+                return False
+            player = players[agent_idx]
+            try:
+                has_object = bool(player.has_object())
+            except Exception:
+                held = getattr(player, "held_object", None)
+                has_object = held is not None
+            if not has_object:
+                return False
+            try:
+                held_obj = player.get_object()
+            except Exception:
+                held_obj = getattr(player, "held_object", None)
+            item = self.partial_success_item
+            if not item:
+                return held_obj is not None
+            if isinstance(held_obj, dict):
+                held_name = str(held_obj.get("name") or "")
+            else:
+                held_name = str(getattr(held_obj, "name", held_obj) or "")
+            return held_name == item or item in held_name
         return False
+
+    def _select_partial_success_record(
+        self,
+        records: List[Any],
+        *,
+        allow_fallback: bool = True,
+    ) -> Optional[Any]:
+        if not records:
+            return None
+        target_agent = int(getattr(self, "partial_success_agent_index", -1))
+        for record in reversed(records):
+            try:
+                if int(getattr(record, "agent_index")) == target_agent:
+                    return record
+            except (TypeError, ValueError):
+                continue
+        return records[-1] if allow_fallback else None
+
+    def _apply_partial_success_reward_to_record(self, record: Any) -> bool:
+        if record is None:
+            return False
+        reward_value = float(getattr(self, "partial_success_reward", 0.0) or 0.0)
+        if reward_value <= 0.0:
+            return False
+        try:
+            record.reward = float(getattr(record, "reward", 0.0) or 0.0) + reward_value
+        except Exception:
+            return False
+        record.done = True
+        metadata = dict(getattr(record, "metadata", {}) or {})
+        metadata["partial_success"] = self.partial_success_type
+        metadata["partial_success_reward"] = reward_value
+        metadata["partial_success_agent_index"] = int(
+            getattr(self, "partial_success_agent_index", -1)
+        )
+        breakdown = dict(metadata.get("reward_breakdown") or {})
+        raw = dict(breakdown.get("raw") or {})
+        raw["partial_success_reward"] = float(
+            raw.get("partial_success_reward", 0.0) or 0.0
+        ) + reward_value
+        raw["total"] = (
+            float(raw.get("total", record.reward - reward_value) or 0.0)
+            + reward_value
+        )
+        breakdown["raw"] = raw
+        breakdown["partial_success_reward"] = float(
+            breakdown.get("partial_success_reward", 0.0) or 0.0
+        ) + reward_value
+        breakdown["total"] = float(
+            breakdown.get("total", record.reward - reward_value) or 0.0
+        ) + reward_value
+        metadata["reward_breakdown"] = breakdown
+        record.metadata = metadata
+        return True
 
     def _apply_partial_success_reward(self, records: List[Any]) -> None:
         if not records:
             return
-        record = records[-1]
-        try:
-            record.reward = float(getattr(record, "reward", 0.0) or 0.0) + float(
-                self.partial_success_reward
-            )
-        except Exception:
+        if bool(getattr(self, "partial_success_shared_terminal_reward", False)):
+            self._apply_shared_partial_success_reward_to_records(records)
             return
-        metadata = dict(getattr(record, "metadata", {}) or {})
-        metadata["partial_success"] = self.partial_success_type
-        metadata["partial_success_reward"] = float(self.partial_success_reward)
-        breakdown = dict(metadata.get("reward_breakdown") or {})
-        raw = dict(breakdown.get("raw") or {})
-        raw["partial_success_reward"] = float(self.partial_success_reward)
-        breakdown["raw"] = raw
-        breakdown["partial_success_reward"] = float(self.partial_success_reward)
-        metadata["reward_breakdown"] = breakdown
-        record.metadata = metadata
+        record = self._select_partial_success_record(records)
+        self._apply_partial_success_reward_to_record(record)
+
+    def _shared_partial_success_agent_indices(self) -> List[int]:
+        try:
+            num_agents = int(getattr(self, "num_agents", 2))
+        except (TypeError, ValueError):
+            num_agents = 2
+        return list(range(max(1, num_agents)))
+
+    def _apply_shared_partial_success_reward_to_records(self, records: List[Any]) -> List[int]:
+        applied: List[int] = []
+        for agent_idx in self._shared_partial_success_agent_indices():
+            selected = None
+            for record in reversed(records):
+                try:
+                    if int(getattr(record, "agent_index")) == agent_idx:
+                        selected = record
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if selected is not None and self._apply_partial_success_reward_to_record(selected):
+                applied.append(agent_idx)
+        return applied
+
+    def _apply_partial_success_reward_to_transition(self, transition: Any) -> bool:
+        if transition is None:
+            return False
+        reward_value = float(getattr(self, "partial_success_reward", 0.0) or 0.0)
+        if reward_value <= 0.0:
+            return False
+        transition.reward = float(getattr(transition, "reward", 0.0) or 0.0) + reward_value
+        transition.partial_success_reward = (
+            float(getattr(transition, "partial_success_reward", 0.0) or 0.0)
+            + reward_value
+        )
+        transition.breakdown_total_reward = (
+            float(getattr(transition, "breakdown_total_reward", 0.0) or 0.0)
+            + reward_value
+        )
+        transition.done = 1.0
+        return True
+
+    def _apply_partial_success_reward_to_buffer(self) -> bool:
+        target_agent = int(getattr(self, "partial_success_agent_index", -1))
+        return self._apply_partial_success_reward_to_agent_buffer(target_agent)
+
+    def _apply_partial_success_reward_to_agent_buffer(self, agent_idx: int) -> bool:
+        active_rollout_id = getattr(self, "_active_rollout_id", None)
+        storage = list(getattr(self.buffer, "storage", []))
+        for transition in reversed(storage):
+            if active_rollout_id is not None and transition.rollout_id != active_rollout_id:
+                continue
+            if int(transition.agent_index) != int(agent_idx):
+                continue
+            action_mode = str(getattr(transition, "action_mode", "") or "").strip().lower()
+            if action_mode != "planner_main":
+                continue
+            return self._apply_partial_success_reward_to_transition(transition)
+        for transition in reversed(storage):
+            if active_rollout_id is not None and transition.rollout_id != active_rollout_id:
+                continue
+            if int(transition.agent_index) != int(agent_idx):
+                continue
+            return self._apply_partial_success_reward_to_transition(transition)
+        return False
+
+    def _apply_partial_success_reward_to_causal_agent_buffer(
+        self, agent_idx: int
+    ) -> bool:
+        """Prefer the teammate transition that actually advanced the task."""
+        active_rollout_id = getattr(self, "_active_rollout_id", None)
+        storage = [
+            transition
+            for transition in list(getattr(self.buffer, "storage", []))
+            if int(getattr(transition, "agent_index", -1)) == int(agent_idx)
+            and (
+                active_rollout_id is None
+                or getattr(transition, "rollout_id", None) == active_rollout_id
+            )
+            and float(getattr(transition, "partial_success_reward", 0.0) or 0.0)
+            <= 0.0
+        ]
+        if not storage:
+            return False
+
+        def mode_is(transition: Any, expected: str) -> bool:
+            return (
+                str(getattr(transition, "action_mode", "") or "")
+                .strip()
+                .lower()
+                == expected
+            )
+
+        def reward_value(transition: Any, name: str) -> float:
+            return float(getattr(transition, name, 0.0) or 0.0)
+
+        predicates = [
+            lambda transition: mode_is(transition, "planner_main")
+            and reward_value(transition, "sequence_reward") > 0.0,
+            lambda transition: mode_is(transition, "planner_main")
+            and reward_value(transition, "paired_comm_reward") > 0.0,
+            lambda transition: mode_is(transition, "planner_main")
+            and reward_value(transition, "reward") > 0.0,
+            lambda transition: mode_is(transition, "planner_main"),
+            lambda transition: reward_value(transition, "sequence_reward") > 0.0
+            or reward_value(transition, "paired_comm_reward") > 0.0
+            or reward_value(transition, "reward") > 0.0,
+        ]
+        for predicate in predicates:
+            for transition in reversed(storage):
+                if predicate(transition):
+                    return self._apply_partial_success_reward_to_transition(transition)
+        return False
+
+    @staticmethod
+    def _source_key_from_entry(entry: Any) -> Optional[Tuple[int, int, int]]:
+        if not isinstance(entry, dict):
+            return None
+        call_index = entry.get("call_index")
+        if call_index is None:
+            return None
+        try:
+            agent_idx = int(entry.get("agent_index"))
+            source_ts = int(entry.get("source_timestamp", entry.get("timestamp", -1)))
+            call_idx = int(call_index)
+        except (TypeError, ValueError):
+            return None
+        return agent_idx, source_ts, call_idx
+
+    @classmethod
+    def _normalize_source_entry_action(cls, action: Any) -> str:
+        text = str(action or "").strip()
+        if not text or text == "[EMPTY]":
+            return ""
+        text = text.replace("<|im_end|>", "").strip()
+        match = re.search(
+            r"Action\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+        )
+        if match:
+            text = match.group(1).strip()
+        text = _strip_action_code_fence(text)
+        return text.replace(" ", "")
+
+    def _transition_action_text(self, transition: Any) -> str:
+        response_ids = getattr(transition, "response_ids", None)
+        tokenizer = getattr(self, "policy_tokenizer", None)
+        if response_ids is None or tokenizer is None:
+            return ""
+        try:
+            values = response_ids.tolist() if hasattr(response_ids, "tolist") else list(response_ids)
+            response = tokenizer.decode(values, skip_special_tokens=True)
+        except Exception:
+            return ""
+        return self._extract_response_action_text(response)
+
+    def _transition_matches_source_entry(
+        self,
+        transition: Any,
+        entry: Dict[str, Any],
+    ) -> bool:
+        entry_action = self._normalize_source_entry_action(entry.get("action"))
+        if not entry_action:
+            return False
+        transition_action = self._normalize_source_entry_action(
+            self._transition_action_text(transition)
+        )
+        return bool(transition_action and transition_action == entry_action)
+
+    def _select_transition_for_source_entry(
+        self,
+        key: Tuple[int, int, int],
+        entry: Dict[str, Any],
+    ) -> Optional[TextTransition]:
+        get_all = getattr(self.buffer, "get_all_by_source_key", None)
+        if callable(get_all):
+            candidates = list(get_all(key))
+        else:
+            transition = self.buffer.get_by_source_key(key)
+            candidates = [transition] if transition is not None else []
+        active_rollout_id = getattr(self, "_active_rollout_id", None)
+        if active_rollout_id is not None:
+            candidates = [
+                transition
+                for transition in candidates
+                if transition.rollout_id == active_rollout_id
+            ]
+        if not candidates:
+            return None
+        entry_action = self._normalize_source_entry_action(entry.get("action"))
+        if entry_action:
+            comparable_candidates = [
+                transition
+                for transition in candidates
+                if self._normalize_source_entry_action(
+                    self._transition_action_text(transition)
+                )
+            ]
+            if not comparable_candidates:
+                return candidates[-1]
+            for transition in candidates:
+                if self._transition_matches_source_entry(transition, entry):
+                    return transition
+            return None
+        return candidates[-1]
+
+    @staticmethod
+    def _transition_component_total(transition: Any) -> float:
+        return (
+            float(getattr(transition, "sequence_reward", 0.0) or 0.0)
+            + float(getattr(transition, "format_reward", 0.0) or 0.0)
+            + float(getattr(transition, "validator_reward", 0.0) or 0.0)
+            + float(getattr(transition, "communication_reward", 0.0) or 0.0)
+            + float(getattr(transition, "collab_reward", 0.0) or 0.0)
+            + float(getattr(transition, "paired_comm_reward", 0.0) or 0.0)
+        )
+
+    def _source_entry_reward_components(self, entry: Dict[str, Any]) -> Dict[str, float]:
+        fmt_reward = float(entry.get("format_reward", 0.0) or 0.0)
+        validator_reward = float(entry.get("validator_reward", 0.0) or 0.0)
+        validator_penalty_value = float(getattr(self, "validator_penalty_value", -0.1))
+        if validator_reward < validator_penalty_value:
+            validator_reward = validator_penalty_value
+        paired_comm_reward = float(entry.get("paired_comm_reward", 0.0) or 0.0)
+        if paired_comm_reward < 0.0 and (fmt_reward < 0.0 or validator_reward < 0.0):
+            paired_comm_reward = 0.0
+        return {
+            "sequence_reward": float(entry.get("sequence_reward", 0.0) or 0.0),
+            "format_reward": fmt_reward,
+            "validator_reward": validator_reward,
+            "communication_reward": float(entry.get("communication_reward", 0.0) or 0.0),
+            "repeat_communication_reward": float(
+                entry.get("repeat_communication_reward", 0.0) or 0.0
+            ),
+            "forced_communication_reward": float(
+                entry.get("forced_communication_reward", 0.0) or 0.0
+            ),
+            "collab_reward": float(entry.get("collab_reward", 0.0) or 0.0),
+            "paired_comm_reward": paired_comm_reward,
+        }
+
+    @staticmethod
+    def _source_entry_paired_comm_meta(entry: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "paired_comm_role": entry.get("paired_comm_role"),
+            "paired_comm_result": entry.get("paired_comm_result"),
+            "paired_comm_target": entry.get("paired_comm_target"),
+            "paired_comm_request_action": entry.get("paired_comm_request_action"),
+            "paired_comm_request_helpful": entry.get("paired_comm_request_helpful"),
+            "paired_comm_consumed_requests": copy.deepcopy(
+                entry.get("paired_comm_consumed_requests")
+            ),
+            "paired_comm_registered_requests": copy.deepcopy(
+                entry.get("paired_comm_registered_requests")
+            ),
+        }
+
+    @staticmethod
+    def _clear_transition_paired_comm_meta(transition: Any) -> None:
+        transition.paired_comm_role = None
+        transition.paired_comm_result = None
+        transition.paired_comm_target = None
+        transition.paired_comm_request_action = None
+        transition.paired_comm_request_helpful = None
+        transition.paired_comm_consumed_requests = None
+        transition.paired_comm_registered_requests = None
+
+    def _apply_source_entry_to_transition(self, transition: Any, entry: Dict[str, Any]) -> bool:
+        components = self._source_entry_reward_components(entry)
+        paired_comm_meta = self._source_entry_paired_comm_meta(entry)
+        existing_format_reward = float(getattr(transition, "format_reward", 0.0) or 0.0)
+        existing_validator_reward = float(
+            getattr(transition, "validator_reward", 0.0) or 0.0
+        )
+        if existing_format_reward < 0.0:
+            # Source entries may be refreshed after the full response was
+            # classified as malformed. Never let that refresh erase a format
+            # penalty already attached to the stored transition.
+            components["format_reward"] = existing_format_reward
+            components["validator_reward"] = 0.0
+            components["sequence_reward"] = 0.0
+        elif existing_validator_reward < 0.0 and components["validator_reward"] >= 0.0:
+            components["validator_reward"] = existing_validator_reward
+            components["sequence_reward"] = 0.0
+        action_mode = str(getattr(transition, "action_mode", "") or "").strip().lower()
+        if action_mode == "communication":
+            components["sequence_reward"] = 0.0
+            components["validator_reward"] = 0.0
+        elif action_mode == "wait":
+            components["sequence_reward"] = 0.0
+            components["validator_reward"] = 0.0
+            components["communication_reward"] = 0.0
+            components["repeat_communication_reward"] = 0.0
+            components["forced_communication_reward"] = 0.0
+            components["collab_reward"] = 0.0
+            components["paired_comm_reward"] = 0.0
+            paired_comm_meta = {}
+        elif action_mode in {"mixed", "multi_embodied", "malformed"}:
+            if existing_format_reward < 0.0:
+                components["format_reward"] = existing_format_reward
+            components["sequence_reward"] = 0.0
+            components["validator_reward"] = 0.0
+            components["communication_reward"] = 0.0
+            components["repeat_communication_reward"] = 0.0
+            components["forced_communication_reward"] = 0.0
+            components["collab_reward"] = 0.0
+            components["paired_comm_reward"] = 0.0
+            paired_comm_meta = {}
+        old_base = self._transition_component_total(transition)
+        old_reward = float(getattr(transition, "reward", 0.0) or 0.0)
+        preserved_extra = old_reward - old_base
+        new_base = (
+            components["sequence_reward"]
+            + components["format_reward"]
+            + components["validator_reward"]
+            + components["communication_reward"]
+            + components["collab_reward"]
+            + components["paired_comm_reward"]
+        )
+        transition.sequence_reward = components["sequence_reward"]
+        transition.process_reward = components["sequence_reward"]
+        transition.format_reward = components["format_reward"]
+        transition.validator_reward = components["validator_reward"]
+        transition.communication_reward = components["communication_reward"]
+        transition.repeat_communication_reward = components["repeat_communication_reward"]
+        transition.forced_communication_reward = components["forced_communication_reward"]
+        transition.collab_reward = components["collab_reward"]
+        transition.paired_comm_reward = components["paired_comm_reward"]
+        if abs(float(components["paired_comm_reward"] or 0.0)) > 1e-9:
+            transition.paired_comm_role = paired_comm_meta.get("paired_comm_role")
+            transition.paired_comm_result = paired_comm_meta.get("paired_comm_result")
+            transition.paired_comm_target = paired_comm_meta.get("paired_comm_target")
+            transition.paired_comm_request_action = paired_comm_meta.get(
+                "paired_comm_request_action"
+            )
+            transition.paired_comm_request_helpful = paired_comm_meta.get(
+                "paired_comm_request_helpful"
+            )
+            transition.paired_comm_consumed_requests = paired_comm_meta.get(
+                "paired_comm_consumed_requests"
+            )
+            transition.paired_comm_registered_requests = paired_comm_meta.get(
+                "paired_comm_registered_requests"
+            )
+        else:
+            self._clear_transition_paired_comm_meta(transition)
+        transition.reward = new_base + preserved_extra
+        transition.breakdown_total_reward = transition.reward
+        return abs(new_base - old_base) > 1e-9
+
+    def _apply_process_reward_source_updates(
+        self,
+        process_reward: Optional[Dict[str, Any]],
+    ) -> int:
+        if not process_reward or not isinstance(process_reward, dict):
+            return 0
+        source_entries = process_reward.get("source_entries") or []
+        if not source_entries:
+            return 0
+        updated = 0
+        for entry in source_entries:
+            key = self._source_key_from_entry(entry)
+            if key is None:
+                continue
+            transition = self._select_transition_for_source_entry(key, entry)
+            if transition is None:
+                continue
+            if self._apply_source_entry_to_transition(transition, entry):
+                updated += 1
+        return updated
+
+    def _apply_partial_success_reward_to_sources(
+        self,
+        executed_sources: Optional[List[Dict[str, Any]]],
+        agent_idx: Optional[int] = None,
+    ) -> bool:
+        target_agent = (
+            int(agent_idx)
+            if agent_idx is not None
+            else int(getattr(self, "partial_success_agent_index", -1))
+        )
+        active_rollout_id = getattr(self, "_active_rollout_id", None)
+        for source in reversed(executed_sources or []):
+            key = self._source_key_from_entry(source)
+            if key is None or key[0] != target_agent:
+                continue
+            transition = self._select_transition_for_source_entry(key, source)
+            if transition is None:
+                continue
+            return self._apply_partial_success_reward_to_transition(transition)
+        return False
+
+    def _apply_partial_success_reward_to_current_planner_record(
+        self,
+        records: List[Any],
+        agent_idx: int,
+    ) -> bool:
+        for record in reversed(records or []):
+            try:
+                if int(getattr(record, "agent_index")) != int(agent_idx):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if self._response_action_mode(
+                record,
+                tokenizer=getattr(self, "policy_tokenizer", None),
+            ) != "planner_main":
+                continue
+            return self._apply_partial_success_reward_to_record(record)
+        return False
+
+    def _apply_shared_partial_success_reward(
+        self,
+        records: List[Any],
+        executed_sources: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        applied_agents = set()
+        for agent_idx in self._shared_partial_success_agent_indices():
+            if self._apply_partial_success_reward_to_sources(
+                executed_sources,
+                agent_idx=int(agent_idx),
+            ):
+                applied_agents.add(agent_idx)
+        for agent_idx in self._shared_partial_success_agent_indices():
+            if agent_idx in applied_agents:
+                continue
+            if (
+                int(agent_idx)
+                != int(getattr(self, "partial_success_agent_index", -1))
+                and self._apply_partial_success_reward_to_causal_agent_buffer(
+                    int(agent_idx)
+                )
+            ):
+                applied_agents.add(agent_idx)
+        for agent_idx in self._shared_partial_success_agent_indices():
+            if agent_idx in applied_agents:
+                continue
+            if self._apply_partial_success_reward_to_current_planner_record(
+                records,
+                int(agent_idx),
+            ):
+                applied_agents.add(agent_idx)
+        for agent_idx in self._shared_partial_success_agent_indices():
+            if agent_idx in applied_agents:
+                continue
+            if self._apply_partial_success_reward_to_agent_buffer(agent_idx):
+                applied_agents.add(agent_idx)
+        return bool(applied_agents)
 
     def _extract_agent_roles(self, agents_cfg: Dict[str, Any]) -> Dict[int, str]:
         roles: Dict[int, str] = {}
@@ -2440,6 +3109,7 @@ class MAPPOTrainer:
             agent_index=agent_index,
             messages=messages,
             temperature=(context or {}).get("temperature"),
+            stop=(context or {}).get("stop"),
         )
         prompt_text = convert_messages_to_prompt(messages)
         tokenizer = self.policy_tokenizer
@@ -2454,11 +3124,7 @@ class MAPPOTrainer:
             return_tensors="pt",
             add_special_tokens=False,
         )["input_ids"].squeeze(0).cpu()
-        response_ids = tokenizer(
-            response_text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )["input_ids"].squeeze(0).cpu()
+        response_ids = self._response_ids_from_actor_metadata(response_text, actor_metadata)
         critic_prefix, critic_dynamic = self._build_critic_prompt_parts(
             agent_index=agent_index,
             messages=messages,
@@ -2482,7 +3148,17 @@ class MAPPOTrainer:
                 ),
             )
         response_log_probs = actor_metadata.get("response_log_probs") or []
-        response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
+        if len(response_log_probs) != int(response_ids.numel()):
+            print(
+                "[MAPPOTrainer] align vLLM logprobs "
+                f"agent={agent_index} response_ids={int(response_ids.numel())} "
+                f"logprob_tokens={len(response_log_probs)}",
+                flush=True,
+            )
+        response_log_probs_tensor = self._align_response_log_probs_to_ids(
+            response_log_probs,
+            response_ids,
+        )
         total_log_prob = actor_metadata.get("log_prob")
         if total_log_prob is None:
             total_log_prob = (
@@ -2530,29 +3206,49 @@ class MAPPOTrainer:
         url: str,
         payload: Dict[str, Any],
         timeout: float,
+        retries: int = 0,
+        retry_backoff: float = 2.0,
     ) -> Dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        req = urllib_request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib_request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib_error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"vLLM endpoint HTTP {exc.code}: {detail}") from exc
-        except urllib_error.URLError as exc:
-            raise RuntimeError(f"vLLM endpoint unavailable: {url} ({exc})") from exc
-        return json.loads(raw)
+        attempts = max(1, int(retries) + 1)
+        for attempt in range(1, attempts + 1):
+            req = urllib_request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib_request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                return json.loads(raw)
+            except urllib_error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="ignore")
+                if attempt >= attempts:
+                    raise RuntimeError(f"vLLM endpoint HTTP {exc.code}: {detail}") from exc
+                reason = f"HTTP {exc.code}: {detail[:200]}"
+            except TimeoutError as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(f"vLLM endpoint timed out after {timeout}s: {url}") from exc
+                reason = f"timeout after {timeout}s"
+            except urllib_error.URLError as exc:
+                if attempt >= attempts:
+                    raise RuntimeError(f"vLLM endpoint unavailable: {url} ({exc})") from exc
+                reason = str(exc)
+            print(
+                "[MAPPOTrainer] vllm request retry "
+                f"url={url} attempt={attempt}/{attempts} reason={reason}",
+                flush=True,
+            )
+            time.sleep(max(0.0, float(retry_backoff)) * attempt)
+        raise RuntimeError(f"vLLM endpoint request failed without response: {url}")
 
     def _query_vllm_actor(
         self,
         agent_index: int,
         messages: List[Dict[str, str]],
         temperature: Optional[float],
+        stop: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         model_name = self.agents_cfg.get(f"agent_{agent_index}", {}).get(
             "model", "qwen2.5-7B-instruct"
@@ -2566,13 +3262,15 @@ class MAPPOTrainer:
                 "timeout", self.trainer_cfg.get("vllm_request_timeout", 120)
             )
         )
+        retries = int(self.trainer_cfg.get("vllm_request_retries", 0) or 0)
+        retry_backoff = float(self.trainer_cfg.get("vllm_request_retry_backoff", 2.0))
         rank, endpoint_url = self._vllm_endpoint("/rl/generate", service="actor")
         request_started = time.time()
         print(
             "[MAPPOTrainer] vllm request start "
             f"rank={rank} agent={agent_index} model={model_name} "
             f"adapter={actor_adapter_name or 'base'} "
-            f"url={endpoint_url} timeout={timeout} "
+            f"url={endpoint_url} timeout={timeout} retries={retries} "
             f"temperature={float(temperature if temperature is not None else 0.0)} "
             f"messages={len(messages)}"
         )
@@ -2583,8 +3281,11 @@ class MAPPOTrainer:
                 "adapter_name": actor_adapter_name,
                 "temperature": float(temperature if temperature is not None else 0.0),
                 "max_tokens": int(self.trainer_cfg.get("max_new_tokens", 512)),
+                "stop": stop,
             },
             timeout=timeout,
+            retries=retries,
+            retry_backoff=retry_backoff,
         )
         elapsed = time.time() - request_started
         if hasattr(self, "_last_rollout_stats"):
@@ -2596,6 +3297,7 @@ class MAPPOTrainer:
                 + float(elapsed)
             )
         response_text = str(response.get("text") or "")
+        response_token_ids = response.get("response_token_ids") or []
         token_logprobs = [
             float(item) for item in (response.get("response_log_probs") or [])
         ]
@@ -2610,10 +3312,43 @@ class MAPPOTrainer:
         )
         return response_text, {
             "response_log_probs": token_logprobs,
+            "response_token_ids": response_token_ids,
             "response_tokens": response_tokens,
             "log_prob": float(sum(token_logprobs)) if token_logprobs else 0.0,
             "token_count": int(response.get("token_count", len(token_logprobs))),
         }
+
+    def _response_ids_from_actor_metadata(
+        self,
+        response_text: str,
+        actor_metadata: Dict[str, Any],
+    ) -> torch.Tensor:
+        token_ids = actor_metadata.get("response_token_ids")
+        if token_ids:
+            try:
+                return torch.tensor([int(item) for item in token_ids], dtype=torch.long)
+            except (TypeError, ValueError):
+                pass
+        assert self.policy_tokenizer is not None
+        return self.policy_tokenizer(
+            response_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"].squeeze(0).cpu()
+
+    @staticmethod
+    def _align_response_log_probs_to_ids(
+        response_log_probs: List[float],
+        response_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        target_len = int(response_ids.numel())
+        values = [float(item) for item in response_log_probs]
+        if len(values) > target_len:
+            values = values[:target_len]
+        elif len(values) < target_len:
+            pad_value = values[-1] if values else 0.0
+            values.extend([pad_value] * (target_len - len(values)))
+        return torch.tensor(values, dtype=torch.float32)
 
     def _query_vllm_value(self, critic_prompt: str, timeout: float) -> float:
         rank, endpoint_url = self._vllm_endpoint("/rl/value", service="value")
@@ -2629,6 +3364,8 @@ class MAPPOTrainer:
                 "adapter_name": self.critic_adapter.name if self.critic_adapter else None,
             },
             timeout=timeout,
+            retries=int(self.trainer_cfg.get("vllm_request_retries", 0) or 0),
+            retry_backoff=float(self.trainer_cfg.get("vllm_request_retry_backoff", 2.0)),
         )
         elapsed = time.time() - request_started
         if hasattr(self, "_last_rollout_stats"):
@@ -2654,6 +3391,7 @@ class MAPPOTrainer:
             agent_index=agent_index,
             messages=messages,
             temperature=(context or {}).get("temperature"),
+            stop=(context or {}).get("stop"),
         )
         prompt_text = convert_messages_to_prompt(messages)
         tokenizer = self.policy_tokenizer
@@ -2666,7 +3404,7 @@ class MAPPOTrainer:
 
         model = self.accelerator.unwrap_model(self.text_policy)
         prompt_ids = tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
-        response_ids = tokenizer(response_text, return_tensors="pt", add_special_tokens=False)["input_ids"].squeeze(0).cpu()
+        response_ids = self._response_ids_from_actor_metadata(response_text, actor_metadata)
 
         critic_prefix, critic_dynamic = self._build_critic_prompt_parts(
             agent_index=agent_index,
@@ -2695,7 +3433,17 @@ class MAPPOTrainer:
                 )
 
         response_log_probs = actor_metadata.get("response_log_probs") or []
-        response_log_probs_tensor = torch.tensor(response_log_probs, dtype=torch.float32)
+        if len(response_log_probs) != int(response_ids.numel()):
+            print(
+                "[MAPPOTrainer] align vLLM logprobs "
+                f"agent={agent_index} response_ids={int(response_ids.numel())} "
+                f"logprob_tokens={len(response_log_probs)}",
+                flush=True,
+            )
+        response_log_probs_tensor = self._align_response_log_probs_to_ids(
+            response_log_probs,
+            response_ids,
+        )
         total_log_prob = actor_metadata.get("log_prob")
         if total_log_prob is None:
             total_log_prob = float(response_log_probs_tensor.sum().item()) if response_log_probs else 0.0
@@ -2749,6 +3497,12 @@ class MAPPOTrainer:
                 phase = self._runtime_stage_phase(
                     "eval" if "eval" in str(self.output_dir).lower() else "collect"
                 )
+                print(
+                    "[Collect] before set_logging_context "
+                    f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                    f"update={update_idx} phase={phase}",
+                    flush=True,
+                )
                 self.session.set_logging_context(
                     update_idx=update_idx,
                     phase=phase,
@@ -2756,7 +3510,25 @@ class MAPPOTrainer:
                     loop_round_idx=self._runtime_loop_round_idx(),
                     rotate_session=True,
                 )
+                print(
+                    "[Collect] after set_logging_context "
+                    f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                    f"update={update_idx}",
+                    flush=True,
+                )
+            print(
+                "[Collect] before reset_rollout_stats "
+                f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                f"update={update_idx}",
+                flush=True,
+            )
             self._reset_rollout_stats()
+            print(
+                "[Collect] before collect_rollout "
+                f"rank={self.accelerator.process_index} worker={self._runtime_worker_id()} "
+                f"update={update_idx}",
+                flush=True,
+            )
             self.collect_rollout()
             print(
                 "[Collect] before save_rollout "
@@ -2825,6 +3597,11 @@ class MAPPOTrainer:
                 f"[TrainOnly] Update {update_idx}: loaded global transitions={len(transitions)}"
             )
             local_transitions = self._shard_transitions_for_rank(transitions)
+            self._pending_success_replay_transitions = (
+                self._shard_aux_transitions_for_rank(
+                    getattr(self, "_pending_success_replay_transitions", [])
+                )
+            )
             if not local_transitions:
                 self.accelerator.print(
                     "[TrainOnly] Local rank received no rollout shard; stopping."
@@ -2955,6 +3732,11 @@ class MAPPOTrainer:
             self._last_rollout_stats["rollout_wall_time_sec"] = 0.0
         except Exception:
             pass
+        self._active_rollout_id = (
+            f"worker{self._runtime_worker_id()}_u{self._runtime_stage_round_idx():05d}"
+            f"_episode0"
+        )
+        self._active_rollout_episode_idx = 0
         if self.snapshot_paths_configured and not self.snapshot_records:
             raise RuntimeError(
                 "trainer.off_policy_snapshots was configured, but no snapshot states were loaded. "
@@ -2963,10 +3745,25 @@ class MAPPOTrainer:
         try:
             if self.snapshot_records:
                 if self.snapshot_rollout_mode in {"autoregressive", "auto", "env"}:
+                    print(
+                        "[Collect] before snapshot_autoregressive_rollout "
+                        f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()}",
+                        flush=True,
+                    )
                     self._collect_snapshot_autoregressive_rollout()
                 else:
+                    print(
+                        "[Collect] before snapshot_rollout "
+                        f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()}",
+                        flush=True,
+                    )
                     self._collect_snapshot_rollout()
             else:
+                print(
+                    "[Collect] before env_rollout "
+                    f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()}",
+                    flush=True,
+                )
                 self._collect_env_rollout()
         finally:
             if hasattr(self, "_last_rollout_stats"):
@@ -2981,9 +3778,12 @@ class MAPPOTrainer:
         done_flag: bool,
     ) -> int:
         added = 0
+        episode_done_seen = False
         for record in records:
             reward = getattr(record, "reward", default_reward)
             done = float(getattr(record, "done", done_flag))
+            if done > 0.0:
+                episode_done_seen = True
             meta = record.metadata or {}
             breakdown = (meta or {}).get("reward_breakdown") or {}
             raw_entry = breakdown.get("raw") or {}
@@ -3011,46 +3811,79 @@ class MAPPOTrainer:
                 )
                 or 0.0
             )
-            paired_comm_reward = float(breakdown.get("paired_comm_reward", 0.0) or 0.0)
+            paired_comm_reward = float(
+                breakdown.get(
+                    "paired_comm_reward",
+                    raw_entry.get("paired_comm_reward", 0.0),
+                )
+                or 0.0
+            )
+            paired_comm_meta = self._source_entry_paired_comm_meta(raw_entry)
+            partial_success_reward = float(
+                breakdown.get(
+                    "partial_success_reward",
+                    raw_entry.get("partial_success_reward", 0.0),
+                )
+                or 0.0
+            )
             collab_reward = float(
                 breakdown.get("collab_reward", raw_entry.get("collab_reward", 0.0))
                 or 0.0
             )
-            breakdown_total_reward = float(
-                raw_entry.get(
-                    "total",
-                    seq_reward
-                    + fmt_reward
-                    + validator_reward
-                    + communication_reward
-                    + collab_reward
-                    + paired_comm_reward,
-                )
-                or (
-                    seq_reward
-                    + fmt_reward
-                    + validator_reward
-                    + communication_reward
-                    + collab_reward
-                    + paired_comm_reward
-                )
+            validator_penalty_value = float(
+                getattr(self, "validator_penalty_value", -0.1)
             )
+            format_penalty_value = float(getattr(self, "format_penalty_value", -0.2))
+            response_action_mode = self._response_action_mode(
+                record,
+                tokenizer=getattr(self, "policy_tokenizer", None),
+            )
+            if response_action_mode == "communication":
+                seq_reward = 0.0
+                validator_reward = 0.0
+                if isinstance(meta, dict):
+                    meta["action_mode"] = response_action_mode
+            elif response_action_mode == "wait":
+                seq_reward = 0.0
+                validator_reward = 0.0
+                communication_reward = 0.0
+                repeat_communication_reward = 0.0
+                forced_communication_reward = 0.0
+                collab_reward = 0.0
+                paired_comm_reward = 0.0
+                paired_comm_meta = {}
+                if isinstance(meta, dict):
+                    meta["action_mode"] = response_action_mode
+            elif response_action_mode in {"mixed", "multi_embodied", "malformed"}:
+                fmt_reward = format_penalty_value
+                validator_reward = 0.0
+                seq_reward = 0.0
+                communication_reward = 0.0
+                repeat_communication_reward = 0.0
+                forced_communication_reward = 0.0
+                collab_reward = 0.0
+                paired_comm_reward = 0.0
+                paired_comm_meta = {}
+                if isinstance(meta, dict):
+                    meta["action_mode"] = response_action_mode
+                    meta["format_fallback_penalty"] = True
+            elif validator_reward < validator_penalty_value:
+                validator_reward = validator_penalty_value
+            if paired_comm_reward < 0.0 and (fmt_reward < 0.0 or validator_reward < 0.0):
+                paired_comm_reward = 0.0
+                paired_comm_meta = {}
+            reward = (
+                seq_reward
+                + fmt_reward
+                + validator_reward
+                + communication_reward
+                + collab_reward
+                + paired_comm_reward
+                + partial_success_reward
+            )
+            breakdown_total_reward = float(reward)
             process_reward = seq_reward
             source_key = self._record_source_key(record)
-            if source_key is not None:
-                self._backfill_existing_transition_from_record(
-                    source_key,
-                    reward=float(reward),
-                    format_reward=fmt_reward,
-                    validator_reward=validator_reward,
-                    sequence_reward=seq_reward,
-                    communication_reward=communication_reward,
-                    repeat_communication_reward=repeat_communication_reward,
-                    forced_communication_reward=forced_communication_reward,
-                    collab_reward=collab_reward,
-                    paired_comm_reward=paired_comm_reward,
-                    breakdown_total_reward=breakdown_total_reward,
-                )
             self.buffer.add(
                 prompt_ids=meta["prompt_ids"],
                 response_ids=meta["response_ids"],
@@ -3073,11 +3906,194 @@ class MAPPOTrainer:
                 forced_communication_reward=forced_communication_reward,
                 collab_reward=collab_reward,
                 paired_comm_reward=paired_comm_reward,
+                partial_success_reward=partial_success_reward,
+                paired_comm_role=paired_comm_meta.get("paired_comm_role"),
+                paired_comm_result=paired_comm_meta.get("paired_comm_result"),
+                paired_comm_target=paired_comm_meta.get("paired_comm_target"),
+                paired_comm_request_action=paired_comm_meta.get(
+                    "paired_comm_request_action"
+                ),
+                paired_comm_request_helpful=paired_comm_meta.get(
+                    "paired_comm_request_helpful"
+                ),
+                paired_comm_consumed_requests=paired_comm_meta.get(
+                    "paired_comm_consumed_requests"
+                ),
+                paired_comm_registered_requests=paired_comm_meta.get(
+                    "paired_comm_registered_requests"
+                ),
                 breakdown_total_reward=breakdown_total_reward,
                 reward_source_key=source_key,
+                action_mode=response_action_mode,
+                rollout_id=getattr(self, "_active_rollout_id", None),
             )
             added += 1
+        if done_flag and added:
+            seen_agents = set()
+            for transition in reversed(self.buffer.storage):
+                if transition.rollout_id != getattr(self, "_active_rollout_id", None):
+                    continue
+                agent_idx = int(transition.agent_index)
+                if agent_idx in seen_agents:
+                    continue
+                transition.done = 1.0
+                seen_agents.add(agent_idx)
+                if len(seen_agents) >= max(1, int(getattr(self, "num_agents", 2))):
+                    break
+            episode_done_seen = True
+        if episode_done_seen:
+            self._active_rollout_episode_idx = int(
+                getattr(self, "_active_rollout_episode_idx", 0)
+            ) + 1
+            self._active_rollout_id = (
+                f"worker{self._runtime_worker_id()}_u{self._runtime_stage_round_idx():05d}"
+                f"_episode{self._active_rollout_episode_idx}"
+            )
         return added
+
+    @classmethod
+    def _response_action_mode(cls, record: Any, tokenizer: Any = None) -> str:
+        response = cls._record_response_text(record, tokenizer=tokenizer)
+        inferred_mode = cls._classify_response_action_mode(response)
+        if inferred_mode == "malformed":
+            return "malformed"
+        if inferred_mode == "wait":
+            return "wait"
+        meta = getattr(record, "metadata", None) or {}
+        mode = str(meta.get("action_mode") or "").strip().lower()
+        if mode:
+            return mode
+        return inferred_mode
+
+    @staticmethod
+    def _record_response_text(record: Any, tokenizer: Any = None) -> str:
+        response = str(getattr(record, "response", "") or "")
+        if response:
+            return response
+        meta = getattr(record, "metadata", None) or {}
+        if isinstance(meta, dict):
+            stored = meta.get("_response_text_for_reward") or meta.get("response_text")
+            if isinstance(stored, str) and stored:
+                return stored
+            response_ids = meta.get("response_ids")
+            if response_ids is not None and tokenizer is not None:
+                try:
+                    values = response_ids.tolist() if hasattr(response_ids, "tolist") else list(response_ids)
+                    return tokenizer.decode(values, skip_special_tokens=True)
+                except Exception:
+                    return ""
+        return ""
+
+    @classmethod
+    def _classify_response_action_mode(cls, response: str) -> str:
+        if cls._response_has_malformed_code_fence_tail(response):
+            return "malformed"
+        action = cls._extract_response_action_text(response)
+        tokens = cls._split_response_action_tokens(action)
+        if not tokens:
+            return "empty"
+        collab_tokens = [token for token in tokens if cls._is_response_collab_action(token)]
+        embodied_tokens = [token for token in tokens if not cls._is_response_collab_action(token)]
+        malformed_tokens = [
+            token
+            for token in tokens
+            if "```" in token
+            or re.search(r"(?i)\bpython\b", token)
+            or cls._response_token_has_trailing_text(token)
+        ]
+        if malformed_tokens:
+            return "malformed"
+        if collab_tokens and embodied_tokens:
+            return "mixed"
+        if len(embodied_tokens) > 1:
+            return "multi_embodied"
+        if collab_tokens:
+            return "communication"
+        if embodied_tokens and embodied_tokens[0].strip().lower().startswith("wait"):
+            return "wait"
+        return "planner_main"
+
+    @staticmethod
+    def _response_has_malformed_code_fence_tail(response: str) -> bool:
+        text = response or ""
+        if "```" not in text:
+            return False
+        action_match = re.search(r"^\s*Action\s*:", text, flags=re.IGNORECASE | re.MULTILINE)
+        if action_match is None:
+            return True
+        after_action = text[action_match.end() :]
+        first_fence = after_action.find("```")
+        if first_fence == -1:
+            return False
+        before_first_fence = after_action[:first_fence].strip()
+        if not before_first_fence:
+            # The action block itself can be fenced; flag only unclosed or extra
+            # answer sections after that fenced action block.
+            closing = after_action.find("```", first_fence + 3)
+            if closing == -1:
+                return True
+            tail = after_action[closing + 3 :].strip()
+            return bool(tail)
+        tail = after_action[first_fence + 3 :].strip()
+        return bool(tail)
+
+    @staticmethod
+    def _extract_response_action_text(response: str) -> str:
+        match = re.search(
+            r"Action\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
+            response or "",
+            flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+        )
+        text = (match.group(1) if match else "").strip()
+        return _strip_action_code_fence(text)
+
+    @staticmethod
+    def _split_response_action_tokens(action: str) -> List[str]:
+        body = re.sub(r"^\s*Action\s*:\s*", "", action or "", flags=re.IGNORECASE)
+        body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", ";")
+        tokens: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for char in body:
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth > 0:
+                depth -= 1
+            if char == ";" and depth == 0:
+                token = "".join(current).strip()
+                if token:
+                    tokens.append(token)
+                current = []
+                continue
+            current.append(char)
+        token = "".join(current).strip()
+        if token:
+            tokens.append(token)
+        return tokens
+
+    @staticmethod
+    def _is_response_collab_action(token: str) -> bool:
+        lowered = (token or "").strip().lower()
+        return lowered.startswith("collab(") or lowered.startswith(
+            ("request(", "seek(", "ack(", "deny(")
+        )
+
+    @staticmethod
+    def _response_token_has_trailing_text(token: str) -> bool:
+        stripped = (token or "").strip()
+        if not stripped:
+            return False
+        depth = 0
+        saw_open = False
+        for index, char in enumerate(stripped):
+            if char == "(":
+                depth += 1
+                saw_open = True
+            elif char == ")" and depth > 0:
+                depth -= 1
+                if saw_open and depth == 0:
+                    return bool(stripped[index + 1 :].strip())
+        return False
 
     @staticmethod
     def _record_source_key(record: Any) -> Optional[Tuple[int, int, int]]:
@@ -3093,38 +4109,6 @@ class MAPPOTrainer:
             return agent_idx, timestep, int(raw_call_index)
         except (TypeError, ValueError):
             return None
-
-    def _backfill_existing_transition_from_record(
-        self,
-        source_key: Tuple[int, int, int],
-        *,
-        reward: float,
-        format_reward: float,
-        validator_reward: float,
-        sequence_reward: float,
-        communication_reward: float,
-        repeat_communication_reward: float,
-        forced_communication_reward: float,
-        collab_reward: float,
-        paired_comm_reward: float,
-        breakdown_total_reward: float,
-    ) -> None:
-        existing = self.buffer.get_by_source_key(source_key)
-        if existing is None:
-            return
-        if sequence_reward == 0.0 and validator_reward == 0.0 and reward == 0.0:
-            return
-        existing.reward = float(reward)
-        existing.format_reward = float(format_reward)
-        existing.validator_reward = float(validator_reward)
-        existing.process_reward = float(sequence_reward)
-        existing.sequence_reward = float(sequence_reward)
-        existing.communication_reward = float(communication_reward)
-        existing.repeat_communication_reward = float(repeat_communication_reward)
-        existing.forced_communication_reward = float(forced_communication_reward)
-        existing.collab_reward = float(collab_reward)
-        existing.paired_comm_reward = float(paired_comm_reward)
-        existing.breakdown_total_reward = float(breakdown_total_reward)
 
     def _collect_env_rollout(self):
         if self.session is None:
@@ -3157,8 +4141,23 @@ class MAPPOTrainer:
                     )
                     self._record_cap_warned = True
                 records = records[: self.max_records_per_step]
+            self._apply_process_reward_source_updates(step_result.process_reward)
             if partial_success:
-                self._apply_partial_success_reward(records)
+                executed_sources = getattr(step_result, "executed_action_sources", None)
+                if bool(getattr(self, "partial_success_shared_terminal_reward", False)):
+                    self._apply_shared_partial_success_reward(records, executed_sources)
+                    reward_for_rollout = step_result.reward
+                elif self._apply_partial_success_reward_to_sources(executed_sources):
+                    reward_for_rollout = step_result.reward
+                else:
+                    target_record = self._select_partial_success_record(
+                        records, allow_fallback=False
+                    )
+                    if target_record is not None:
+                        self._apply_partial_success_reward(records)
+                    else:
+                        self._apply_partial_success_reward_to_buffer()
+                        reward_for_rollout = step_result.reward
             added = self._append_policy_records(
                 records, reward_for_rollout, done_for_rollout
             )
@@ -3220,8 +4219,23 @@ class MAPPOTrainer:
                     )
                     self._record_cap_warned = True
                 records = records[: self.max_records_per_step]
+            self._apply_process_reward_source_updates(step_result.process_reward)
             if partial_success:
-                self._apply_partial_success_reward(records)
+                executed_sources = getattr(step_result, "executed_action_sources", None)
+                if bool(getattr(self, "partial_success_shared_terminal_reward", False)):
+                    self._apply_shared_partial_success_reward(records, executed_sources)
+                    reward_for_rollout = step_result.reward
+                elif self._apply_partial_success_reward_to_sources(executed_sources):
+                    reward_for_rollout = step_result.reward
+                else:
+                    target_record = self._select_partial_success_record(
+                        records, allow_fallback=False
+                    )
+                    if target_record is not None:
+                        self._apply_partial_success_reward(records)
+                    else:
+                        self._apply_partial_success_reward_to_buffer()
+                        reward_for_rollout = step_result.reward
             added = self._append_policy_records(
                 records, reward_for_rollout, done_for_rollout
             )
@@ -3241,13 +4255,31 @@ class MAPPOTrainer:
             if self.accelerator.is_main_process:
                 self.accelerator.print("[MAPPO] Snapshot dataset exhausted.")
             return
+        print(
+            "[Collect] snapshot_autoregressive before load_snapshot "
+            f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()}",
+            flush=True,
+        )
         self.session.load_snapshot(snapshot_record.snapshot)
+        print(
+            "[Collect] snapshot_autoregressive after load_snapshot "
+            f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()} "
+            f"timestep={getattr(self.session.env.state, 'timestep', None)}",
+            flush=True,
+        )
         while True:
             if self.rollout_horizon is not None:
                 snapshot_ts = getattr(self.session.env.state, "timestep", None)
                 if snapshot_ts is not None and int(snapshot_ts) >= self.rollout_horizon:
                     break
-            if self.session.env.is_done():
+            env_done = self.session.env.is_done()
+            print(
+                "[Collect] snapshot_autoregressive before step "
+                f"worker={self._runtime_worker_id()} update={self._runtime_stage_round_idx()} "
+                f"timestep={getattr(self.session.env.state, 'timestep', None)} done={env_done}",
+                flush=True,
+            )
+            if env_done:
                 break
             step_result = self.session.step()
             partial_success = self._partial_success_reached()
@@ -3275,8 +4307,23 @@ class MAPPOTrainer:
                     )
                     self._record_cap_warned = True
                 records = records[: self.max_records_per_step]
+            self._apply_process_reward_source_updates(step_result.process_reward)
             if partial_success:
-                self._apply_partial_success_reward(records)
+                executed_sources = getattr(step_result, "executed_action_sources", None)
+                if bool(getattr(self, "partial_success_shared_terminal_reward", False)):
+                    self._apply_shared_partial_success_reward(records, executed_sources)
+                    reward_for_rollout = step_result.reward
+                elif self._apply_partial_success_reward_to_sources(executed_sources):
+                    reward_for_rollout = step_result.reward
+                else:
+                    target_record = self._select_partial_success_record(
+                        records, allow_fallback=False
+                    )
+                    if target_record is not None:
+                        self._apply_partial_success_reward(records)
+                    else:
+                        self._apply_partial_success_reward_to_buffer()
+                        reward_for_rollout = step_result.reward
             self._append_policy_records(records, reward_for_rollout, done_for_rollout)
             if done_for_rollout:
                 break
@@ -3543,6 +4590,60 @@ class MAPPOTrainer:
             flush=True,
         )
 
+    @staticmethod
+    def _transition_has_reward_signal(transition: TextTransition) -> bool:
+        fields = (
+            "reward",
+            "partial_success_reward",
+            "sequence_reward",
+            "communication_reward",
+            "repeat_communication_reward",
+            "forced_communication_reward",
+            "collab_reward",
+            "paired_comm_reward",
+            "format_reward",
+            "validator_reward",
+        )
+        for field in fields:
+            if abs(float(getattr(transition, field, 0.0) or 0.0)) > 1e-9:
+                return True
+        return False
+
+    def _policy_loss_active_mask(
+        self, transitions: List[TextTransition]
+    ) -> torch.Tensor:
+        allowed_modes = getattr(self, "policy_train_action_modes", None)
+        if allowed_modes is None:
+            return torch.ones(len(transitions), dtype=torch.bool)
+        include_rewarded = bool(
+            getattr(self, "policy_include_rewarded_filtered_actions", True)
+        )
+        mask = []
+        for transition in transitions:
+            action_mode = str(transition.action_mode or "").strip().lower()
+            active = action_mode in allowed_modes
+            if not active and include_rewarded:
+                active = self._transition_has_reward_signal(transition)
+            mask.append(bool(active))
+        return torch.tensor(mask, dtype=torch.bool)
+
+    def _any_rank_has_active_policy_minibatch(self, active_minibatch: bool) -> bool:
+        active_flag = torch.tensor(
+            1.0 if active_minibatch else 0.0,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        active_sum = None
+        try:
+            if hasattr(self.accelerator, "reduce"):
+                active_sum = self.accelerator.reduce(active_flag, reduction="sum")
+        except Exception:
+            active_sum = None
+        if active_sum is None:
+            gathered_active = self.accelerator.gather(active_flag)
+            active_sum = gathered_active.sum()
+        return float(active_sum.item()) > 0.0
+
     # ------------------------------------------------------------------
     def update_policy(self, transitions: List[TextTransition]):
         assert self.text_policy is not None
@@ -3579,12 +4680,19 @@ class MAPPOTrainer:
         advantages, returns = self.compute_advantages(transitions)
         raw_advantages = advantages.clone()
         returns_stats = returns.clone()
+        policy_active_mask_cpu = self._policy_loss_active_mask(transitions)
         if advantages.numel() > 1:
-            adv_std = advantages.std(unbiased=False).clamp(min=1e-6)
-            advantages = (advantages - advantages.mean()) / adv_std
+            active_advantages = advantages[policy_active_mask_cpu]
+            if active_advantages.numel() > 1:
+                adv_std = active_advantages.std(unbiased=False).clamp(min=1e-6)
+                active_mean = active_advantages.mean()
+                advantages = (advantages - active_mean) / adv_std
+            else:
+                advantages = advantages if active_advantages.numel() else advantages * 0.0
         else:
             advantages = advantages - advantages.mean()
         advantages = advantages.to(self.device)
+        policy_active_mask = policy_active_mask_cpu.to(self.device)
         returns = returns.to(self.device)
 
         batch_size = max(1, self.train_batch_size)
@@ -3669,6 +4777,7 @@ class MAPPOTrainer:
                 batch_old_values = old_values[batch_indices]
                 batch_adv = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
+                batch_policy_active_mask = policy_active_mask[batch_indices]
 
                 policy_forward_ctx = (
                     nullcontext() if not stop_policy_updates else torch.no_grad()
@@ -3705,6 +4814,8 @@ class MAPPOTrainer:
                     zip(token_log_probs, batch_old_token_log_probs)
                 ):
                     if new_lp.numel() == 0:
+                        continue
+                    if not bool(batch_policy_active_mask[sample_idx].item()):
                         continue
                     if old_lp.numel() != new_lp.numel():
                         if old_lp.numel() == 0:
@@ -3746,18 +4857,27 @@ class MAPPOTrainer:
                 policy_loss_raw = (
                     torch.stack(token_policy_loss_parts).mean()
                     if token_policy_loss_parts
-                    else torch.zeros((), dtype=torch.float32, device=self.device)
+                    else entropies.sum() * 0.0
+                )
+                active_minibatch_global = self._any_rank_has_active_policy_minibatch(
+                    bool(token_policy_loss_parts)
                 )
                 # PPO-style non-negative KL approximation under the rollout policy.
                 approx_kl = (
                     ((token_ratios - 1.0) - token_logratio).mean().clamp_min(0.0)
                     if token_logratio.numel() > 0
-                    else torch.zeros((), dtype=torch.float32, device=self.device)
+                    else entropies.sum() * 0.0
                 )
                 token_approx_kl = approx_kl
                 kl_penalty_raw = approx_kl * self.kl_penalty_coef
-                entropy_loss_raw = -entropies.mean()
-                if stop_policy_updates:
+                active_entropies = entropies[batch_policy_active_mask]
+                entropy_mean_raw = (
+                    active_entropies.mean()
+                    if active_entropies.numel() > 0
+                    else entropies.sum() * 0.0
+                )
+                entropy_loss_raw = -entropy_mean_raw
+                if stop_policy_updates or not active_minibatch_global:
                     policy_loss = torch.zeros_like(policy_loss_raw)
                     entropy_loss = torch.zeros_like(entropy_loss_raw)
                     kl_penalty = torch.zeros_like(kl_penalty_raw)
@@ -3765,7 +4885,7 @@ class MAPPOTrainer:
                     policy_loss = policy_loss_raw
                     entropy_loss = entropy_loss_raw
                     kl_penalty = kl_penalty_raw
-                if not stop_policy_updates:
+                if (not stop_policy_updates) and active_minibatch_global:
                     policy_objective = (
                         policy_loss_raw
                         + self.entropy_coef * entropy_loss_raw
@@ -3896,6 +5016,8 @@ class MAPPOTrainer:
                     ):
                         if new_lp.numel() == 0:
                             continue
+                        if not bool(batch_policy_active_mask[sample_idx].item()):
+                            continue
                         if old_lp.numel() != new_lp.numel():
                             if old_lp.numel() == 0:
                                 old_lp = torch.zeros_like(new_lp)
@@ -3936,28 +5058,38 @@ class MAPPOTrainer:
                     policy_loss_release = (
                         torch.stack(token_policy_loss_parts_release).mean()
                         if token_policy_loss_parts_release
-                        else torch.zeros((), dtype=torch.float32, device=self.device)
+                        else entropies_release.sum() * 0.0
+                    )
+                    active_release_global = self._any_rank_has_active_policy_minibatch(
+                        bool(token_policy_loss_parts_release)
                     )
                     approx_kl_release = (
                         ((token_ratios_release - 1.0) - token_logratio_release)
                         .mean()
                         .clamp_min(0.0)
                         if token_logratio_release.numel() > 0
-                        else torch.zeros((), dtype=torch.float32, device=self.device)
+                        else entropies_release.sum() * 0.0
                     )
-                    entropy_loss_release = -entropies_release.to(
+                    entropies_release = entropies_release.to(
                         self.device, dtype=torch.float32
-                    ).mean()
+                    )
+                    active_entropies_release = entropies_release[batch_policy_active_mask]
+                    entropy_loss_release = -(
+                        active_entropies_release.mean()
+                        if active_entropies_release.numel() > 0
+                        else entropies_release.sum() * 0.0
+                    )
                     kl_penalty_release = approx_kl_release * self.kl_penalty_coef
                     policy_objective_release = (
                         policy_loss_release
                         + self.entropy_coef * entropy_loss_release
                         + kl_penalty_release
                     )
-                    self.accelerator.backward(
-                        policy_objective_release
-                        / float(self.gradient_accumulation_steps)
-                    )
+                    if active_release_global:
+                        self.accelerator.backward(
+                            policy_objective_release
+                            / float(self.gradient_accumulation_steps)
+                        )
                     policy_loss_raw = policy_loss_release
                     policy_loss = policy_loss_release
                     entropy_loss_raw = entropy_loss_release
@@ -3967,7 +5099,7 @@ class MAPPOTrainer:
                     approx_kl = approx_kl_release
                     token_approx_kl = approx_kl_release
                     token_ratios = token_ratios_release
-                    entropies = entropies_release.to(self.device, dtype=torch.float32)
+                    entropies = entropies_release
                     loss = (
                         policy_loss
                         + self.value_coef * value_loss
@@ -4680,6 +5812,11 @@ class MAPPOTrainer:
             "critic_adapter_param_delta",
             "value_head_grad_norm",
             "value_head_param_delta",
+            "success_replay/bc_transitions",
+            "success_replay/bc_active_transitions",
+            "success_replay/bc_loss",
+            "success_replay/bc_weight",
+            "success_replay/bc_optimizer_steps",
         ]
         packed = torch.tensor(
             [weight] + [float(loss_dict.get(name, 0.0)) * weight for name in metric_names],
@@ -4727,7 +5864,9 @@ class MAPPOTrainer:
             "actor0_grad_norm,actor0_param_delta,"
             "actor1_grad_norm,actor1_param_delta,"
             "critic_adapter_grad_norm,critic_adapter_param_delta,"
-            "value_head_grad_norm,value_head_param_delta"
+            "value_head_grad_norm,value_head_param_delta,"
+            "success_replay_bc_transitions,success_replay_bc_active_transitions,"
+            "success_replay_bc_loss,success_replay_bc_weight,success_replay_bc_optimizer_steps"
         )
         row_idx, _ = self._prepare_csv_log(path, header)
         with path.open("a", encoding="utf-8") as handle:
@@ -4757,7 +5896,12 @@ class MAPPOTrainer:
                 f"{aggregated_metrics.get('actor0_grad_norm', 0.0)},{aggregated_metrics.get('actor0_param_delta', 0.0)},"
                 f"{aggregated_metrics.get('actor1_grad_norm', 0.0)},{aggregated_metrics.get('actor1_param_delta', 0.0)},"
                 f"{aggregated_metrics.get('critic_adapter_grad_norm', 0.0)},{aggregated_metrics.get('critic_adapter_param_delta', 0.0)},"
-                f"{aggregated_metrics.get('value_head_grad_norm', 0.0)},{aggregated_metrics.get('value_head_param_delta', 0.0)}\n"
+                f"{aggregated_metrics.get('value_head_grad_norm', 0.0)},{aggregated_metrics.get('value_head_param_delta', 0.0)},"
+                f"{aggregated_metrics.get('success_replay/bc_transitions', 0.0)},"
+                f"{aggregated_metrics.get('success_replay/bc_active_transitions', 0.0)},"
+                f"{aggregated_metrics.get('success_replay/bc_loss', 0.0)},"
+                f"{aggregated_metrics.get('success_replay/bc_weight', 0.0)},"
+                f"{aggregated_metrics.get('success_replay/bc_optimizer_steps', 0.0)}\n"
             )
 
     def log_performance(self, update_idx: int):
@@ -4975,13 +6119,16 @@ class MAPPOTrainer:
                 shutil.rmtree(nested_dir)
             tokenizer.save_pretrained(out_dir)
 
+        update_export_dir = self.export_latest_dir / f"u{int(update_idx):05d}"
+        update_export_dir.mkdir(parents=True, exist_ok=True)
+
         payload: Dict[str, Any] = {
             "model_path": str(self.model_path),
             "lora_path": None,
             "update_idx": update_idx,
         }
 
-        value_head_path = self.export_latest_dir / "value_head.pt"
+        value_head_path = update_export_dir / "value_head.pt"
         torch.save(
             {
                 "state_dict": unwrapped.value_head.state_dict(),
@@ -4995,7 +6142,7 @@ class MAPPOTrainer:
             # Export per-agent adapters so the sampler can load different models for each agent.
             exported_actor: Dict[str, Dict[str, Any]] = {}
             for idx, spec in sorted(self.actor_adapters.items()):
-                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}"
+                adapter_dir = update_export_dir / f"adapter_{_safe_name(spec.name)}"
                 self.accelerator.print(
                     f"[Export] Saving adapter[{idx}:{spec.name}] -> {adapter_dir}"
                 )
@@ -5009,7 +6156,7 @@ class MAPPOTrainer:
 
             if self.critic_adapter is not None:
                 spec = self.critic_adapter
-                adapter_dir = self.export_latest_dir / f"adapter_{_safe_name(spec.name)}"
+                adapter_dir = update_export_dir / f"adapter_{_safe_name(spec.name)}"
                 self.accelerator.print(
                     f"[Export] Saving adapter[critic:{spec.name}] -> {adapter_dir}"
                 )
@@ -5021,7 +6168,7 @@ class MAPPOTrainer:
 
             # Backward-compat: if this is a single-adapter run, keep legacy lora_path field.
             if not self.actor_adapters and self.critic_adapter is None:
-                adapter_dir = self.export_latest_dir / "adapter"
+                adapter_dir = update_export_dir / "adapter"
                 self.accelerator.print(f"[Export] Saving adapter -> {adapter_dir}")
                 active = getattr(hf_model, "active_adapter", "default")
                 if isinstance(active, (list, tuple)):
@@ -5031,7 +6178,7 @@ class MAPPOTrainer:
                 _save_adapter_snapshot(active_name, adapter_dir)
                 payload["lora_path"] = str(adapter_dir)
         else:
-            model_dir = self.export_latest_dir / "model"
+            model_dir = update_export_dir / "model"
             self.accelerator.print(f"[Export] Saving full model -> {model_dir}")
             if model_dir.exists():
                 shutil.rmtree(model_dir)
@@ -5071,7 +6218,23 @@ class MAPPOTrainer:
             "forced_communication_reward": t.forced_communication_reward,
             "collab_reward": t.collab_reward,
             "paired_comm_reward": t.paired_comm_reward,
+            "partial_success_reward": t.partial_success_reward,
+            "paired_comm_role": t.paired_comm_role,
+            "paired_comm_result": t.paired_comm_result,
+            "paired_comm_target": t.paired_comm_target,
+            "paired_comm_request_action": t.paired_comm_request_action,
+            "paired_comm_request_helpful": t.paired_comm_request_helpful,
+            "paired_comm_consumed_requests": copy.deepcopy(
+                t.paired_comm_consumed_requests
+            ),
+            "paired_comm_registered_requests": copy.deepcopy(
+                t.paired_comm_registered_requests
+            ),
             "breakdown_total_reward": t.breakdown_total_reward,
+            "reward_source_key": t.reward_source_key,
+            "action_mode": t.action_mode,
+            "rollout_id": t.rollout_id,
+            "rollout_file": t.rollout_file,
         }
 
     def _dict_to_transition(self, d: Dict[str, Any]) -> TextTransition:
@@ -5105,11 +6268,61 @@ class MAPPOTrainer:
             ),
             collab_reward=float(d.get("collab_reward", 0.0)),
             paired_comm_reward=float(d.get("paired_comm_reward", 0.0)),
+            partial_success_reward=float(d.get("partial_success_reward", 0.0)),
+            paired_comm_role=(
+                str(d["paired_comm_role"])
+                if d.get("paired_comm_role") is not None
+                else None
+            ),
+            paired_comm_result=(
+                str(d["paired_comm_result"])
+                if d.get("paired_comm_result") is not None
+                else None
+            ),
+            paired_comm_target=(
+                int(d["paired_comm_target"])
+                if d.get("paired_comm_target") is not None
+                else None
+            ),
+            paired_comm_request_action=(
+                str(d["paired_comm_request_action"])
+                if d.get("paired_comm_request_action") is not None
+                else None
+            ),
+            paired_comm_request_helpful=(
+                bool(d["paired_comm_request_helpful"])
+                if d.get("paired_comm_request_helpful") is not None
+                else None
+            ),
+            paired_comm_consumed_requests=copy.deepcopy(
+                d.get("paired_comm_consumed_requests")
+            ),
+            paired_comm_registered_requests=copy.deepcopy(
+                d.get("paired_comm_registered_requests")
+            ),
             breakdown_total_reward=float(
                 d.get(
                     "breakdown_total_reward",
                     d.get("raw_total_reward", 0.0),  # legacy fallback if present
                 )
+            ),
+            reward_source_key=tuple(d["reward_source_key"])
+            if d.get("reward_source_key") is not None
+            else None,
+            action_mode=(
+                str(d["action_mode"])
+                if d.get("action_mode") is not None
+                else None
+            ),
+            rollout_id=(
+                str(d["rollout_id"])
+                if d.get("rollout_id") is not None
+                else None
+            ),
+            rollout_file=(
+                str(d["rollout_file"])
+                if d.get("rollout_file") is not None
+                else None
             ),
         )
 
@@ -5120,6 +6333,175 @@ class MAPPOTrainer:
         payload = [self._transition_to_dict(t) for t in transitions]
         torch.save(payload, path)
         self._save_rollout_archive(payload, update_idx)
+        self._maybe_save_success_replay(payload, update_idx)
+
+    def _success_replay_payload_has_success(
+        self, payload: List[Dict[str, Any]]
+    ) -> bool:
+        threshold = abs(float(getattr(self, "success_replay_min_partial_success_reward", 20.0)))
+        threshold = max(1e-9, threshold)
+        for item in payload:
+            try:
+                partial = float(item.get("partial_success_reward", 0.0) or 0.0)
+                reward = float(item.get("reward", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if partial >= threshold or reward >= threshold:
+                return True
+        return False
+
+    @staticmethod
+    def _success_replay_file_update_idx(path: Path) -> Optional[int]:
+        match = re.search(r"_u(\d+)_", path.name)
+        if match:
+            return int(match.group(1))
+        match = re.search(r"_u(\d+)\.pt$", path.name)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _success_replay_files(self) -> List[Path]:
+        replay_dir = getattr(self, "success_replay_dir", None)
+        if replay_dir is None:
+            return []
+        try:
+            files = [path for path in Path(replay_dir).glob("success_rank*_u*.pt") if path.is_file()]
+        except FileNotFoundError:
+            return []
+        def _sort_key(path: Path) -> Tuple[int, float, str]:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            return (
+                self._success_replay_file_update_idx(path) or -1,
+                mtime,
+                path.name,
+            )
+        return sorted(
+            files,
+            key=_sort_key,
+        )
+
+    def _prune_success_replay(self) -> None:
+        if not bool(getattr(self, "success_replay_enabled", False)):
+            return
+        max_episodes = int(getattr(self, "success_replay_max_episodes", 0))
+        if max_episodes <= 0:
+            return
+        files = self._success_replay_files()
+        overflow = len(files) - max_episodes
+        if overflow <= 0:
+            return
+        for path in files[:overflow]:
+            try:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".json").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _maybe_save_success_replay(
+        self, payload: List[Dict[str, Any]], update_idx: int
+    ) -> None:
+        if not bool(getattr(self, "success_replay_enabled", False)):
+            return
+        if int(getattr(self, "success_replay_max_episodes", 0)) <= 0:
+            return
+        if not payload:
+            return
+        replay_dir = Path(getattr(self, "success_replay_dir", self.rollout_dir / "success_replay"))
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        worker_id = self._runtime_worker_id()
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for idx, item in enumerate(payload):
+            rollout_id = str(item.get("rollout_id") or f"rank{worker_id}_u{int(update_idx):05d}")
+            grouped.setdefault(rollout_id, []).append(item)
+        saved_any = False
+        threshold = max(
+            1e-9,
+            abs(float(getattr(self, "success_replay_min_partial_success_reward", 20.0))),
+        )
+        for episode_idx, (rollout_id, episode_payload) in enumerate(sorted(grouped.items())):
+            if not self._success_replay_payload_has_success(episode_payload):
+                continue
+            timestamp_ms = int(time.time() * 1000)
+            unique_seed = (
+                f"{socket.gethostname()}:{os.getpid()}:{timestamp_ms}:"
+                f"{worker_id}:{update_idx}:{episode_idx}:{rollout_id}:{len(episode_payload)}"
+            )
+            suffix = hashlib.sha1(unique_seed.encode("utf-8")).hexdigest()[:8]
+            path = (
+                replay_dir
+                / f"success_rank{worker_id}_u{int(update_idx):05d}_{timestamp_ms}_{suffix}.pt"
+            )
+            torch.save(episode_payload, path)
+            partial_count = sum(
+                1
+                for item in episode_payload
+                if float(item.get("partial_success_reward", 0.0) or 0.0) >= threshold
+            )
+            meta = {
+                "update_idx": int(update_idx),
+                "worker_id": int(worker_id),
+                "rollout_id": rollout_id,
+                "num_transitions": len(episode_payload),
+                "partial_success_transition_count": int(partial_count),
+                "timestamp_ms": timestamp_ms,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "path": str(path),
+            }
+            path.with_suffix(".json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            saved_any = True
+        if saved_any:
+            self._prune_success_replay()
+
+    def _load_success_replay_transitions(
+        self, max_update_exclusive: int
+    ) -> List[TextTransition]:
+        if not bool(getattr(self, "success_replay_enabled", False)):
+            return []
+        sample_episodes = int(getattr(self, "success_replay_sample_episodes", 0))
+        if sample_episodes <= 0:
+            return []
+        replay_files = []
+        for path in self._success_replay_files():
+            update_idx = self._success_replay_file_update_idx(path)
+            if update_idx is None:
+                continue
+            if int(update_idx) >= int(max_update_exclusive):
+                continue
+            replay_files.append(path)
+        if not replay_files:
+            return []
+        selected = replay_files[-sample_episodes:]
+        transitions: List[TextTransition] = []
+        for path in selected:
+            try:
+                data = torch.load(path, map_location="cpu")
+            except Exception as exc:
+                self.accelerator.print(
+                    f"[MAPPO] skip unreadable success replay {path}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            file_rollout_id = path.stem
+            for item in data:
+                transition = self._dict_to_transition(item)
+                if transition.rollout_id is None:
+                    transition.rollout_id = file_rollout_id
+                if transition.rollout_file is None:
+                    transition.rollout_file = str(path)
+                transitions.append(transition)
+        if transitions:
+            self.accelerator.print(
+                "[MAPPO] loaded success replay "
+                f"episodes={len(selected)} transitions={len(transitions)} "
+                f"max_update_exclusive={int(max_update_exclusive)}"
+            )
+        return transitions
 
     def _save_rollout_archive(self, payload: List[Dict[str, Any]], update_idx: int) -> None:
         phase = self._runtime_stage_phase("collect")
@@ -5211,6 +6593,7 @@ class MAPPOTrainer:
         return True
 
     def load_rollouts(self) -> List[TextTransition]:
+        self._pending_success_replay_transitions = []
         print(
             "[MAPPO] load_rollouts before barrier "
             f"rank={self.accelerator.process_index}",
@@ -5249,8 +6632,76 @@ class MAPPOTrainer:
         transitions: List[TextTransition] = []
         for p in sorted(selected):
             data = torch.load(p, map_location="cpu")
-            transitions.extend([self._dict_to_transition(d) for d in data])
+            parsed = re.search(r"rollout_rank(\d+)_u(\d+)\.pt$", p.name)
+            if parsed:
+                file_rollout_id = f"rank{int(parsed.group(1))}_u{int(parsed.group(2)):05d}"
+            else:
+                file_rollout_id = p.stem
+            for d in data:
+                transition = self._dict_to_transition(d)
+                if transition.rollout_id is None:
+                    transition.rollout_id = file_rollout_id
+                if transition.rollout_file is None:
+                    transition.rollout_file = str(p)
+                transitions.append(transition)
+        replay_transitions = self._load_success_replay_transitions(max_u)
+        if replay_transitions:
+            replay_mode = str(
+                getattr(self, "success_replay_mode", "append") or "append"
+            ).strip().lower()
+            if replay_mode in {"append", "mix", "mixed", "baseline"}:
+                current_count = len(transitions)
+                transitions.extend(replay_transitions)
+                self.accelerator.print(
+                    "[MAPPO] appended success replay "
+                    f"current_transitions={current_count} "
+                    f"replay_transitions={len(replay_transitions)} "
+                    f"total={len(transitions)}"
+                )
+            elif replay_mode in {"elite_bc", "bc", "imitation", "sft"}:
+                self._pending_success_replay_transitions = replay_transitions
+                self.accelerator.print(
+                    "[MAPPO] held success replay for auxiliary BC "
+                    f"current_transitions={len(transitions)} "
+                    f"replay_transitions={len(replay_transitions)} "
+                    f"mode={replay_mode}"
+                )
+            elif replay_mode in {"off", "none", "disabled"}:
+                self.accelerator.print(
+                    "[MAPPO] loaded success replay but mode is disabled "
+                    f"replay_transitions={len(replay_transitions)}"
+                )
+            else:
+                raise ValueError(
+                    "Unsupported success_replay.mode="
+                    f"{replay_mode!r}; expected append|elite_bc|off."
+                )
         return transitions
+
+    def _shard_aux_transitions_for_rank(
+        self, transitions: List[TextTransition]
+    ) -> List[TextTransition]:
+        world_size = max(1, int(self.accelerator.num_processes))
+        rank = int(self.accelerator.process_index)
+        if world_size <= 1 or not transitions:
+            return list(transitions)
+
+        total = len(transitions)
+        per_rank = int(math.ceil(total / float(world_size)))
+        padded_size = per_rank * world_size
+        indices = list(range(total))
+        if padded_size > total:
+            indices.extend(indices[: padded_size - total])
+
+        start = rank * per_rank
+        end = start + per_rank
+        shard = [transitions[idx] for idx in indices[start:end]]
+        self.accelerator.print(
+            "[TrainOnly] auxiliary replay shard "
+            f"rank={rank}/{world_size} global={total} local={len(shard)} "
+            f"padded={padded_size}"
+        )
+        return shard
 
     def _shard_transitions_for_rank(
         self, transitions: List[TextTransition]

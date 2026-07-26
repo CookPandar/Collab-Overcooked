@@ -1,0 +1,46 @@
+field_groups:
+  basic:
+    - name: title
+      description: "Paper or framework title."
+      detail_level: "brief"
+    - name: venue_status
+      description: "Whether the item is confirmed as ICML 2026, and by which source."
+      detail_level: "moderate"
+    - name: code_repository
+      description: "Official or author-provided repository URL; mark if no public repo was found."
+      detail_level: "moderate"
+  method:
+    - name: method_summary
+      description: "Core technical idea and the MAS design object being optimized."
+      detail_level: "detailed"
+    - name: collaborative_training
+      description: "Whether multiple agents/policies/prompts are jointly or co-adaptively trained/optimized."
+      detail_level: "detailed"
+    - name: algorithm
+      description: "Named algorithm, optimizer, or search strategy such as GRPO, LinUCB, GAT surrogate, evolutionary beam search, or contrastive optimization."
+      detail_level: "detailed"
+  benchmark:
+    - name: benchmarks
+      description: "Benchmarks, datasets, scenarios, metrics, and train/test split if available."
+      detail_level: "detailed"
+    - name: public_vs_private
+      description: "Whether the benchmark/data is public, partially public, or private/industrial."
+      detail_level: "moderate"
+  training_compute:
+    - name: training_device
+      description: "GPU/NPU/API requirements and whether hardware is explicitly stated."
+      detail_level: "detailed"
+    - name: batch_size
+      description: "Global batch, micro batch, rollout/group size, sample pool, validation budget, or API-call budget depending on method type."
+      detail_level: "detailed"
+    - name: model_backbones
+      description: "Policy/orchestrator/sub-agent/optimizer/evaluator model names."
+      detail_level: "moderate"
+  uncertainty:
+    - name: uncertain
+      description: "Unclear, missing, or weakly sourced fields that require follow-up."
+      detail_level: "brief"
+uncertain:
+  - "Exact official ICML page for MASPO and MASPOB if needed beyond author repository/arXiv source."
+  - "FlexMARL public code repository: no public repo found in inspected arXiv source."
+  - "ProtocolBench repository naming redirects/README differ from arXiv comment URL, but the arXiv comment links to ulab-uiuc/AgentProtocols."

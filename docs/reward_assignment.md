@@ -259,11 +259,14 @@ trainer:
     utensil: oven0
     target: baked_bell_pepper
     terminal_reward: 20.0
+    shared_terminal_reward: false
 ```
 
 For `oven_cooking`, the rollout terminates early when the target item is cooking
 in the configured utensil. If the environment has not already returned done, the
 last policy record receives `terminal_reward`, default `20.0`.
+When `shared_terminal_reward: true`, the same terminal reward is applied once to
+each agent's latest transition in the active rollout.
 
 This is a task-level terminal/partial-success reward. It is not the same as
 `sequence_reward`; a rollout can reach partial success through environment

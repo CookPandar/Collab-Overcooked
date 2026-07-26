@@ -151,6 +151,8 @@ class LLMAgents(LLMPair):
         self._communication_turn_counter = 0
         self._communication_turn_timestamp = None
         self._collab_ack_consumed = False
+        self._llm_call_index_timestamp = None
+        self._next_llm_call_index = 0
         if history_window is None:
             window_value = 0
         else:
@@ -180,11 +182,15 @@ class LLMAgents(LLMPair):
             "current_ml_action_steps": self.current_ml_action_steps,
             "active_action_source": copy.deepcopy(self._active_action_source),
             "current_action_source": copy.deepcopy(self._current_action_source),
-            "locked_action_source": copy.deepcopy(self._locked_action_source),
+            "locked_action_source": copy.deepcopy(
+                getattr(self, "_locked_action_source", None)
+            ),
             "time_to_wait": self.time_to_wait,
             "action_wait_queue": list(self.action_wait_parse.queue),
             "pending_action_sources": list(self._pending_action_sources.queue),
             "failed_history": copy.deepcopy(self.failed_history),
+            "llm_call_index_timestamp": getattr(self, "_llm_call_index_timestamp", None),
+            "next_llm_call_index": int(getattr(self, "_next_llm_call_index", 0) or 0),
         }
 
     def import_runtime_state(self, data: Optional[Dict[str, Any]]):
@@ -242,6 +248,13 @@ class LLMAgents(LLMPair):
         failed_history = data.get("failed_history")
         if isinstance(failed_history, list):
             self.failed_history = copy.deepcopy(failed_history)
+        index_timestamp = data.get("llm_call_index_timestamp")
+        self._llm_call_index_timestamp = (
+            int(index_timestamp)
+            if isinstance(index_timestamp, (int, float))
+            else None
+        )
+        self._next_llm_call_index = int(data.get("next_llm_call_index", 0) or 0)
 
     def set_mdp(self, mdp: OvercookedGridworld):
         self.mdp = mdp
@@ -394,6 +407,8 @@ class LLMAgents(LLMPair):
         self._active_action_source = None
         self.last_executed_action_source = None
         self._clear_pending_action_sources()
+        self._llm_call_index_timestamp = None
+        self._next_llm_call_index = 0
 
     def set_agent_index(self, agent_index):
         self.agent_index = agent_index
@@ -1069,6 +1084,19 @@ class LLMAgents(LLMPair):
             "malformed_tokens": malformed_tokens,
         }
 
+    @staticmethod
+    def _has_nonempty_tail_after_fenced_response(response: str) -> bool:
+        """A complete fenced reply must not be followed by extra narration."""
+        if not isinstance(response, str):
+            return False
+        stripped = response.strip()
+        if not stripped.startswith("```"):
+            return False
+        closing = stripped.find("```", 3)
+        if closing == -1:
+            return True
+        return bool(stripped[closing + 3 :].strip())
+
     def _strip_code_fences(self, text: str) -> str:
         if not isinstance(text, str):
             return ""
@@ -1076,8 +1104,10 @@ class LLMAgents(LLMPair):
         if not stripped.startswith("```"):
             return stripped
         content = stripped[3:]
-        closing = content.rfind("```")
+        closing = content.find("```")
+        tail = ""
         if closing != -1:
+            tail = content[closing + 3 :].strip()
             content = content[:closing]
         content = content.strip()
         if "\n" in content:
@@ -1085,10 +1115,10 @@ class LLMAgents(LLMPair):
             # Drop a markdown fence language tag, but keep a one-line action.
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]*", first_line.strip()):
                 content = remainder
-        return content.strip()
-        if closing != -1:
-            remainder = remainder[:closing]
-        return remainder.strip()
+        content = content.strip()
+        if tail:
+            return self._append_with_newline(content, tail)
+        return content
 
     def _set_planner_call_context(self, call_type: str, **metadata):
         if not hasattr(self, "planner") or self.planner is None:
@@ -1175,32 +1205,22 @@ class LLMAgents(LLMPair):
                 call_type=call_type,
             )
             return
-        normalized = (action_text or "").strip() or "[EMPTY]"
-        was_rewardable = (
-            entry.get("call_type") in reward_tracker.rewardable_action_call_types
-            and not entry.get("is_collab")
-        )
-        entry["action"] = normalized
-        entry["call_type"] = call_type
-        entry["is_collab"] = self._is_collab_action(normalized)
-        now_rewardable = (
-            call_type in reward_tracker.rewardable_action_call_types
-            and not entry.get("is_collab")
-            and normalized != "[EMPTY]"
-            and not self._is_wait_action(normalized)
-        )
-        has_format_penalty = any(
-            item.get("type") == "format" for item in (entry.get("penalties") or [])
-        )
-        if now_rewardable and not was_rewardable and not has_format_penalty:
-            entry["format_reward"] = (
-                float(entry.get("format_reward", 0.0) or 0.0)
-                + reward_tracker.format_success_reward_value
-            )
-            entry["total"] = (
-                float(entry.get("total", 0.0) or 0.0)
-                + reward_tracker.format_success_reward_value
-            )
+        can_update = getattr(reward_tracker, "_source_entry_can_be_updated", None)
+        if callable(can_update) and not can_update(entry, action_text, call_type):
+            ensure_entry = getattr(reward_tracker, "ensure_llm_action_entry", None)
+            if ensure_entry is not None:
+                ensure_entry(
+                    agent_index=self.agent_index,
+                    timestamp=timestamp,
+                    action_text=action_text,
+                    agent_name=self.name,
+                    call_index=call_index,
+                    call_type=call_type,
+                )
+            return
+        update_entry = getattr(reward_tracker, "_update_llm_action_entry", None)
+        if callable(update_entry):
+            update_entry(entry, action_text, agent_name=self.name, call_type=call_type)
 
     def _queue_action_source(
         self,
@@ -1234,7 +1254,6 @@ class LLMAgents(LLMPair):
             return None
         source = self._pending_action_sources.get()
         source = dict(source)
-        source["timestamp"] = getattr(self, "current_timestep", source.get("timestamp"))
         source.setdefault("action", (action_text or "").strip())
         self._current_action_source = source
         if not (
@@ -1271,7 +1290,6 @@ class LLMAgents(LLMPair):
         self._pending_action_sources = kept
         if matched is None:
             return None
-        matched["timestamp"] = getattr(self, "current_timestep", matched.get("timestamp"))
         self._current_action_source = dict(matched)
         if not (
             getattr(self, "current_ml_action_steps", 0) > 0
@@ -1339,16 +1357,12 @@ class LLMAgents(LLMPair):
         self._locked_action_source = None
 
     def _clear_active_action_source_after_completion(self) -> None:
-        """Keep an executed source alive until CollabMainSession consumes it.
+        """Clear source state after an action completes.
 
-        Environment success is visible to the agent at the next decision state,
-        but the RL session consumes `last_executed_action_source` only after the
-        previous `env.step()` reports `obs.ml_actions`. Clearing here can drop
-        the source before process reward is backfilled to the LLM call that
-        produced the action.
+        Process reward is assigned when validator accepts the LLM action, so
+        completed environment actions must not keep stale source state around
+        for later reward backfill.
         """
-        if isinstance(getattr(self, "last_executed_action_source", None), dict):
-            return
         self._clear_active_action_source()
 
     def _replace_pending_action_plan(
@@ -1370,21 +1384,11 @@ class LLMAgents(LLMPair):
             self.action_wait_parse.put(action)
             self._queue_pending_action_source(action, call_index, call_type)
 
-    def _apply_penalty_to_last_entry(self, penalty_type: str, detail: str) -> bool:
+    def _apply_penalty_to_entry(self, entry, penalty_type: str, detail: str) -> bool:
         if not self.reward_tracker or self.agent_index is None:
             return False
-        entry = getattr(self, "_last_reward_entry", None)
         if not entry:
             return False
-        if self.pending_llm_logs:
-            current_call_index = self.pending_llm_logs[-1].get("call_index")
-            entry_call_index = entry.get("call_index")
-            if (
-                current_call_index is not None
-                and entry_call_index is not None
-                and int(current_call_index) != int(entry_call_index)
-            ):
-                return False
         if penalty_type == "format":
             value = self.reward_tracker.format_penalty_value
             reward_key = "format_reward"
@@ -1434,6 +1438,42 @@ class LLMAgents(LLMPair):
                 ]
         return True
 
+    def _apply_penalty_to_last_entry(self, penalty_type: str, detail: str) -> bool:
+        entry = getattr(self, "_last_reward_entry", None)
+        if not entry:
+            return False
+        if self.pending_llm_logs:
+            current_call_index = self.pending_llm_logs[-1].get("call_index")
+            entry_call_index = entry.get("call_index")
+            if (
+                current_call_index is not None
+                and entry_call_index is not None
+                and int(current_call_index) != int(entry_call_index)
+            ):
+                return False
+        return LLMAgents._apply_penalty_to_entry(self, entry, penalty_type, detail)
+
+    def _reward_entry_for_current_action_source(self) -> Optional[Dict[str, Any]]:
+        reward_tracker = getattr(self, "reward_tracker", None)
+        if not reward_tracker or self.agent_index is None:
+            return None
+        source = getattr(self, "_current_action_source", None)
+        if not isinstance(source, dict):
+            return None
+        call_index = source.get("call_index")
+        if call_index is None:
+            return None
+        try:
+            agent_idx = int(source.get("agent_index", self.agent_index))
+            timestamp = int(source.get("source_timestamp", source.get("timestamp", self.current_timestep)))
+            call_idx = int(call_index)
+        except (TypeError, ValueError):
+            return None
+        entry = getattr(reward_tracker, "call_records_by_source", {}).get(
+            (agent_idx, timestamp, call_idx)
+        )
+        return entry if isinstance(entry, dict) else None
+
     def _ensure_penalty_reward_entry(self, action_text: Optional[str], call_type: str = "planner_main"):
         if self._pending_reward_event is not None:
             return
@@ -1467,6 +1507,69 @@ class LLMAgents(LLMPair):
             self.reward_tracker.register_format_error(self.agent_index, detail)
         else:
             self.reward_tracker.register_validator_error(self.agent_index, detail)
+
+    def _register_validator_penalty_for_current_action(self, detail: str) -> None:
+        """Bind validation failure to the action being checked, never to a later LLM call."""
+        if not self.reward_tracker or self.agent_index is None:
+            return
+        entry = self._reward_entry_for_current_action_source()
+        if isinstance(entry, dict):
+            LLMAgents._apply_penalty_to_entry(self, entry, "validator", detail)
+        else:
+            # Validator failures without a concrete action source are controller
+            # state errors; do not queue them for the next LLM call.
+            print(
+                f"[Validator] skip unbound validator penalty for {self.name}: {detail}"
+            )
+
+    def _ensure_reward_entry_for_current_action_source(self) -> Optional[Dict[str, Any]]:
+        """Return the reward entry for the action currently being validated.
+
+        Validator/process rewards are earned when the validator accepts the LLM
+        action. The reward must therefore be written to the call that produced
+        the active action source, not to whichever LLM call happened most
+        recently during communication or correction.
+        """
+        reward_tracker = getattr(self, "reward_tracker", None)
+        if not reward_tracker or self.agent_index is None:
+            return None
+        source = getattr(self, "_current_action_source", None)
+        if not isinstance(source, dict):
+            return None
+        call_index = source.get("call_index")
+        if call_index is None:
+            return None
+        action_text = getattr(self, "current_ml_action", None) or source.get("action")
+        if action_text and not self._action_source_matches(source, action_text):
+            return None
+        timestamp = source.get("source_timestamp", source.get("timestamp", self.current_timestep))
+        call_type = source.get("call_type") or "planner_main"
+        ensure_entry = getattr(reward_tracker, "ensure_llm_action_entry", None)
+        if ensure_entry is None:
+            return self._reward_entry_for_current_action_source()
+        entry = ensure_entry(
+            agent_index=int(source.get("agent_index", self.agent_index)),
+            timestamp=timestamp,
+            action_text=action_text,
+            agent_name=source.get("agent", self.name),
+            call_index=call_index,
+            call_type=call_type,
+        )
+        self._last_reward_entry = entry
+        return entry if isinstance(entry, dict) else None
+
+    def _mark_current_action_validated(self) -> bool:
+        entry = self._ensure_reward_entry_for_current_action_source()
+        if not isinstance(entry, dict):
+            return False
+        mark_entry = getattr(self.reward_tracker, "mark_llm_action_entry_validated", None)
+        if mark_entry is None:
+            return False
+        self._last_reward_entry = mark_entry(
+            entry,
+            action_text=getattr(self, "current_ml_action", None),
+        )
+        return isinstance(self._last_reward_entry, dict)
 
     def _record_communication_penalty(
         self, action_block: Optional[str], detail: str, penalty_type: str = "validator"
@@ -1571,7 +1674,7 @@ class LLMAgents(LLMPair):
         if not primary:
             return
         if call_index is None:
-            call_index = len(self.pending_llm_logs) - 1
+            call_index = self._last_llm_call_index()
         if call_index is None or call_index < 0:
             return
         self._relabel_last_llm_call("planner_main")
@@ -1682,13 +1785,27 @@ class LLMAgents(LLMPair):
         elif reset_on_empty:
             self.current_recent_goal_text = "[EMPTY]"
 
+    def _allocate_llm_call_index(self) -> int:
+        timestamp = getattr(self, "current_timestep", None)
+        try:
+            timestamp_key = int(timestamp)
+        except (TypeError, ValueError):
+            timestamp_key = None
+        if timestamp_key != getattr(self, "_llm_call_index_timestamp", None):
+            self._llm_call_index_timestamp = timestamp_key
+            self._next_llm_call_index = 0
+        call_index = int(getattr(self, "_next_llm_call_index", 0) or 0)
+        self._next_llm_call_index = call_index + 1
+        return call_index
+
     def _log_llm_call(self, call_type: str, prompt_text: str, response_text: str, tokens: int = 0, metadata: Optional[dict] = None):
         prompt = (prompt_text or "").strip()
         response = (response_text or "").strip()
+        call_index = self._allocate_llm_call_index()
         entry = {
             "timestamp": self.current_timestep,
             "agent": self.name,
-            "call_index": len(self.pending_llm_logs),
+            "call_index": call_index,
             "call_type": call_type,
             "input": prompt,
             "output": response,
@@ -1739,6 +1856,15 @@ class LLMAgents(LLMPair):
         )
         return info
 
+    def _last_llm_call_index(self) -> Optional[int]:
+        logs = getattr(self, "pending_llm_logs", [])
+        if not logs:
+            return None
+        try:
+            return int(logs[-1].get("call_index"))
+        except (TypeError, ValueError):
+            return None
+
     def _handle_format_issues(
         self,
         issues: List[str],
@@ -1763,18 +1889,44 @@ class LLMAgents(LLMPair):
         self._annotate_last_log_metadata(
             has_failure_context=True, validator_feedbacks=[normalized]
         )
-        self._register_penalty("validator", normalized)
+        self._register_validator_penalty_for_current_action(normalized)
 
     def _record_validation_reward(self, failed_message: Optional[str]):
-        if getattr(self, "_last_validation_failed_format", False):
+        success = isinstance(failed_message, str) and "success" in failed_message.lower()
+        if getattr(self, "_last_validation_failed_format", False) and not success:
             self._flush_reward_event()
             return
         if self._is_collab_action(getattr(self, "current_ml_action", None)):
             self._flush_reward_event()
             return
+        if success and self._mark_current_action_validated():
+            return
+        if not success:
+            self._handle_validator_failure(failed_message)
         self._ensure_penalty_reward_entry(self.current_ml_action)
-        self._handle_validator_failure(failed_message)
         self._flush_reward_event()
+        if not success:
+            return
+        if self._mark_current_action_validated():
+            return
+        entry = getattr(self, "_last_reward_entry", None)
+        if isinstance(entry, dict):
+            source_ts = entry.get("source_timestamp", entry.get("timestamp"))
+            call_index = entry.get("call_index")
+            call_type = entry.get("call_type")
+        else:
+            return
+        mark_validated = getattr(self.reward_tracker, "mark_llm_action_validated", None)
+        if mark_validated is None:
+            return
+        self._last_reward_entry = mark_validated(
+            agent_index=self.agent_index,
+            timestamp=source_ts,
+            action_text=self.current_ml_action,
+            agent_name=self.name,
+            call_index=call_index,
+            call_type=call_type or "planner_main",
+        )
 
     def _report_action_format_error(self, detail: str, action_text: Optional[str] = None, call_type: str = "planner_main"):
         self._ensure_penalty_reward_entry(action_text, call_type)
@@ -1821,6 +1973,14 @@ class LLMAgents(LLMPair):
     def _ensure_pure_action_response(self, response: str, call_type: str = "planner_main"):
         action_text = self.parse_response(response, "action")
         action_info = self._annotate_last_action_mode(action_text)
+        original_call_index = self._last_llm_call_index()
+        action_info["call_index"] = original_call_index
+        if self._has_nonempty_tail_after_fenced_response(response):
+            action_info = dict(action_info)
+            action_info["mode"] = "malformed"
+            action_info["malformed_tokens"] = action_info.get("tokens", [])
+            action_info["call_index"] = original_call_index
+            self._annotate_last_log_metadata(action_mode="malformed")
         extra_tokens = 0
         if action_info["mode"] not in {"mixed", "multi_embodied", "malformed"}:
             return response, extra_tokens, action_info
@@ -1831,6 +1991,8 @@ class LLMAgents(LLMPair):
         extra_tokens += correction_tokens
         corrected_action = self.parse_response(response, "action")
         corrected_info = self._annotate_last_action_mode(corrected_action)
+        corrected_info["call_index"] = self._last_llm_call_index()
+        corrected_info["corrected_from_call_index"] = original_call_index
         if corrected_info["mode"] in {"mixed", "multi_embodied", "malformed"}:
             self._handle_format_issues([corrected_info["mode"] + "_action_types"], corrected_action, "format_correction")
         return response, extra_tokens, corrected_info
@@ -2869,11 +3031,12 @@ class LLMAgents(LLMPair):
             )
             reward_call_type = query_call_type
             self._set_planner_call_context(query_call_type)
+            map_text = self.mdp.state_string(self.state).replace("ø", "o")
             response, tokens_num = self.planner.query(
                 proxy=self.proxy,
                 stop="Scene",
                 trace=self.trace,
-                map=self.mdp.state_string(self.state).replace("ø", "o"),
+                map=map_text,
             )
             self._log_llm_call(
                 query_call_type,
@@ -2881,8 +3044,10 @@ class LLMAgents(LLMPair):
                 response,
                 tokens_num,
             )
-            planner_call_index = len(self.pending_llm_logs) - 1
+            planner_call_index = self._last_llm_call_index()
             response, _, action_info = self._ensure_pure_action_response(response)
+            if action_info.get("call_index") is not None:
+                planner_call_index = action_info.get("call_index")
             print(response)
             # check whether need communication
             # check whether has the action
@@ -2916,6 +3081,8 @@ class LLMAgents(LLMPair):
             if action_text_block == "":
                 print("\n\n\n******No Action Part, Correcting**********\n\n\n")
                 action_text_block, response = self.important_part_no_create(1, "action", response)
+                planner_call_index = self._last_llm_call_index()
+                reward_call_type = "planner_main"
             self._handle_format_issues(format_issues, action_text_block, reward_call_type)
             self.update_recent_goal_text(recent_goal_text)
             recent_goal_entry = self.current_recent_goal_text
@@ -3116,7 +3283,14 @@ class LLMAgents(LLMPair):
             forced_action = override.get("action")
             if not reward_action and forced_action:
                 reward_action = forced_action
-        if reward_call_index is not None:
+        source_bound = (
+            getattr(self, "_current_action_source", None) is not None
+            and self._action_source_matches(
+                getattr(self, "_current_action_source", None),
+                reward_action,
+            )
+        )
+        if reward_call_index is not None and not source_bound:
             if not reward_action:
                 reward_action = "[EMPTY]"
             self._queue_reward_event(reward_action, reward_call_index, reward_call_type)

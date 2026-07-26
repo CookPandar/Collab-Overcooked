@@ -60,6 +60,7 @@ def main() -> int:
         print(
             "[reload-vllm] reloaded "
             f"port={port} modules={result.get('lora_modules', [])} "
+            f"specs={result.get('lora_module_specs', [])} "
             f"value_head={result.get('value_head')}",
             flush=True,
         )

@@ -1,0 +1,78 @@
+topic: "ICML 2026 LLM multi-agent distributed reinforcement learning methods and benchmarks"
+scope:
+  primary:
+    - "ICML 2026 papers on LLM-based multi-agent system design, training, prompt/structure optimization, and protocol benchmarks"
+  secondary:
+    - "Closely related non-ICML papers/frameworks for distributed LLM-based MARL or adversarial co-training"
+  notes:
+    - "Current research date: 2026-07-26"
+    - "ICML status is taken from arXiv comments, paper sources, official/author repository badges, or ICML virtual links where available."
+items:
+  - id: mas_orchestra
+    name: "MAS-Orchestra"
+    title: "MAS-Orchestra: Understanding and Improving Multi-Agent Reasoning Through Holistic Orchestration and Controlled Benchmarks"
+    venue_status: "ICML 2026"
+    priority: "core"
+    why_included: "Most directly matches RL-based LLM multi-agent system design; trains an orchestrator policy with GRPO."
+    sources:
+      paper: "https://arxiv.org/abs/2601.14652"
+      code: "https://github.com/SalesforceAIResearch/MAS-Orchestra"
+      benchmark: "https://huggingface.co/datasets/Salesforce/MASBench"
+  - id: maspo
+    name: "MASPO"
+    title: "MASPO: Joint Prompt Optimization for LLM-based Multi-Agent Systems"
+    venue_status: "ICML 2026"
+    priority: "core-adjacent"
+    why_included: "Joint/co-adaptive prompt optimization across LLM agents; not model-parameter RL."
+    sources:
+      paper: "https://arxiv.org/abs/2605.06623"
+      code: "https://github.com/wangzx1219/MASPO"
+  - id: maspob
+    name: "MASPOB"
+    title: "MASPOB: Bandit-Based Prompt Optimization for Multi-Agent Systems with Graph Neural Networks"
+    venue_status: "ICML 2026 Spotlight"
+    priority: "core-adjacent"
+    why_included: "Bandit/GNN sample-efficient prompt-combination optimization for fixed-topology MAS."
+    sources:
+      paper: "https://arxiv.org/abs/2603.02630"
+      code: "https://github.com/HZ1008/MASPOB"
+  - id: omac
+    name: "OMAC"
+    title: "OMAC: A Holistic Optimization Framework for LLM-Based Multi-Agent Collaboration"
+    venue_status: "ICML 2026 Oral"
+    priority: "core-adjacent"
+    why_included: "Optimizes LLM-MAS functionality and collaboration structure over five design dimensions."
+    sources:
+      paper: "https://arxiv.org/abs/2505.11765"
+      code: "https://github.com/xiwenchao/OMAC"
+      icml: "https://icml.cc/virtual/2026/oral/71174"
+  - id: protocolbench
+    name: "ProtocolBench / ProtocolRouter"
+    title: "ProtocolBench: Which LLM MultiAgent Protocol to Choose?"
+    venue_status: "ICML 2026"
+    priority: "benchmark"
+    why_included: "Benchmark/router for LLM multi-agent communication protocols; useful benchmark reference, not RL training."
+    sources:
+      paper: "https://arxiv.org/abs/2510.17149"
+      code: "https://github.com/ulab-uiuc/AgentProtocols"
+  - id: flexmarl
+    name: "FlexMARL"
+    title: "Rollout-Training Co-Design for Efficient LLM-Based Multi-Agent Reinforcement Learning"
+    venue_status: "Not ICML-confirmed; arXiv source uses ACM SIGCOMM 2026 metadata"
+    priority: "secondary-distributed-rl"
+    why_included: "Strongest match to distributed LLM-based MARL systems and training infrastructure, but not an ICML 2026 item."
+    sources:
+      paper: "https://arxiv.org/abs/2602.09578"
+  - id: advevo_marl
+    name: "AdvEvo-MARL"
+    title: "AdvEvo-MARL: Shaping Internalized Safety through Adversarial Co-Evolution in Multi-Agent Reinforcement Learning"
+    venue_status: "Not ICML-confirmed; arXiv source uses ICLR 2026 template"
+    priority: "secondary-cotraining"
+    why_included: "Clear attacker/defender co-evolutionary MARL with public code and explicit GPU/batch script."
+    sources:
+      paper: "https://arxiv.org/abs/2510.01586"
+      code: "https://github.com/PzySeere/AdvEvo-MARL"
+execution:
+  batch_size: 4
+  items_per_agent: 2
+  output_dir: "./results"

@@ -110,6 +110,31 @@ def _rewrite_experiment_paths(trainer: dict, repo_root: Path) -> None:
             ]
 
 
+def _resolve_initial_adapter_paths(trainer: dict, repo_root: Path) -> None:
+    lora_path = trainer.get("lora_path")
+    if isinstance(lora_path, str) and lora_path:
+        trainer["lora_path"] = _resolve_lora_dir(lora_path, repo_root)
+
+    actor_cfg = trainer.get("actor_adapters")
+    if isinstance(actor_cfg, dict):
+        for value in actor_cfg.values():
+            if not isinstance(value, dict):
+                continue
+            lora_path = value.get("lora_path")
+            if isinstance(lora_path, str) and lora_path:
+                value["lora_path"] = _resolve_lora_dir(lora_path, repo_root)
+
+    critic_cfg = trainer.get("critic_adapter")
+    if isinstance(critic_cfg, dict):
+        lora_path = critic_cfg.get("lora_path")
+        if isinstance(lora_path, str) and lora_path:
+            critic_cfg["lora_path"] = _resolve_lora_dir(lora_path, repo_root)
+
+    critic_lora_path = trainer.get("critic_lora_path")
+    if isinstance(critic_lora_path, str) and critic_lora_path:
+        trainer["critic_lora_path"] = _resolve_lora_dir(critic_lora_path, repo_root)
+
+
 def _apply_latest_override(trainer: dict, base_dir: Path) -> None:
     latest_file = trainer.get("latest_model_path_file")
     if not latest_file:
@@ -189,6 +214,7 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     trainer = data.setdefault("trainer", {})
     _rewrite_experiment_paths(trainer, repo_root)
     _apply_latest_override(trainer, repo_root)
+    _resolve_initial_adapter_paths(trainer, repo_root)
     for key in [
         "rollout_dir",
         "output_dir",
@@ -229,6 +255,10 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
     if stage == "collect":
         trainer["collect_only"] = True
         trainer["train_only"] = False
+        if str(os.environ.get("RL_MAX_NEW_TOKENS", "")).strip():
+            trainer["max_new_tokens"] = int(os.environ["RL_MAX_NEW_TOKENS"])
+        if str(os.environ.get("RL_COLLECT_MAX_NEW_TOKENS", "")).strip():
+            trainer["max_new_tokens"] = int(os.environ["RL_COLLECT_MAX_NEW_TOKENS"])
         if str(os.environ.get("RL_COLLECT_VALUE_BACKEND", "")).strip():
             trainer["collect_value_backend"] = str(os.environ["RL_COLLECT_VALUE_BACKEND"]).strip()
         if str(os.environ.get("RL_COMPUTE_VALUES_IN_COLLECT", "")).strip():
@@ -242,6 +272,10 @@ def build_rank_bound_config(src_cfg: Path, stage: str, tmp_dir: Path) -> Path:
         trainer["collect_only"] = True
         trainer["train_only"] = False
         trainer["generation_temperature"] = 0.0
+        if str(os.environ.get("RL_MAX_NEW_TOKENS", "")).strip():
+            trainer["max_new_tokens"] = int(os.environ["RL_MAX_NEW_TOKENS"])
+        if str(os.environ.get("RL_EVAL_MAX_NEW_TOKENS", "")).strip():
+            trainer["max_new_tokens"] = int(os.environ["RL_EVAL_MAX_NEW_TOKENS"])
         trainer["compute_values_in_collect"] = False
         trainer["collect_value_backend"] = "none"
 

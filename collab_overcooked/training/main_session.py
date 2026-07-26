@@ -40,6 +40,23 @@ from ..main import (
     make_agent_from_config,
 )
 
+
+def _strip_action_code_fence(action: str) -> str:
+    stripped = (action or "").strip()
+    if not stripped.startswith("```"):
+        return stripped.strip("`").strip()
+    content = stripped[3:]
+    closing = content.rfind("```")
+    if closing != -1:
+        content = content[:closing]
+    content = content.strip()
+    if "\n" in content:
+        first_line, remainder = content.split("\n", 1)
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]*", first_line.strip()):
+            content = remainder
+    return content.strip().strip("`").strip()
+
+
 # ---------------------------------------------------------------------------
 # Interfaces & dataclasses
 # ---------------------------------------------------------------------------
@@ -91,6 +108,7 @@ class SessionStep:
     env_info: Dict[str, Any]
     process_reward: Optional[Dict[str, Any]]
     policy_records: List[PolicyCallRecord]
+    executed_action_sources: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +211,7 @@ class RLPlannerProxy:
         context = {
             "temperature": temperature,
             "debug_mode": debug_mode,
+            "stop": stop,
             "trace": trace,
             "rethink": rethink,
             "map": map,
@@ -352,7 +371,6 @@ class CollabMainSession:
         self._init_policy_record_logging(len(self.agents))
         print("[CollabMainSession] after _init_policy_record_logging")
         self._shared_agent_traces: Dict[int, Dict[str, Any]] = {}
-        self._pending_reward_records: Dict[Tuple[int, int, int], PolicyCallRecord] = {}
         self.rl_modules: List[RLPlannerProxy] = []
         for idx, agent in enumerate(self.team.agents):
             if isinstance(agent, LLMAgents):
@@ -387,7 +405,6 @@ class CollabMainSession:
             self.reward_tracker.reset()
         self.team.reset()
         self._shared_agent_traces.clear()
-        self._pending_reward_records.clear()
         for proxy in self.rl_modules:
             proxy.consume_records()
         return self._build_observation(self.env.state)
@@ -428,13 +445,12 @@ class CollabMainSession:
         current_observation = self._build_observation(state)
         for proxy in self.rl_modules:
             setattr(proxy, "_rl_global_observation", current_observation)
-        print(f"[CollabMainSession] Beginning step at timestep {state.timestep}")
         joint_action, pickup_parm = self.team.joint_action(state)
         print(
             f"[CollabMainSession] joint_action={joint_action} pickup_parm={pickup_parm}"
         )
+        executed_action_sources = self._collect_executed_action_sources()
         obs, reward, done, env_info = self.env.step(joint_action, pickup_parm)
-        executed_action_sources = self._consume_executed_action_sources(obs.ml_actions)
 
         process_reward = None
         if self.reward_tracker:
@@ -456,9 +472,7 @@ class CollabMainSession:
                 if record.micro_step is None:
                     record.micro_step = self._record_micro_step(record)
             records.extend(agent_records)
-        records = self._merge_pending_reward_records(records, process_reward)
         self._assign_call_rewards(records, process_reward, done)
-        self._update_pending_reward_records(records)
         self._persist_policy_records(records)
         self._shrink_policy_records(records)
         print(
@@ -474,7 +488,17 @@ class CollabMainSession:
             env_info={"ml_actions": obs.ml_actions, "raw_info": env_info},
             process_reward=process_reward,
             policy_records=records,
+            executed_action_sources=executed_action_sources,
         )
+
+    # ------------------------------------------------------------------
+    def _collect_executed_action_sources(self) -> List[Dict[str, Any]]:
+        sources: List[Dict[str, Any]] = []
+        for agent in getattr(self, "agents", []):
+            source = getattr(agent, "last_executed_action_source", None)
+            if isinstance(source, dict):
+                sources.append(copy.deepcopy(source))
+        return sources
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -486,123 +510,6 @@ class CollabMainSession:
             return int(raw)
         except (TypeError, ValueError):
             return None
-
-    def _consume_executed_action_sources(
-        self, ml_actions: Optional[List[Optional[str]]] = None
-    ) -> List[Optional[Dict[str, Any]]]:
-        sources: List[Optional[Dict[str, Any]]] = []
-        for idx, agent in enumerate(self.team.agents):
-            executed_action = (
-                ml_actions[idx]
-                if ml_actions is not None and idx < len(ml_actions)
-                else None
-            )
-            source = getattr(agent, "last_executed_action_source", None)
-            if executed_action and not isinstance(source, dict):
-                resolver = getattr(agent, "_resolve_executed_action_source", None)
-                if callable(resolver):
-                    try:
-                        source = resolver(executed_action)
-                    except Exception:
-                        source = None
-            if executed_action and isinstance(source, dict):
-                enriched = dict(source)
-                enriched.setdefault("agent_index", idx)
-                enriched.setdefault("submitted_action", executed_action)
-                sources.append(enriched)
-                try:
-                    setattr(agent, "last_executed_action_source", None)
-                except Exception:
-                    pass
-            else:
-                sources.append(None)
-                # Do not consume the source on movement steps or failed interacts.
-                # It must stay attached until the environment reports the actual
-                # medium-level action in state.ml_actions.
-        return sources
-
-    def _process_reward_call_indices(
-        self, process_reward: Optional[Dict[str, Any]]
-    ) -> Dict[int, set]:
-        by_agent: Dict[int, set] = {0: set(), 1: set()}
-        if not isinstance(process_reward, dict):
-            return by_agent
-        default_ts = process_reward.get("timestamp")
-        per_agent = process_reward.get("per_agent") or []
-        for agent_idx in range(min(len(per_agent), 2)):
-            agent_reward = per_agent[agent_idx]
-            calls = agent_reward.get("calls") if isinstance(agent_reward, dict) else None
-            if not calls:
-                continue
-            for entry in calls:
-                if not isinstance(entry, dict):
-                    continue
-                call_index = entry.get("call_index")
-                if call_index is None:
-                    continue
-                try:
-                    source_ts = entry.get("source_timestamp", entry.get("timestamp", default_ts))
-                    by_agent[agent_idx].add((int(source_ts), int(call_index)))
-                except (TypeError, ValueError):
-                    continue
-        return by_agent
-
-    def _record_source_key(
-        self, record: PolicyCallRecord
-    ) -> Optional[Tuple[int, int, int]]:
-        if record.agent_index not in (0, 1):
-            return None
-        raw = (record.metadata or {}).get("call_index")
-        if raw is None:
-            raw = record.micro_step
-        try:
-            return int(record.agent_index), int(record.timestep), int(raw)
-        except (TypeError, ValueError):
-            return None
-
-    def _merge_pending_reward_records(
-        self,
-        records: List[PolicyCallRecord],
-        process_reward: Optional[Dict[str, Any]],
-    ) -> List[PolicyCallRecord]:
-        if not hasattr(self, "_pending_reward_records"):
-            self._pending_reward_records = {}
-        wanted = self._process_reward_call_indices(process_reward)
-        merged = list(records)
-        present = {
-            key for key in (self._record_source_key(record) for record in merged) if key
-        }
-        for agent_idx, source_keys in wanted.items():
-            for source_ts, call_index in source_keys:
-                key = (agent_idx, source_ts, call_index)
-                if key in present:
-                    continue
-                pending = self._pending_reward_records.pop(key, None)
-                if pending is not None:
-                    merged.append(pending)
-                    present.add(key)
-        return merged
-
-    def _update_pending_reward_records(self, records: List[PolicyCallRecord]) -> None:
-        if not hasattr(self, "_pending_reward_records"):
-            self._pending_reward_records = {}
-        for record in records:
-            key = self._record_source_key(record)
-            if key is None:
-                continue
-            breakdown = (record.metadata or {}).get("reward_breakdown") or {}
-            seq_reward = float(breakdown.get("sequence_reward", 0.0) or 0.0)
-            format_reward = float(breakdown.get("format_reward", 0.0) or 0.0)
-            has_penalty = bool(
-                format_reward < 0.0
-                or float(breakdown.get("validator_reward", 0.0) or 0.0)
-                or float(breakdown.get("communication_reward", 0.0) or 0.0)
-                or float(breakdown.get("paired_comm_reward", 0.0) or 0.0)
-            )
-            if seq_reward or has_penalty or not self._record_can_receive_sequence_reward(record):
-                self._pending_reward_records.pop(key, None)
-            else:
-                self._pending_reward_records[key] = record
 
     def _build_agents(self) -> List[LLMAgents]:
         agents = []
@@ -771,8 +678,6 @@ class CollabMainSession:
         process_reward: Optional[Dict[str, Any]],
         done_flag: bool,
     ):
-        if not hasattr(self, "_pending_reward_records"):
-            self._pending_reward_records = {}
         has_reward_entries = False
         if process_reward and isinstance(process_reward, dict):
             for agent_reward in process_reward.get("per_agent") or []:
@@ -782,38 +687,160 @@ class CollabMainSession:
         if not records and not has_reward_entries:
             return
         reward_queues: Dict[int, List[Dict[str, Any]]] = {0: [], 1: []}
-        reward_by_source_key: Dict[int, Dict[Tuple[int, int], Dict[str, Any]]] = {0: {}, 1: {}}
-        executed_sequence_reward: Dict[int, float] = {0: 0.0, 1: 0.0}
+        reward_by_source_key: Dict[int, Dict[Tuple[int, int], List[Dict[str, Any]]]] = {0: {}, 1: {}}
         reward_default_ts = None
+        indexed_entry_ids = set()
+
+        def _index_reward_entry(
+            entry: Dict[str, Any],
+            agent_idx: int,
+            *,
+            add_to_queue: bool,
+        ) -> None:
+            if not isinstance(entry, dict):
+                return
+            entry_id = id(entry)
+            if entry_id in indexed_entry_ids:
+                return
+            indexed_entry_ids.add(entry_id)
+            if add_to_queue:
+                reward_queues[agent_idx].append(entry)
+            call_index = entry.get("call_index")
+            if call_index is None:
+                return
+            source_ts = entry.get(
+                "source_timestamp",
+                entry.get("timestamp", reward_default_ts),
+            )
+            if source_ts is None:
+                source_ts = -1
+            try:
+                reward_by_source_key[agent_idx].setdefault(
+                    (int(source_ts), int(call_index)), []
+                ).append(entry)
+            except (TypeError, ValueError):
+                pass
+
         if process_reward and isinstance(process_reward, dict):
             reward_default_ts = process_reward.get("timestamp")
             per_agent = process_reward.get("per_agent") or []
             for agent_idx in range(min(len(per_agent), 2)):
                 agent_reward = per_agent[agent_idx]
-                if isinstance(agent_reward, dict):
-                    executed_sequence_reward[agent_idx] = float(
-                        agent_reward.get("sequence_reward", 0.0) or 0.0
-                    )
                 agent_calls = agent_reward.get("calls") if isinstance(agent_reward, dict) else None
                 if agent_calls:
                     for entry in agent_calls:
-                        if not isinstance(entry, dict):
-                            continue
-                        reward_queues[agent_idx].append(entry)
-                        call_index = entry.get("call_index")
-                        if call_index is not None:
-                            source_ts = entry.get(
-                                "source_timestamp",
-                                entry.get("timestamp", reward_default_ts),
-                            )
-                            if source_ts is None:
-                                source_ts = -1
-                            try:
-                                reward_by_source_key[agent_idx][
-                                    (int(source_ts), int(call_index))
-                                ] = entry
-                            except (TypeError, ValueError):
-                                pass
+                        _index_reward_entry(entry, agent_idx, add_to_queue=True)
+            for entry in process_reward.get("source_entries") or []:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    source_agent_idx = int(entry.get("agent_index"))
+                except (TypeError, ValueError):
+                    continue
+                if source_agent_idx not in reward_by_source_key:
+                    continue
+                _index_reward_entry(entry, source_agent_idx, add_to_queue=False)
+
+        def _record_action(record: PolicyCallRecord, metadata: Dict[str, Any]) -> str:
+            return self._normalize_reward_action(str(
+                metadata.get("action") or self._extract_action_text(record.response)
+            ))
+
+        def _entry_action(entry: Dict[str, Any]) -> str:
+            return self._normalize_reward_action(str(entry.get("action") or ""))
+
+        def _entry_reward_magnitude(entry: Dict[str, Any]) -> float:
+            reward_keys = (
+                "sequence_reward",
+                "format_reward",
+                "validator_reward",
+                "communication_reward",
+                "collab_reward",
+                "paired_comm_reward",
+            )
+            return sum(abs(float(entry.get(key, 0.0) or 0.0)) for key in reward_keys)
+
+        def _record_action_is_embodied(action: str) -> bool:
+            lowered = action.lower()
+            return bool(
+                action
+                and not lowered.startswith(("collab(", "request(", "seek(", "ack(", "deny("))
+                and not lowered.startswith("wait")
+            )
+
+        def _pop_entry_from_queue(agent_idx: int, target_entry: Dict[str, Any]) -> None:
+            queue = reward_queues.get(agent_idx, [])
+            reward_queues[agent_idx] = [
+                entry for entry in queue if entry is not target_entry
+            ]
+
+        def _pop_source_entry(
+            agent_idx: int,
+            key: Tuple[int, int],
+            record: PolicyCallRecord,
+            metadata: Dict[str, Any],
+            context: Dict[str, Any],
+        ) -> Optional[Dict[str, Any]]:
+            candidates = reward_by_source_key.get(agent_idx, {}).get(key)
+            if not candidates:
+                return None
+            target_action = _record_action(record, metadata)
+            target_call_type = (
+                metadata.get("semantic_call_type")
+                or metadata.get("call_type")
+                or context.get("call_type")
+            )
+            selected_idx: Optional[int] = None
+            selected_score: Optional[Tuple[int, int, int, float]] = None
+            target_is_embodied = _record_action_is_embodied(target_action)
+            for candidate_idx, candidate in enumerate(candidates):
+                candidate_action = _entry_action(candidate)
+                candidate_call_type = candidate.get("call_type")
+                actions_match = bool(
+                    target_action and candidate_action and candidate_action == target_action
+                )
+                if target_action and candidate_action and candidate_action != target_action:
+                    continue
+                if (
+                    not actions_match
+                    and len(candidates) > 1
+                    and
+                    target_call_type
+                    and candidate_call_type
+                    and target_call_type != candidate_call_type
+                ):
+                        continue
+                score = (
+                    1 if actions_match else 0,
+                    1 if target_call_type and candidate_call_type == target_call_type else 0,
+                    1
+                    if target_is_embodied
+                    and candidate_call_type in {"planner_main", "validator_correction"}
+                    else 0,
+                    _entry_reward_magnitude(candidate),
+                )
+                if selected_score is None or score > selected_score:
+                    selected_idx = candidate_idx
+                    selected_score = score
+            if selected_idx is None:
+                return None
+            entry = candidates.pop(selected_idx)
+            if not candidates:
+                reward_by_source_key.get(agent_idx, {}).pop(key, None)
+            _pop_entry_from_queue(agent_idx, entry)
+            return entry
+
+        def _remove_source_entry(agent_idx: int, target_entry: Dict[str, Any]) -> None:
+            by_key = reward_by_source_key.get(agent_idx, {})
+            empty_keys = []
+            for key, entries in by_key.items():
+                remaining = [entry for entry in entries if entry is not target_entry]
+                if remaining:
+                    by_key[key] = remaining
+                else:
+                    empty_keys.append(key)
+            for key in empty_keys:
+                by_key.pop(key, None)
 
         for idx, record in enumerate(records):
             metadata = dict(record.metadata)
@@ -835,166 +862,170 @@ class CollabMainSession:
                 metadata["action"] = metadata.get("replay_action")
             if record.micro_step is not None:
                 metadata.setdefault("micro_step", int(record.micro_step))
-                reward_entry = None
-                call_index = metadata.get("call_index")
-                reward_source_key = None
-                if call_index is not None:
+            reward_entry = None
+            call_index = metadata.get("call_index")
+            if call_index is not None:
+                try:
+                    call_index_int = int(call_index)
+                except (TypeError, ValueError):
+                    call_index_int = None
+                if call_index_int is not None:
+                    record_ts = None
                     try:
-                        call_index_int = int(call_index)
-                        record_ts_int = int(record.timestep)
-                        reward_source_key = (record.agent_index, record_ts_int, call_index_int)
+                        record_ts = int(record.timestep)
                     except (TypeError, ValueError):
-                        call_index_int = None
-                        reward_source_key = None
-                    if call_index_int is not None:
                         record_ts = None
-                        try:
-                            record_ts = int(record.timestep)
-                        except (TypeError, ValueError):
-                            record_ts = None
-                        if record_ts is not None:
-                            reward_entry = reward_by_source_key.get(record.agent_index, {}).pop(
-                                (record_ts, call_index_int), None
-                            )
-                        if reward_entry is None:
-                            reward_entry = reward_by_source_key.get(record.agent_index, {}).pop(
-                                (-1, call_index_int), None
-                            )
-                        if reward_entry is not None:
-                            queue = reward_queues.get(record.agent_index, [])
-                            reward_queues[record.agent_index] = [
-                                entry for entry in queue if entry is not reward_entry
-                            ]
-                if reward_entry is None:
-                    queue = reward_queues.get(record.agent_index, [])
-                    for queue_idx, candidate in enumerate(queue):
-                        if candidate.get("call_index") is not None:
-                            continue
-                        reward_entry = queue.pop(queue_idx)
-                        break
-                if reward_entry is None and metadata.get("action"):
-                    target_action = self._normalize_reward_action(str(metadata.get("action") or ""))
-                    target_call_type = metadata.get("call_type") or context.get("call_type")
-                    queue = reward_queues.get(record.agent_index, [])
-                    for queue_idx, candidate in enumerate(queue):
-                        candidate_action = self._normalize_reward_action(
-                            str(candidate.get("action") or "")
+                    if record_ts is not None:
+                        reward_entry = _pop_source_entry(
+                            record.agent_index,
+                            (record_ts, call_index_int),
+                            record,
+                            metadata,
+                            context,
                         )
-                        candidate_call_type = candidate.get("call_type")
-                        if candidate_action != target_action:
-                            continue
-                        if target_call_type and candidate_call_type and target_call_type != candidate_call_type:
-                            continue
-                        reward_entry = queue.pop(queue_idx)
-                        call_index = candidate.get("call_index")
-                        if call_index is not None:
-                            try:
-                                reward_by_source_key.get(record.agent_index, {}).pop(
-                                    (int(candidate.get("source_timestamp", candidate.get("timestamp", -1))), int(call_index)),
-                                    None,
-                                )
-                            except (TypeError, ValueError):
-                                pass
-                        break
-                if reward_entry:
-                    if reward_source_key is not None:
-                        self._pending_reward_records.pop(reward_source_key, None)
-                    seq_reward = float(reward_entry.get("sequence_reward", 0.0))
-                    fmt_reward = float(reward_entry.get("format_reward", 0.0))
-                    validator_reward = float(reward_entry.get("validator_reward", 0.0))
-                    entry_penalties = list(reward_entry.get("penalties") or [])
-                    if any(item.get("type") == "format" for item in entry_penalties):
-                        validator_reward = 0.0
-                        reward_entry = dict(reward_entry)
-                        reward_entry["validator_reward"] = 0.0
-                        reward_entry["penalties"] = [
-                            item
-                            for item in entry_penalties
-                            if item.get("type") != "validator"
-                        ]
-                        reward_entry["total"] = (
-                            float(reward_entry.get("sequence_reward", 0.0) or 0.0)
-                            + float(reward_entry.get("format_reward", 0.0) or 0.0)
-                            + float(reward_entry.get("communication_reward", 0.0) or 0.0)
-                            + float(reward_entry.get("collab_reward", 0.0) or 0.0)
-                            + float(reward_entry.get("paired_comm_reward", 0.0) or 0.0)
+                    if reward_entry is None:
+                        reward_entry = _pop_source_entry(
+                            record.agent_index,
+                            (-1, call_index_int),
+                            record,
+                            metadata,
+                            context,
                         )
-                    can_receive_execution_reward = self._record_can_receive_execution_from_entry(
-                        record, reward_entry
+            if reward_entry is None:
+                queue = reward_queues.get(record.agent_index, [])
+                for queue_idx, candidate in enumerate(queue):
+                    if candidate.get("call_index") is not None:
+                        continue
+                    reward_entry = queue.pop(queue_idx)
+                    _remove_source_entry(record.agent_index, reward_entry)
+                    break
+            if reward_entry is None and metadata.get("action"):
+                target_action = self._normalize_reward_action(str(metadata.get("action") or ""))
+                target_call_type = metadata.get("call_type") or context.get("call_type")
+                queue = reward_queues.get(record.agent_index, [])
+                for queue_idx, candidate in enumerate(queue):
+                    candidate_action = self._normalize_reward_action(
+                        str(candidate.get("action") or "")
                     )
-                    if not can_receive_execution_reward:
-                        action_mode = metadata.get("action_mode")
-                        semantic = metadata.get("semantic_call_type") or metadata.get("call_type")
-                        context_call_type = context.get("call_type")
-                        entry_call_type = reward_entry.get("call_type")
-                        explicitly_non_execution = (
-                            action_mode in {"communication", "mixed", "malformed", "multi_embodied"}
-                            or (
-                                action_mode not in {"planner_main", "validator_correction"}
-                                and (semantic == "communication" or context_call_type == "communication")
-                            )
-                        )
-                        can_receive_execution_reward = (
-                            not explicitly_non_execution
-                            and entry_call_type in {"planner_main", "validator_correction"}
-                        )
-                    if not can_receive_execution_reward:
-                        seq_reward = 0.0
-                        validator_reward = 0.0
-                        if fmt_reward > 0.0:
-                            fmt_reward = 0.0
-                    communication_reward = float(
-                        reward_entry.get("communication_reward", 0.0)
+                    candidate_call_type = candidate.get("call_type")
+                    if candidate_action != target_action:
+                        continue
+                    if target_call_type and candidate_call_type and target_call_type != candidate_call_type:
+                        continue
+                    reward_entry = queue.pop(queue_idx)
+                    _remove_source_entry(record.agent_index, reward_entry)
+                    break
+            if reward_entry:
+                normalizer = getattr(
+                    getattr(self, "reward_tracker", None),
+                    "normalize_reward_entry",
+                    None,
+                )
+                if normalizer is not None:
+                    reward_entry = normalizer(reward_entry)
+                seq_reward = float(reward_entry.get("sequence_reward", 0.0))
+                fmt_reward = float(reward_entry.get("format_reward", 0.0))
+                validator_reward = float(reward_entry.get("validator_reward", 0.0))
+                validator_penalty_floor = getattr(
+                    getattr(self, "reward_tracker", None),
+                    "validator_penalty_value",
+                    None,
+                )
+                if validator_penalty_floor is not None:
+                    validator_penalty_floor = float(validator_penalty_floor)
+                    if validator_reward < validator_penalty_floor:
+                        validator_reward = validator_penalty_floor
+                entry_penalties = list(reward_entry.get("penalties") or [])
+                if any(item.get("type") == "format" for item in entry_penalties):
+                    validator_reward = 0.0
+                    reward_entry = dict(reward_entry)
+                    reward_entry["validator_reward"] = 0.0
+                    reward_entry["penalties"] = [
+                        item
+                        for item in entry_penalties
+                        if item.get("type") != "validator"
+                    ]
+                    reward_entry["total"] = (
+                        float(reward_entry.get("sequence_reward", 0.0) or 0.0)
+                        + float(reward_entry.get("format_reward", 0.0) or 0.0)
+                        + float(reward_entry.get("communication_reward", 0.0) or 0.0)
+                        + float(reward_entry.get("collab_reward", 0.0) or 0.0)
+                        + float(reward_entry.get("paired_comm_reward", 0.0) or 0.0)
                     )
-                    repeat_communication_reward = float(
-                        reward_entry.get("repeat_communication_reward", 0.0)
-                    )
-                    forced_communication_reward = float(
-                        reward_entry.get("forced_communication_reward", 0.0)
-                    )
-                    paired_comm_reward = float(
-                        reward_entry.get("paired_comm_reward", 0.0)
-                    )
-                    collab_reward = float(reward_entry.get("collab_reward", 0.0))
-                    record.reward = (
-                        seq_reward
-                        + fmt_reward
-                        + validator_reward
-                        + communication_reward
-                        + collab_reward
-                        + paired_comm_reward
-                    )
-                    breakdown = {
-                        "sequence_reward": seq_reward,
-                        "format_reward": fmt_reward,
-                        "validator_reward": validator_reward,
-                        "communication_reward": communication_reward,
-                        "repeat_communication_reward": repeat_communication_reward,
-                        "forced_communication_reward": forced_communication_reward,
-                        "collab_reward": collab_reward,
-                        "paired_comm_reward": paired_comm_reward,
-                        "call_type": reward_entry.get("call_type"),
-                        "raw": reward_entry,
-                    }
-                    metadata["reward_breakdown"] = breakdown
+                can_receive_validated_reward = self._record_can_receive_validated_reward_from_entry(
+                    record, reward_entry
+                )
+                if not can_receive_validated_reward:
+                    seq_reward = 0.0
+                    validator_reward = 0.0
+                    fmt_reward = 0.0
+                communication_reward = float(
+                    reward_entry.get("communication_reward", 0.0)
+                )
+                repeat_communication_reward = float(
+                    reward_entry.get("repeat_communication_reward", 0.0)
+                )
+                forced_communication_reward = float(
+                    reward_entry.get("forced_communication_reward", 0.0)
+                )
+                paired_comm_reward = float(
+                    reward_entry.get("paired_comm_reward", 0.0)
+                )
+                if (
+                    paired_comm_reward < 0.0
+                    and (fmt_reward < 0.0 or validator_reward < 0.0)
+                ):
+                    paired_comm_reward = 0.0
+                collab_reward = float(reward_entry.get("collab_reward", 0.0))
+                record_action = self._normalize_reward_action(str(
+                    metadata.get("action") or self._extract_action_text(record.response)
+                ))
+                if record_action.lower().startswith("wait"):
+                    seq_reward = 0.0
+                    validator_reward = 0.0
+                    communication_reward = 0.0
+                    repeat_communication_reward = 0.0
+                    forced_communication_reward = 0.0
+                    paired_comm_reward = 0.0
+                    collab_reward = 0.0
+                record.reward = (
+                    seq_reward
+                    + fmt_reward
+                    + validator_reward
+                    + communication_reward
+                    + collab_reward
+                    + paired_comm_reward
+                )
+                breakdown = {
+                    "sequence_reward": seq_reward,
+                    "format_reward": fmt_reward,
+                    "validator_reward": validator_reward,
+                    "communication_reward": communication_reward,
+                    "repeat_communication_reward": repeat_communication_reward,
+                    "forced_communication_reward": forced_communication_reward,
+                    "collab_reward": collab_reward,
+                    "paired_comm_reward": paired_comm_reward,
+                    "call_type": reward_entry.get("call_type"),
+                    "raw": reward_entry,
+                }
+                metadata["reward_breakdown"] = breakdown
+            else:
+                fallback = self._fallback_communication_reward(record, metadata)
+                if fallback is not None:
+                    record.reward = float(fallback.get("total", 0.0) or 0.0)
+                    metadata["reward_breakdown"] = fallback
                 else:
-                    fallback = self._fallback_communication_reward(record, metadata)
-                    if fallback is not None:
-                        record.reward = float(fallback.get("total", 0.0) or 0.0)
-                        metadata["reward_breakdown"] = fallback
-                    else:
-                        record.reward = 0.0
-                        metadata.setdefault("reward_breakdown", {}).setdefault(
-                            "missing_reward_entry", True
-                        )
-                record.metadata = metadata
+                    record.reward = 0.0
+                    metadata.setdefault("reward_breakdown", {}).setdefault(
+                        "missing_reward_entry", True
+                    )
+            record.metadata = metadata
 
-        self._normalize_executed_sequence_rewards(records, executed_sequence_reward)
         for idx, record in enumerate(records):
             record.done = bool(done_flag) if idx == len(records) - 1 else False
 
     @staticmethod
-    def _record_can_receive_execution_reward(record: PolicyCallRecord) -> bool:
+    def _record_can_receive_validated_action_reward(record: PolicyCallRecord) -> bool:
         metadata = record.metadata or {}
         action_mode = metadata.get("action_mode")
         semantic = metadata.get("semantic_call_type") or metadata.get("call_type")
@@ -1009,7 +1040,7 @@ class CollabMainSession:
         return semantic in rewardable_types or context_call_type in rewardable_types
 
     @staticmethod
-    def _reward_entry_is_rewardable_execution(entry: Optional[Dict[str, Any]]) -> bool:
+    def _reward_entry_is_validated_action(entry: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(entry, dict):
             return False
         action = str(entry.get("action") or "").strip()
@@ -1032,12 +1063,12 @@ class CollabMainSession:
         return not lowered.startswith(("collab(", "request(", "seek(", "ack(", "deny(", "wait"))
 
     @staticmethod
-    def _record_can_receive_execution_from_entry(
+    def _record_can_receive_validated_reward_from_entry(
         record: PolicyCallRecord, entry: Optional[Dict[str, Any]]
     ) -> bool:
-        if CollabMainSession._record_can_receive_execution_reward(record):
+        if CollabMainSession._record_can_receive_validated_action_reward(record):
             return True
-        if not CollabMainSession._reward_entry_is_rewardable_execution(entry):
+        if not CollabMainSession._reward_entry_is_validated_action(entry):
             return False
         metadata = record.metadata or {}
         action_mode = metadata.get("action_mode")
@@ -1046,10 +1077,6 @@ class CollabMainSession:
         if action_mode in {"communication", "malformed"} and not CollabMainSession._record_has_embodied_action_text(record):
             return False
         return True
-
-    @staticmethod
-    def _record_can_receive_sequence_reward(record: PolicyCallRecord) -> bool:
-        return CollabMainSession._record_can_receive_execution_reward(record)
 
     def _fallback_communication_reward(
         self,
@@ -1063,7 +1090,7 @@ class CollabMainSession:
         rewards, which are based on the communication text itself.
         """
         debug = bool(os.environ.get("RL_DEBUG_COMM_FALLBACK"))
-        if not self.reward_tracker:
+        if not getattr(self, "reward_tracker", None):
             if debug:
                 print("[comm-fallback] no reward_tracker", flush=True)
             return None
@@ -1172,10 +1199,6 @@ class CollabMainSession:
         if not text:
             return ""
         text = text.replace("<|im_end|>", "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text).strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
         match = re.search(
             r"Action\s*:\s*(.*?)(?=^\s*(?:Think|Recent Goal|Action)\s*:|\Z)",
             text,
@@ -1183,67 +1206,8 @@ class CollabMainSession:
         )
         if match:
             text = match.group(1).strip()
-        if text.endswith("```"):
-            text = text[:-3].strip()
+        text = _strip_action_code_fence(text)
         return text.replace(" ", "")
-
-    @staticmethod
-    def _set_record_sequence_reward(record: PolicyCallRecord, sequence_reward: float) -> None:
-        metadata = dict(record.metadata or {})
-        breakdown = dict(metadata.get("reward_breakdown") or {})
-        old_sequence = float(breakdown.get("sequence_reward", 0.0) or 0.0)
-        delta = float(sequence_reward) - old_sequence
-        record.reward = float(record.reward or 0.0) + delta
-        breakdown["sequence_reward"] = float(sequence_reward)
-        raw = dict(breakdown.get("raw") or {})
-        if raw:
-            old_raw_sequence = float(raw.get("sequence_reward", old_sequence) or 0.0)
-            raw["sequence_reward"] = float(sequence_reward)
-            raw["progress_reward"] = float(sequence_reward)
-            raw["total"] = float(raw.get("total", 0.0) or 0.0) + (
-                float(sequence_reward) - old_raw_sequence
-            )
-            breakdown["raw"] = raw
-        metadata["reward_breakdown"] = breakdown
-        record.metadata = metadata
-
-    def _normalize_executed_sequence_rewards(
-        self,
-        records: List[PolicyCallRecord],
-        executed_sequence_reward: Dict[int, float],
-    ) -> None:
-        """Ensure one executed env action gives sequence reward to at most one transition."""
-        records_by_agent: Dict[int, List[PolicyCallRecord]] = {0: [], 1: []}
-        for record in records:
-            if record.agent_index in records_by_agent:
-                records_by_agent[record.agent_index].append(record)
-
-        for agent_idx, agent_records in records_by_agent.items():
-            target_sequence = float(executed_sequence_reward.get(agent_idx, 0.0) or 0.0)
-            if target_sequence == 0.0:
-                continue
-            kept = False
-            for record in agent_records:
-                metadata = record.metadata or {}
-                breakdown = metadata.get("reward_breakdown") or {}
-                current_sequence = float(
-                    breakdown.get("sequence_reward", 0.0) or 0.0
-                )
-                raw_entry = breakdown.get("raw") if isinstance(breakdown, dict) else None
-                raw_sequence = (
-                    float(raw_entry.get("sequence_reward", 0.0) or 0.0)
-                    if isinstance(raw_entry, dict)
-                    else 0.0
-                )
-                if current_sequence == 0.0 and raw_sequence > 0.0:
-                    current_sequence = raw_sequence
-                if current_sequence == 0.0:
-                    continue
-                if kept or not self._record_can_receive_execution_from_entry(record, raw_entry):
-                    self._set_record_sequence_reward(record, 0.0)
-                    continue
-                self._set_record_sequence_reward(record, min(current_sequence, target_sequence))
-                kept = True
 
     def _metadata_snapshot(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
@@ -1311,6 +1275,10 @@ class CollabMainSession:
     @staticmethod
     def _shrink_policy_records(records: List[PolicyCallRecord]) -> None:
         for record in records:
+            if record.response:
+                metadata = record.metadata if isinstance(record.metadata, dict) else {}
+                metadata.setdefault("_response_text_for_reward", record.response)
+                record.metadata = metadata
             record.messages = []
             record.prompt = ""
             record.response = ""
