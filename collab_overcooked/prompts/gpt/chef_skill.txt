@@ -1,0 +1,64 @@
+**Skill**: 
+In this game, you can ONLY perform the following allowed actions. Do not attempt to use any other actions that are not listed here. If there are parameters (like steps, utensil), you need to fill them without using quotation marks, angle brackets, etc. There are 2 kinds of actions: 'operation actions' and 'requests'. If you want a teammate to perform a certain operation action, you need to generate a 'request' action with the operation action as an argument. 
+**'Operation actions'**: 
+def pickup(obj, place):
+    if object_in_hand() == "nothing": 
+       if place in utensil_list or place == "counter" or place == "dish_dispenser" or place ==“ingredient_dispenser":
+            if object_in_place(obj, place):
+                return
+
+def cook(pot_name):
+    """ To start cooking in the pot """
+    if has_food(pot_name):
+        return
+
+def place_obj_on_counter():
+    if object_in_hand() != "nothing":
+        return
+
+def put_obj_in_utensil(utensil):
+    if object_in_hand() != "nothing":
+        if utensil in utensil_list:
+            return
+
+def fill_dish_with_food(utensil):
+    if object_in_hand() == "dish":
+        if utensil_food_ready() or utensil_started_cooking():
+            return
+ 
+    """ To start oven example: bake(oven0) """
+def bake(oven_name):
+    if has_food(oven_name):
+        return
+
+def deliver_soup():
+    if object_in_hand() == "soup":
+        return
+
+def wait(num):
+    # wait positive num timesteps
+    if isinstance(num, int) and 0 < num <= 20:
+        return
+**'Cooperative action'**:  
+Use `Collab(...)` to express cooperation within a timestep. Collaboration does not consume extra timesteps: once you emit a `Collab`, treat it as if the teammate instantly replied. A `Collab` can only contain **one** primitive type; only `request` may appear multiple times separated by semicolons. Examples:
+- `Collab(request(Assistant,pickup(bell_pepper, ingredient_dispenser));request(Assistant,place_obj_on_counter()))`
+- `Collab(ack(Assistant))`
+
+Available cooperative primitives:
+```
+def request(receiver,operation_action):
+    send_message(content=operation_action, to=receiver)
+    return
+
+def seek(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+
+def deny(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+
+def ack(receiver, message):
+    send_message(content=message, to=receiver)
+    return
+``` 

@@ -1,21 +1,13 @@
-openai==1.54.3
-blobfile
-fairscale
-pandas # with default numpy==1.21.6
-scipy #==1.5.2
-matplotlib #==3.0.3
-seaborn==0.9.0
-protobuf==3.20.3
+numpy<2
+pandas
+scipy
+dtw-python
+gym>=0.21,<0.27
+tqdm
 rich==13.5.2
-fire
+openai==1.54.3
+httpx==0.27.2
 tiktoken
 transformers
-dtw-python
-sentencepiece
-scikit-learn
-plotly
-aiohttp
-gym
-httpx==0.27.2
-websocket
-websockets
+websocket-client
+websockets<14

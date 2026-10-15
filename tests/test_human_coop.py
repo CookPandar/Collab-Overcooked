@@ -10,16 +10,16 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "lib" / "overcooked_ai"))
 
 from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.mdp.overcooked_mdp import ObjectState, OvercookedGridworld
-from human_coop.policies import ChatPolicy, Decision, HTTPPolicy, RecipePolicy
-from human_coop.server import create_app
-from human_coop.session import Session
+from collab_overcooked.human_coop.policies import ChatPolicy, Decision, HTTPPolicy, RecipePolicy, extract_json_object
+from collab_overcooked.human_coop.server import create_app
+from collab_overcooked.human_coop.session import Session
 
 
 def make_session(order="boiled_egg", human_index=1, **kwargs):
@@ -245,6 +245,17 @@ class InputTests(unittest.TestCase):
         player.set_object(ObjectState("egg", "ingredient", player.position))
         self.assertEqual(session.safe_decision(0, Decision("interact")), Decision())
 
+
+
+class ChatReplyParsingTests(unittest.TestCase):
+    def test_json_object_is_extracted_from_fenced_or_wrapped_replies(self):
+        expected = {"action": "interact", "parameter": "egg"}
+        for reply in ['{"action":"interact","parameter":"egg"}',
+                      '```json\n{"action":"interact","parameter":"egg"}\n```',
+                      '<think>{}</think>Sure: {"action":"interact","parameter":"egg"} done']:
+            self.assertEqual(extract_json_object(reply), expected)
+        with self.assertRaises(ValueError):
+            extract_json_object("no json here")
 
 if __name__ == "__main__":
     unittest.main()

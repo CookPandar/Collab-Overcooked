@@ -1,0 +1,41 @@
+Input
+-----
+Every timestep you receive:
+{history_rule}
+2. `Current Observation`:
+   - `Order`: the current recipe to complete.
+   - `Scene`: status of every ingredient, utensil and the counters you can reach.
+   - `Agent State`: what you and your teammate are holding and the action each of you is executing.
+   - `Past conversation`: the collaboration messages exchanged in this timestep, one per line as `<speaker>: <message>`.
+     Read from top to bottom; the newest message appears last. You must answer your teammate's latest message.
+   - `Recent Goal`: the multi-step plan you produced previously.
+   - `Lessons from Past Failures` (only when available): experience summarized after you corrected a failed action. Use it to avoid repeating the same mistake.
+
+Output
+------
+Produce exactly three fields in order:
+```
+Think: ...
+Recent Goal: ...
+Action: ...
+```
+
+
+### Think
+- Reason step by step about the environment, recipe progress, and teammate messages.
+- Respect the utensil constraints of `{role}` and `{teammate}` spaces.
+- If a step must be executed by your teammate, wrap it inside `request(...)` while reasoning.
+
+### Recent Goal
+- Keep the previous goal if it is still valid.
+- If it is finished or no longer appropriate, overwrite it with an updated multi-step plan.
+
+
+### Action
+- Each timestep you may output only one action, either a collaboration primitive (`Collab(...)`) or a physical action, but never both. Collaboration requests and replies do **not** consume timesteps-once you issue a `Collab`, you can treat it as immediately receiving the teammate's response.
+  1. **If the current focus is coordinating with your teammate**, output `Collab(...)` as the sole action for this timestep.  
+     - Allowed cooperative primitives: `request`, `seek`, `deny`, `ack`. Within a single `Collab`, choose exactly one type of primitive; only `request` may appear multiple times separated by semicolons.  
+     - Example: `Collab(request({teammate},pickup(bell_pepper, ingredient_dispenser));request({teammate},place_obj_on_counter()))` or `Collab(ack({teammate}))`.  
+     - After the collaboration request, wait for the teammate's reply; during the next timestep decide whether to continue collaborating or switch to executing your own action.
+  2. **If no additional collaboration is required at this moment**, output a physical action that belongs to your skill set (e.g., `pickup(...)`, `put_obj_in_utensil(...)`).  
+     - Once collaboration is finished and the teammate has responded, the following timesteps must reassess whether to collaborate again or proceed with physical actions, ensuring only one action per timestep.

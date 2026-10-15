@@ -1,0 +1,19 @@
+# Example: python -m collab_overcooked.main --config configs/example.yaml
+# Every key except `agents` is a command-line argument of collab_overcooked.main;
+# arguments given on the command line override this file.
+order: boiled_egg
+horizon: 120
+episode: 1
+history_window: 3
+temperature: 0.7
+
+# Per-role LLM settings (optional). Keys: model, model_dirname, local_server_api,
+# base_url, api_key, api_key_env (name of an environment variable holding the key),
+# temperature, timeout.
+agents:
+  chef:
+    model: gpt-4o                      # OpenAI API, key from OPENAI_API_KEY
+  assistant:
+    model: Qwen2.5-7B-Instruct         # open-source model served by vLLM
+    model_dirname: Qwen/
+    local_server_api: http://localhost:8000/v1

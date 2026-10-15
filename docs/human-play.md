@@ -10,9 +10,9 @@ There is no human-agent chat or hidden human-goal input.
 From the repository root, preferably in a dedicated Python environment:
 
 ```bash
-pip install -r requirements-human.txt
 pip install -e lib/overcooked_ai
-python src/human_play.py --order boiled_egg --human-index 1 --log-dir play-logs
+pip install -e ".[human]"
+python -m collab_overcooked.human_play --order boiled_egg --human-index 1 --log-dir play-logs
 ```
 
 Open http://127.0.0.1:8080. Start the game and click the kitchen to focus the
@@ -62,7 +62,7 @@ both player roles by the integration tests, including a plated recipe.
 ### Chat-completions-compatible model server
 
 ```bash
-python src/human_play.py --order boiled_egg \
+python -m collab_overcooked.human_play --order boiled_egg \
   --agent-model YOUR_MODEL_ID --agent-base-url http://127.0.0.1:8000/v1 \
   --agent-timeout 10 --max-policy-lag 15
 ```
@@ -83,7 +83,7 @@ can still select a valid action that becomes strategically inappropriate.
 ### Custom HTTP agent
 
 ```bash
-python src/human_play.py --agent-url http://127.0.0.1:9000/action
+python -m collab_overcooked.human_play --agent-url http://127.0.0.1:9000/action
 ```
 
 The game POSTs one public observation to this endpoint:

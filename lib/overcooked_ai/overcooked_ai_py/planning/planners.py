@@ -84,7 +84,7 @@ class MotionPlanner(object):
         to go from starting position to goal position (not including 
         interaction action)."""
         # NOTE: currently unused, pretty bad code. If used in future, clean up
-        min_cost = np.Inf
+        min_cost = np.inf
         for d1, d2 in itertools.product(Direction.ALL_DIRECTIONS, repeat=2):
             start = (pos1, d1)
             end = (pos2, d2)
@@ -226,8 +226,8 @@ class MotionPlanner(object):
         Determines the minimum number of timesteps necessary for a player to go from any 
         terrain feature in list1 to any feature in list2 and perform an interact action
         """
-        min_dist = np.Inf
-        min_manhattan = np.Inf
+        min_dist = np.inf
+        min_manhattan = np.inf
         for pos1, pos2 in itertools.product(pos_list1, pos_list2):
             for mg1, mg2 in itertools.product(self.motion_goals_for_pos[pos1], self.motion_goals_for_pos[pos2]):
                 if not self.is_valid_motion_start_goal_pair(mg1, mg2):
@@ -242,7 +242,7 @@ class MotionPlanner(object):
                     min_dist = curr_dist
                 
         # +1 to account for interaction action
-        if manhattan_if_fail and min_dist == np.Inf:
+        if manhattan_if_fail and min_dist == np.inf:
             min_dist = min_manhattan
         min_cost = min_dist + 1
         return min_cost
@@ -254,7 +254,7 @@ class MotionPlanner(object):
         """
         start_pos = start_pos_and_or[0]
         assert self.mdp.get_terrain_type_at_pos(start_pos) != 'X'
-        min_dist = np.Inf
+        min_dist = np.inf
         best_feature = None
         for feature_pos in feature_pos_list:
             for feature_goal in self.motion_goals_for_pos[feature_pos]:
@@ -527,7 +527,7 @@ class JointMotionPlanner(object):
                 
                 # If one agent waiting causes other to crash into it, return None
                 if self._agents_are_in_same_position((curr_pos_or0, curr_pos_or1)):
-                    return None, None, [np.Inf, np.Inf]
+                    return None, None, [np.inf, np.inf]
                 
             else:
                 curr_pos_or0, curr_pos_or1 = next_pos_or0, next_pos_or1
@@ -542,7 +542,7 @@ class JointMotionPlanner(object):
         assert idx0 != idx1, "No conflict found"
 
         end_pos_and_or = (curr_pos_or0, curr_pos_or1)
-        finishing_times = (np.Inf, idx1) if wait_agent_idx == 0 else (idx0, np.Inf)
+        finishing_times = (np.inf, idx1) if wait_agent_idx == 0 else (idx0, np.inf)
         return joint_plan, end_pos_and_or, finishing_times
 
     def is_valid_joint_motion_goal(self, joint_goal_state):
@@ -859,13 +859,18 @@ class MediumLevelActionManager(object):
     
     def go_to_utensil_actions(self,state:OvercookedState,utensil,player_index):
         player_positions = state.players_pos_and_or
-        obj_locations = self.mdp.utensil_state_dict[utensil]['position']
-        pattern = r'\d+'
-        numbers = re.findall(pattern, utensil)
-        if numbers[0]=='0' or numbers[0] =='1':
-            obj_locations = [obj_locations]
-        else:
-            raise ValueError("Wrong pot number ID")
+        if not utensil:
+            return []
+
+        utensil_state = self.mdp.utensil_state_dict.get(utensil)
+        if not isinstance(utensil_state, dict):
+            return []
+
+        obj_position = utensil_state.get('position')
+        if obj_position is None:
+            return []
+
+        obj_locations = [tuple(obj_position)]
         
         visitable_cur = get_visitable_positions(player_positions[player_index], self.mdp)  
         visitable_oth = get_visitable_positions(player_positions[1 - player_index], self.mdp) 
@@ -914,10 +919,6 @@ class MediumLevelActionManager(object):
     #         return self._get_ml_actions_for_positions(separate_states)
     
 
-    # def pickup_tomato_actions(self, state, counter_objects):
-        tomato_dispenser_locations = self.mdp.get_tomato_dispenser_locations()
-        tomato_pickup_locations = tomato_dispenser_locations + counter_objects['tomato']
-        return self._get_ml_actions_for_positions(tomato_pickup_locations)
 
     def pickup_dish_actions(self, state, counter_objects):
         dish_dispenser_locations = self.mdp.get_dish_dispenser_locations()
@@ -1690,4 +1691,3 @@ class MediumLevelPlanner(object):
 #             print(str(env) + "HEURISTIC: {}".format(heuristic_cost))
 
 #         return heuristic_cost
-

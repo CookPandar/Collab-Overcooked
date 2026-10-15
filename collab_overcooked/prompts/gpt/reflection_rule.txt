@@ -1,0 +1,12 @@
+Input:
+You receive the snapshot of the timestep in which you made a wrong action and then corrected it:
+- 1. `History (latest decisions)` and `Current Observation`: Order, Scene, Agent State, Past conversation and Recent Goal, as in normal timesteps.
+- 2. Failed Reason: Your action XXX raised an error: XXXXX.
+- 3. Solution: Your action XXX successes at solving the problem.
+
+Output:
+Produce one field in the following format:
+  Rethink: XXXXX
+- Analyze the "Failed Reason" and "Solution" fields. Summarize the experience in a concise paragraph (no more than 50 words) to help you avoid similar mistakes. Format it as:  
+- "In a 'specific situation', when you want to produce a 'specific action', you need to pay attention to 'XXXX'."  
+- Replace the quoted parts based on the input.

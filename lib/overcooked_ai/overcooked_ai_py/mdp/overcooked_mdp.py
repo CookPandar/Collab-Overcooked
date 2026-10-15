@@ -101,6 +101,7 @@ class ObjectState(object):
     def to_dict(self):
         return {
             "name": self.name,
+            "catagory": self.catagory,
             "position": self.position,
             "state": self.state
         }
@@ -108,6 +109,17 @@ class ObjectState(object):
     @staticmethod
     def from_dict(obj_dict):
         obj_dict = copy.deepcopy(obj_dict)
+        # Backward compatibility: older snapshots/logs may miss the "catagory" field.
+        # We fall back to a reasonable default so that snapshot replay can proceed.
+        if "catagory" not in obj_dict:
+            name = obj_dict.get("name")
+            if name == "dish":
+                obj_dict["catagory"] = "dish"
+            elif name == "soup":
+                # Soup objects are created as semi-finished and may later be marked with_dish.
+                obj_dict["catagory"] = "semi-finished"
+            else:
+                obj_dict["catagory"] = "ingredient"
         return ObjectState(**obj_dict)
     
 
@@ -298,7 +310,7 @@ class OvercookedState(object):
 
     @property
     def num_orders_remaining(self):
-        return np.Inf if self.order_list is None else len(self.order_list)
+        return np.inf if self.order_list is None else len(self.order_list)
 
     def has_object(self, pos):
         return pos in self.objects
@@ -1275,12 +1287,12 @@ class OvercookedGridworld(object):
         if current_order == 'any' or soup_type == current_order:
             if (soup_type in self.Recipe.recipe_need_dish) and soup_obj.catagory == 'with_dish':
                 state.order_list = state.order_list[1:]
-                if len(state.order_list) <= state.k_order:
+                if (not self.one_task_mode) and len(state.order_list) <= state.k_order:
                     state.order_list = self.add_elements_based_on_probability(state.order_list, self.order_probability)
                 return state, self.delivery_reward
             elif soup_type not in self.Recipe.recipe_need_dish and soup_obj.catagory != 'with_dish':
                 state.order_list = state.order_list[1:]
-                if len(state.order_list) <= state.k_order:
+                if (not self.one_task_mode) and len(state.order_list) <= state.k_order:
                     state.order_list = self.add_elements_based_on_probability(state.order_list, self.order_probability)
                 return state, self.delivery_reward
 

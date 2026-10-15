@@ -1,9 +1,14 @@
-import os, pickle
-from overcooked_ai_py.utils import load_dict_from_file
+"""Planner cache helpers expected by :mod:`overcooked_ai_py.planning.planners`."""
 
-PLANNERS_DIR = os.path.dirname(os.path.abspath(__file__))
+import os
+import pickle
+
+from overcooked_ai_py.static import PLANNERS_DIR
+
 
 def load_saved_action_manager(filename):
-    with open(os.path.join(PLANNERS_DIR, filename), 'rb') as f:
-        mlp_action_manager = pickle.load(f)
-        return mlp_action_manager
+    path = filename
+    if not os.path.isabs(path):
+        path = os.path.join(PLANNERS_DIR, filename)
+    with open(path, "rb") as handle:
+        return pickle.load(handle)

@@ -1,0 +1,15 @@
+Input
+-----
+Each timestep provides the order, kitchen state, agent states and past conversation.
+Use the current state, role capabilities and recipe to choose the next action.
+
+Output
+------
+Return exactly one field on one line:
+Action: <one action>
+
+The action may be a physical action from your skill set or Collab(...).
+Collab permits request, seek, deny or ack. Only request may contain multiple
+requests separated by semicolons. Never combine a physical action with Collab.
+Respect which utensils and objects each agent can access.
+Do not output explanations, reasoning, plans, extra fields or code fences.

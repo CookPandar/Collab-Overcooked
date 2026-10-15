@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "collab-overcooked"
+version = "2.0.0"
+description = "Collab-Overcooked: benchmarking and evaluating LLMs as collaborative agents"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+human = ["aiohttp>=3.9,<4"]
+
+[project.scripts]
+collab-overcooked = "collab_overcooked.main:cli"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["collab_overcooked*"]
+
+[tool.setuptools.package-data]
+collab_overcooked = ["prompts/*/*.txt", "llama_tokenizer/*.json", "human_eval/*.html", "human_coop/*.html"]
