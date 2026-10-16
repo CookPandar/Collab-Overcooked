@@ -16,6 +16,22 @@ from overcooked_ai_py.planning.search import find_path, get_intersect_counter, q
 from ..config import PROMPT_DIR
 from .modules import Module, statistics_dict, turn_statistics_dict
 
+_LABELED_SECTION_HEADER = re.compile(r"^\s*(Think|Recent Goal|Action)\s*:", re.IGNORECASE | re.MULTILINE)
+
+
+def response_has_duplicate_labeled_sections(response: str) -> bool:
+    """A reply repeating a Think / Recent Goal / Action field is malformed."""
+    if not isinstance(response, str) or not response.strip():
+        return False
+    counts: Dict[str, int] = {}
+    for match in _LABELED_SECTION_HEADER.finditer(response):
+        key = match.group(1).strip().lower()
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] > 1:
+            return True
+    return False
+
+
 NAME_TO_ACTION = {
     "NORTH": Direction.NORTH,
     "SOUTH": Direction.SOUTH,
@@ -896,10 +912,12 @@ class LLMAgents(LLMPair):
         }
 
     @staticmethod
-    def _has_nonempty_tail_after_fenced_response(response: str) -> bool:
-        """A complete fenced reply must not be followed by extra narration."""
+    def _has_malformed_response(response: str) -> bool:
+        """A complete fenced reply followed by extra narration, or a reply with repeated fields."""
         if not isinstance(response, str):
             return False
+        if response_has_duplicate_labeled_sections(response):
+            return True
         stripped = response.strip()
         if not stripped.startswith("```"):
             return False
@@ -1189,7 +1207,7 @@ class LLMAgents(LLMPair):
         """One extra LLM call to rewrite a reply whose Action field is mixed, chained or malformed."""
         action_text = self.parse_response(response, "action")
         action_info = self._inspect_action_mode(action_text)
-        if self._has_nonempty_tail_after_fenced_response(response):
+        if self._has_malformed_response(response):
             action_info["mode"] = "malformed"
             action_info["malformed_tokens"] = action_info.get("tokens", [])
         self._annotate_last_log_metadata(action_mode=action_info["mode"])
@@ -1199,6 +1217,9 @@ class LLMAgents(LLMPair):
         self._report_format_issues([action_info["mode"] + "_action_types"])
         response, correction_tokens = self._rewrite_mixed_action_response(response, action_info["mode"])
         corrected_info = self._inspect_action_mode(self.parse_response(response, "action"))
+        if self._has_malformed_response(response):
+            corrected_info["mode"] = "malformed"
+            corrected_info["malformed_tokens"] = corrected_info.get("tokens", [])
         self._annotate_last_log_metadata(action_mode=corrected_info["mode"])
         if corrected_info["mode"] in {"mixed", "multi_embodied", "malformed"}:
             self._report_format_issues([corrected_info["mode"] + "_action_types"])
