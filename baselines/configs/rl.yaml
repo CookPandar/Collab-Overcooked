@@ -27,7 +27,7 @@ seed: 261008
 
 checkpoint_every: 20               # kept checkpoints; the latest two are always kept for recovery
 rollout_workers: 8
-tokens_per_batch: 8192             # tokens per forward pass of the update; lower it if out of memory
+tokens_per_batch: 6144             # tokens per forward pass of the update; lower it if out of memory
 vllm_python: python                # interpreter of the environment where vLLM is installed
 vllm_port: 18000                   # rank r of a torchrun job uses vllm_port + r
 vllm_kv_cache_gib: 8

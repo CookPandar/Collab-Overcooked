@@ -10,6 +10,48 @@ Two response formats (`response_protocol`): `action_only` (a single `Action:` fi
 
 Extra requirements: `peft`, and vLLM for RL (tested with 0.18; it may live in a separate environment, see `vllm_python`).
 
+## Shared data and checkpoints on the lab server
+
+Readable by the `cistusers` group:
+
+| What | Path |
+|---|---|
+| Base model (Qwen3-1.7B) | `/datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
+| SFT data, action only | `/datacache/collab_overcooked/sft_data/gpt4o_action_only_v2_l123/` |
+| SFT data, with Think | `/datacache/collab_overcooked/sft_data/gpt4o_clean_v2_l123/` |
+| SFT adapters, action only, Level 1-2 data (start of the RL runs below) | `/datacache/collab_overcooked/sft_checkpoints/action_only_l12/{Chef,Assistant}` |
+| SFT adapters, action only, Level 1-3 data | `/datacache/collab_overcooked/sft_checkpoints/action_only_l123/{Chef,Assistant}` |
+| SFT adapters, with Think, Level 1-3 data | `/datacache/collab_overcooked/sft_checkpoints/think_l123/{Chef,Assistant}` |
+
+The SFT data are cleaned GPT-4o calls (Level 1-3; files `{train,dev,test}_level12_{Chef,Assistant,both}.jsonl`, the
+`level12` stem is historical; each directory has a README). Level-3 tasks are split by order: carrot / mushroom soup
+for train, pumpkin soup for dev, potato / bell pepper soup for test. They were recorded with the earlier v1-style
+prompt text, so they are close to, not identical with, the v2 prompts; `baselines.sft.train` reads them directly
+(same tokens as the SFT that produced the adapters above). For data with the exact v2 prompts, collect new data
+with `baselines.sft.collect`.
+
+```bash
+python -m baselines.sft.train --model /datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
+    --data /datacache/collab_overcooked/sft_data/gpt4o_action_only_v2_l123/train_level12_both.jsonl \
+    --output runs/sft_action_only --gradient-checkpointing
+```
+
+## Results
+
+![RL curves](figures/rl_level2_level3.png)
+
+Qwen3-1.7B, action only, both roles trained from the Level 1-2 SFT adapters, AgentGym objective, ITES reward,
+8 episodes per update on one A40. Level 2 was trained with the earlier pipeline (same rewards, advantages and actor
+loss); Level 3 with the earlier pipeline up to update 34 and with `baselines.rl` from update 35 (dashed line).
+
+- **Level 2**: success rate 0 → 1.0 by update 19 and stays there; episodes get shorter (about 25 steps, 36 LLM calls).
+- **Level 3**: no delivery within 50 steps in 50 updates; the dense ITES reward per episode rises from -0.2 to
+  about 1.2 (more correct intermediate steps) while the number of LLM calls per episode falls. Level 3 needs more
+  than the Level 1-2 SFT start: e.g. the Level 1-3 SFT adapters above, a longer horizon or more updates.
+- KL to the SFT adapters stays about 0.02-0.05 with occasional spikes (0.56 at update 44).
+
+The curves of a run of `baselines.rl.train` are plotted with `python -m baselines.rl.plot RUN_DIR [RUN_DIR ...]`.
+
 ## 1. SFT data
 
 A teacher model plays the benchmark; its well-formed calls (no format or validator error) of successful episodes
