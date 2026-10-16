@@ -85,8 +85,11 @@ Optional `adaptive_lr` halves the learning rate of the following updates when th
   forward passes of every optimizer step; gradients are summed before each step. The update is the same as with
   one GPU (checked to 1e-7 in fp32).
 
-On one A40, an update of 395 calls takes 64 s instead of 220 s with one call per forward pass (peak 37 GB at
-`tokens_per_batch: 8192`), and vLLM is no longer restarted between collection and training.
+- vLLM sleeps during the update (its GPU memory goes to training) and decodes with CUDA graphs.
+
+On one A40 (Level 3, 8 episodes per update), an update takes 229 s on average (0.30 s per LLM call, collection and
+training together) instead of 536 s (0.60 s per call) with the earlier pipeline, which restarted vLLM and the
+trainer for every stage and scored one call per forward pass.
 
 ### Relation to the earlier pipeline
 
@@ -98,3 +101,9 @@ composition (the same as between two batch sizes of the new code). Two intention
 - the format-correction hint for a reply with several kitchen actions now asks for exactly one action;
 - the format penalty of a call proposing an action with invalid parameters goes to that call (before: to call 0
   of the previous time step).
+
+A bug of the earlier pipeline is fixed: from its second update on, its KL "reference" was the policy of the previous
+update instead of the SFT adapters (the reference adapters were a YAML alias of the actor adapters, which were
+overwritten in place with the latest checkpoint), so its KL term was a per-update trust region and its logged KL
+stayed small. Here the reference is always the SFT adapters; on the same Level-3 checkpoint both codes give the same
+KL to SFT (Chef 0.010 / 0.012, Assistant 0.028 / 0.026), about 0.02-0.03 after 35 updates.
