@@ -133,6 +133,8 @@ Every action is checked by a validator. If the action is invalid (wrong format o
 
 To drive the agents with your own model (e.g. for SFT or RL) and observe their LLM calls, validations and executed actions, see the [Extension API](docs/extension_api.md).
 
+SFT and RL baselines for small open models (AgentGym-RL and MARSHAL objectives, action-only or with Think) are in [baselines/](baselines/README.md).
+
 The prompts are in `collab_overcooked/prompts/gpt/`: `environment_rule.txt` (game rules), `chef_skill.txt` / `assistant_skill.txt` (actions), `communication_rule.txt` (input/output format) and `reflection_rule.txt`.
 
 ## Evaluation

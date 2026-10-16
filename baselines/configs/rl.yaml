@@ -1,0 +1,33 @@
+# python -m baselines.rl.train --config baselines/configs/rl.yaml [key=value ...]
+# e.g. `level=3 objective=marshal output_dir=runs/rl_l3_marshal`. Unset keys take the defaults of
+# baselines/rl/train.py.
+model: /path/to/Qwen3-1.7B
+adapters:                          # SFT adapters (baselines.sft.train); also the frozen KL reference
+  chef: runs/sft_action_only/Chef
+  assistant: runs/sft_action_only/Assistant
+output_dir: runs/rl_level2_agentgym
+
+level: 2                           # the five tasks of the level, mixed in every update
+updates: 50
+episodes_per_update: 8
+horizon: 50
+horizon_schedule: [[5, 20], [10, 35]]   # horizon 20 up to update 5, 35 up to 10, then `horizon`
+response_protocol: action_only     # think_action: Think / Recent Goal / Action (with Think-SFT adapters)
+max_new_tokens: 128                # raise it (e.g. 384) for think_action
+temperature: 0.7
+
+objective: agentgym                # agentgym | marshal (see baselines/rl/update.py)
+lr: 1.0e-5
+kl_coef: 0.02
+adaptive_lr: null                  # e.g. {kl_threshold: 0.05, decay: 0.5, min_scale: 0.1}
+
+reward: {format_penalty: 0.2, validator_penalty: 0.1, ites_weight: 1.0, tes_beta: 0.95}
+terminal_reward: 2.0
+seed: 261008
+
+checkpoint_every: 20               # kept checkpoints; the latest two are always kept for recovery
+rollout_workers: 8
+tokens_per_batch: 8192             # tokens per forward pass of the update; lower it if out of memory
+vllm_python: python                # interpreter of the environment where vLLM is installed
+vllm_port: 18000                   # rank r of a torchrun job uses vllm_port + r
+vllm_kv_cache_gib: 8
