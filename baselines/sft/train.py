@@ -3,6 +3,9 @@
     python -m baselines.sft.train --model /path/to/Qwen3-1.7B --data data/sft/gpt4o_think.jsonl \
         --output runs/sft_think
 
+Also accepts the earlier GPT-4o SFT files ({system, prompt, response, meta: {agent}}), whose messages are
+rebuilt with the agent's layout (system message + rule prompt + "<input>" + observation).
+
 Each role gets its own LoRA adapter (r=16, alpha=32 on q/k/v/o), saved as <output>/Chef and
 <output>/Assistant: the `adapters` of an RL config. The prompt is tokenized exactly as during RL rollouts
 (chat template, enable_thinking=False) and the loss covers the response tokens and the end-of-turn token.
@@ -19,6 +22,17 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 ROLE_ADAPTERS = {"chef": "Chef", "assistant": "Assistant"}
+SYSTEM = ("You are an intelligent agent planner, you need to generate output and plan in the specified format "
+          "according to the game rules and environmental status.")  # collab_overcooked/agents/modules.py
+
+
+def normalize(example):
+    """{role, messages, response}; converts the earlier {system, prompt, response, meta} format."""
+    if "messages" in example:
+        return example
+    return {"role": example["meta"]["agent"].lower(), "response": example["response"],
+            "messages": [{"role": "system", "content": SYSTEM},
+                         {"role": "user", "content": example["system"] + "<input>\n" + example["prompt"]}]}
 
 
 def encode(tokenizer, example, max_length):
@@ -98,7 +112,7 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
-    examples = [json.loads(line) for path in args.data for line in open(path)]
+    examples = [normalize(json.loads(line)) for path in args.data for line in open(path)]
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     for role in args.roles:
