@@ -16,11 +16,16 @@ class VLLMServer:
                  log_path=None):
         self.url = f"http://127.0.0.1:{port}"
         self.served = {}  # agent_index -> served adapter name
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), VLLM_ALLOW_RUNTIME_LORA_UPDATING="True")
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), VLLM_ALLOW_RUNTIME_LORA_UPDATING="True",
+                   VLLM_SERVER_DEV_MODE="1")  # enables /sleep and /wake_up
         command = [python, "-m", "vllm.entrypoints.openai.api_server", "--model", model, "--port", str(port),
                    "--host", "127.0.0.1", "--enable-lora", "--max-loras", "2", "--max-lora-rank", str(max_lora_rank),
-                   "--max-model-len", str(max_model_len), "--enable-prefix-caching",
-                   "--kv-cache-memory-bytes", str(int(kv_cache_gib * 2**30))]
+                   "--max-model-len", str(max_model_len), "--enable-prefix-caching", "--enable-sleep-mode",
+                   "--kv-cache-memory-bytes", str(int(kv_cache_gib * 2**30)),
+                   # the KV cache size is set above; vLLM still refuses to start unless this fraction is free
+                   "--gpu-memory-utilization", "0.3",
+                   # CUDA graphs for decoding without torch.compile (fast decoding, no compile dependency)
+                   "--compilation-config", json.dumps({"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"})]
         self.log = open(log_path, "a") if log_path else subprocess.DEVNULL
         self.process = subprocess.Popen(command, env=env, stdout=self.log, stderr=subprocess.STDOUT)
         self._wait()
@@ -55,6 +60,13 @@ class VLLMServer:
             if name not in self.served.values():
                 self._post("/v1/unload_lora_adapter", {"lora_name": name})
         return dict(self.served)
+
+    def sleep(self):
+        """Free the GPU memory of the server (weights to CPU, KV cache dropped) while the policy is trained."""
+        self._post("/sleep?level=1", {})
+
+    def wake_up(self):
+        self._post("/wake_up", {})
 
     def close(self):
         if self.process.poll() is None:

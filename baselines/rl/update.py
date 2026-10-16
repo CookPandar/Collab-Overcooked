@@ -16,6 +16,7 @@ the forward passes of every optimizer step are split across ranks and the gradie
 """
 
 import random
+import time
 
 import torch
 
@@ -125,8 +126,11 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
     step_chunks = [list(forward_chunks(samples, [i for i, *_ in step], tokens_per_batch))[rank::world]
                    for step in steps]
     all_chunks = [c for chunks in step_chunks for c in chunks]
+    timing = {"started": time.time()}
     old = score(policy, samples, all_chunks, policy.trainable, temperature)
+    timing["old"] = time.time()
     ref = score(policy, samples, all_chunks, policy.references, temperature) if policy.references else None
+    timing["ref"] = time.time()
     params = policy.parameters()
     optimizer = torch.optim.Adam(params, lr=lr)
     metrics = {"pg_loss": [], "kl": [], "ppo_kl": [], "clipfrac": [], "grad_norm": []}
@@ -191,5 +195,10 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
     result["update_kl"] = (sum(max(0.0, total / n) for total, n in update_kl.values()) / len(update_kl)
                            if update_kl else 0.0)
     result["optimizer_steps"] = len(steps)
+    result["forward_passes"] = len(all_chunks)
+    result["prompt_tokens"] = sum(len(s["prompt_ids"]) for s in samples)
+    result["seconds_old_logprobs"] = timing["old"] - timing["started"]
+    result["seconds_ref_logprobs"] = timing["ref"] - timing["old"]
+    result["seconds_train"] = time.time() - timing["ref"]
     result["calls"] = len(samples)
     return result

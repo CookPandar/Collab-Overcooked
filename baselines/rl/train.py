@@ -211,10 +211,13 @@ def main(argv=None):
                         "prompt_ids": torch.tensor(t["prompt_ids"]), "response_ids": torch.tensor(t["response_ids"])}
                        for t, a in zip(transitions, advantages)]
             update_started = time.time()
+            server.sleep()  # the GPU memory of vLLM goes to the update
             lr = cfg["lr"] * state["lr_scale"]
             metrics = ppo_update(policy, samples, objective=cfg["objective"], temperature=cfg["temperature"], lr=lr,
                                  tokens_per_batch=cfg["tokens_per_batch"], kl_coef=cfg["kl_coef"],
                                  seed=cfg["seed"] + update, rank=rank, world=world)
+            torch.cuda.empty_cache()
+            server.wake_up()
             update_seconds = time.time() - update_started
             state = {"update": update, "lr_scale": next_lr_scale(cfg["adaptive_lr"], state["lr_scale"],
                                                                  metrics["update_kl"])}
