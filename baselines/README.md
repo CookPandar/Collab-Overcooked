@@ -17,11 +17,16 @@ Readable by the `cistusers` group:
 | What | Path |
 |---|---|
 | Base model (Qwen3-1.7B) | `/datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` |
-| SFT data, action only | `/datacache/collab_overcooked/sft_data/gpt4o_action_only_v2_l123/` |
-| SFT data, with Think | `/datacache/collab_overcooked/sft_data/gpt4o_clean_v2_l123/` |
-| SFT adapters, action only, Level 1-2 data (start of the RL runs below) | `/datacache/collab_overcooked/sft_checkpoints/action_only_l12/{Chef,Assistant}` |
-| SFT adapters, action only, Level 1-3 data | `/datacache/collab_overcooked/sft_checkpoints/action_only_l123/{Chef,Assistant}` |
-| SFT adapters, with Think, Level 1-3 data | `/datacache/collab_overcooked/sft_checkpoints/think_l123/{Chef,Assistant}` |
+| SFT data, action only | `/home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_data/gpt4o_action_only_v2_l123/` |
+| SFT data, with Think | `/home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_data/gpt4o_clean_v2_l123/` |
+| SFT adapters, action only, Level 1-2 data (start of the RL runs below) | `/home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_checkpoints/action_only_l12/{Chef,Assistant}` |
+| SFT adapters, action only, Level 1-3 data | `/home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_checkpoints/action_only_l123/{Chef,Assistant}` |
+| SFT adapters, with Think, Level 1-3 data | `/home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_checkpoints/think_l123/{Chef,Assistant}` |
+
+The Think Level 1-3 adapters were replaced on 2026-10-18. The earlier copy (sha256 Chef 43b379f0, Assistant a554a32e)
+was trained with loss on the whole sequence and a chat layout different from inference, and scored 0 on Level 2-3; it is
+kept in `runs/think_judge/deprecated_think_l123_fullseq_loss`. The current adapters (Chef dd470648, Assistant
+7122b72b) were trained with `baselines.sft.train` (response-only loss, runtime layout).
 
 The SFT data are cleaned GPT-4o calls (Level 1-3; files `{train,dev,test}_level12_{Chef,Assistant,both}.jsonl`, the
 `level12` stem is historical; each directory has a README). Level-3 tasks are split by order: carrot / mushroom soup
@@ -32,7 +37,7 @@ with `baselines.sft.collect`.
 
 ```bash
 python -m baselines.sft.train --model /datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
-    --data /datacache/collab_overcooked/sft_data/gpt4o_action_only_v2_l123/train_level12_both.jsonl \
+    --data /home/zhangshuwen/Collab-Overcooked-private/runs/datacache_legacy/sft_data/gpt4o_action_only_v2_l123/train_level12_both.jsonl \
     --output runs/sft_action_only --gradient-checkpointing
 ```
 

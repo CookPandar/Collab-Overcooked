@@ -35,7 +35,17 @@ def normalize(example):
                          {"role": "user", "content": example["system"] + "<input>\n" + example["prompt"]}]}
 
 
-def encode(tokenizer, example, max_length):
+def row_weight(example, kind_weights):
+    """Loss weight of one example from the kind of its target action (--kind-weights); 1 when unset."""
+    if not kind_weights:
+        return 1.0
+    from baselines.rl.credit import is_collab, is_wait, normalize_action
+    action = normalize_action(example["response"])
+    kind = "wait" if is_wait(action) else "collab" if is_collab(action) else "physical"
+    return kind_weights.get(kind, 1.0)
+
+
+def encode(tokenizer, example, max_length, kind_weights=None):
     prompt = tokenizer.apply_chat_template(example["messages"], add_generation_prompt=True, tokenize=True,
                                            enable_thinking=False)
     if hasattr(prompt, "keys"):
@@ -44,12 +54,12 @@ def encode(tokenizer, example, max_length):
     response.append(tokenizer.convert_tokens_to_ids("<|im_end|>"))
     if len(prompt) + len(response) > max_length:
         return None
-    return torch.tensor(list(prompt) + response), len(prompt)
+    return torch.tensor(list(prompt) + response), len(prompt), row_weight(example, kind_weights)
 
 
 def train_role(model_path, examples, output, args):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    data = [x for x in (encode(tokenizer, e, args.max_length) for e in examples) if x is not None]
+    data = [x for x in (encode(tokenizer, e, args.max_length, args.kind_weights) for e in examples) if x is not None]
     print(f"{output.name}: {len(data)} examples ({len(examples) - len(data)} longer than {args.max_length})")
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).to(args.device)
     if args.gradient_checkpointing:
@@ -71,12 +81,12 @@ def train_role(model_path, examples, output, args):
         rng.shuffle(order)
         for start in range(0, len(order), args.batch_size):
             batch = [data[i] for i in order[start:start + args.batch_size]]
-            n_tokens = sum(len(ids) - prompt_len for ids, prompt_len in batch)
+            n_tokens = sum(weight * (len(ids) - prompt_len) for ids, prompt_len, weight in batch)
             total = 0.0
-            for ids, prompt_len in batch:  # one sequence per forward pass: no padding
+            for ids, prompt_len, weight in batch:  # one sequence per forward pass: no padding
                 ids = ids.to(args.device)
                 logits = model(input_ids=ids[None]).logits[0, prompt_len - 1:-1].float()
-                loss = torch.nn.functional.cross_entropy(logits, ids[prompt_len:], reduction="sum") / n_tokens
+                loss = weight * torch.nn.functional.cross_entropy(logits, ids[prompt_len:], reduction="sum") / n_tokens
                 loss.backward()
                 total += loss.item()
             grad_norm = torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -88,7 +98,8 @@ def train_role(model_path, examples, output, args):
                                   "lr": scheduler.get_last_lr()[0]}) + "\n")
             if step % 20 == 0:
                 print(f"{output.name} epoch {epoch} step {step}/{steps} loss {total:.4f}", flush=True)
-        model.save_pretrained(str(output.parent / "epochs" / f"epoch{epoch}" / output.name))
+        if args.save_every and epoch % args.save_every == 0 and epoch < args.epochs:  # storage is limited
+            model.save_pretrained(str(output.parent / "epochs" / f"epoch{epoch}" / output.name))
     model.save_pretrained(str(output))
     log.close()
 
@@ -100,6 +111,7 @@ def main(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--roles", nargs="+", default=["chef", "assistant"])
     parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--save_every", type=int, default=25, help="also keep epochs/epochN every N epochs (0: never)")
     parser.add_argument("--batch-size", type=int, default=16, help="sequences per optimizer step")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
@@ -110,6 +122,8 @@ def main(argv=None):
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--kind-weights", type=lambda s: {k: float(v) for k, v in (p.split("=") for p in s.split(","))},
+                        default=None, help="loss weight per target kind, e.g. physical=3,collab=1,wait=1")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
     examples = [normalize(json.loads(line)) for path in args.data for line in open(path)]
