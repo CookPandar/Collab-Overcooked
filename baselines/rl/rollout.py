@@ -10,6 +10,7 @@ from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from collab_overcooked.agent_factory import make_agent
 
 from .credit import CallCredit
+from .think_judge import action_start_token
 
 ROLES = ("chef", "assistant")
 SEED_MODULUS = 2**31 - 1
@@ -103,6 +104,7 @@ def run_episode(policy, order, horizon, *, seed, response_protocol="action_only"
             "timestep": record["timestep"],
             "call_index": record["call_index"],
             "call_type": record["call_type"],
+            "policy_call": record["metadata"].get("global_index"),  # set by policies that number their calls
             "action_mode": mode,
             "prompt_ids": record["metadata"]["prompt_ids"],
             "response_ids": record["metadata"]["response_ids"],
@@ -111,7 +113,17 @@ def run_episode(policy, order, horizon, *, seed, response_protocol="action_only"
             "format_reward": fmt,
             "validator_reward": val,
             "sequence_reward": ites,
+            "collab_reward": credit.collab_reward(record),
+            "uncooperative": record["uncooperative"],
+            "repeat": record.get("repeat", False),
+            "collab_requests": record.get("requests", 0),
+            "uptaken": record.get("uptaken", 0),
             "terminal_reward": 0.0,
+            "action_start": (action_start_token(policy.tokenizer, record["metadata"]["response_ids"],
+                                                record["response"]) if hasattr(policy, "tokenizer") else None),
+            "judge_record": {k: record[k] for k in ("agent_index", "call_type", "response", "observation",
+                                                    "history_before", "validations", "validated_action", "ites",
+                                                    "format_error")},
         })
     if success:
         for agent_index in (0, 1):
@@ -119,5 +131,6 @@ def run_episode(policy, order, horizon, *, seed, response_protocol="action_only"
             if last:
                 last[-1]["terminal_reward"] = float(terminal_reward)
     for t in transitions:
-        t["reward"] = t["format_reward"] + t["validator_reward"] + t["sequence_reward"] + t["terminal_reward"]
+        t["reward"] = (t["format_reward"] + t["validator_reward"] + t["sequence_reward"] + t["collab_reward"]
+                       + t["terminal_reward"])
     return {"order": order, "success": success, "steps": steps, "transitions": transitions}
