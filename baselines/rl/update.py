@@ -73,13 +73,18 @@ def forward_chunks(samples, indices, budget):
             yield role, chunk
 
 
-def score(policy, samples, chunks, adapters, temperature, grad=False):
-    """Token log-probs of the samples in `chunks`, with the adapter of each chunk's role."""
+def score(policy, samples, chunks, adapters, temperature, grad=False, entropy=None):
+    """Token log-probs of the samples in `chunks`, with the adapter of each chunk's role; a dict `entropy` receives
+    the token entropies."""
     result = {}
     for role, chunk in chunks:
         with torch.set_grad_enabled(grad):
             values = policy.token_logprobs(adapters[role], [samples[i]["prompt_ids"] for i in chunk],
-                                           [samples[i]["response_ids"] for i in chunk], temperature)
+                                           [samples[i]["response_ids"] for i in chunk], temperature,
+                                           with_entropy=entropy is not None)
+        if entropy is not None:
+            values, entropies = values
+            entropy.update(zip(chunk, entropies))
         result.update(zip(chunk, values))
     return result
 
@@ -115,9 +120,12 @@ def _optimizer_steps(samples, objective, rng):
 
 
 def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, tokens_per_batch=8192,
-               kl_coef=None, seed=0, rank=0, world=1):
+               kl_coef=None, entropy_coef=0.0, seed=0, rank=0, world=1, min_token_logprob=None):
     """`samples`: dicts with agent_index, prompt_ids, response_ids (LongTensor) and advantage; identical on all
-    ranks. Returns averaged metrics."""
+    ranks. `entropy_coef`: verl actor entropy bonus, - entropy_coef * token-mean entropy per call (weighted as the
+    pg loss). `min_token_logprob`: tokens whose recomputed old log-prob is below it (sampled by vLLM but nearly
+    impossible under the trained policy: the source of the KL spikes) are left out of the pg and KL terms.
+    Returns averaged metrics."""
     cfg = dict(OBJECTIVES[objective])
     if kl_coef is not None:
         cfg["kl_coef"] = kl_coef
@@ -133,7 +141,8 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
     timing["ref"] = time.time()
     params = policy.parameters()
     optimizer = torch.optim.Adam(params, lr=lr)
-    metrics = {"pg_loss": [], "kl": [], "ppo_kl": [], "clipfrac": [], "grad_norm": []}
+    metrics = {"pg_loss": [], "kl": [], "kl_clamped": [], "masked_tokens": [], "ppo_kl": [], "clipfrac": [],
+               "grad_norm": [], "entropy": []}
     update_kl = {}  # group (pair or call) -> [sum, tokens] of (ratio - 1) - log ratio
 
     for step, chunks in zip(steps, step_chunks):
@@ -142,25 +151,47 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
         pair_tokens = {group[0]: sum(len(samples[j]["response_ids"]) for j in group[1])
                        for _, _, group in weights.values() if group is not None}
         for role, chunk in chunks:
-            new = score(policy, samples, [(role, chunk)], policy.trainable, temperature, grad=True)
+            entropy = {} if entropy_coef else None
+            new = score(policy, samples, [(role, chunk)], policy.trainable, temperature, grad=True, entropy=entropy)
             loss = 0.0
             for i in chunk:
                 pg_w, kl_w, group = weights[i]
                 advantage = float(samples[i]["advantage"])
+                token_advantage = samples[i].get("token_advantage")
+                keep = None
+                if min_token_logprob is not None:
+                    keep = (old[i] >= min_token_logprob).to(new[i].dtype)
+                    metrics["masked_tokens"].append(float(1 - keep.mean()))
                 log_ratio = new[i] - old[i]
+                if keep is not None:
+                    log_ratio = log_ratio * keep  # masked tokens: ratio 1, no pg gradient
                 ratio = torch.exp(log_ratio)
                 clipped = torch.clamp(ratio, 1 - cfg["clip"], 1 + cfg["clip"])
-                pg = torch.maximum(-advantage * ratio, -advantage * clipped)
-                if cfg["dual_clip"] is not None and advantage < 0:
-                    pg = torch.minimum(pg, torch.full_like(pg, -cfg["dual_clip"] * advantage))
-                loss = loss + pg_w * pg.mean()
+                if token_advantage is not None:  # per-token advantages (think reward on the reasoning tokens)
+                    advantage = token_advantage.to(ratio.device)
+                    pg = torch.maximum(-advantage * ratio, -advantage * clipped)
+                    if cfg["dual_clip"] is not None:
+                        pg = torch.where(advantage < 0, torch.minimum(pg, -cfg["dual_clip"] * advantage), pg)
+                else:
+                    pg = torch.maximum(-advantage * ratio, -advantage * clipped)
+                    if cfg["dual_clip"] is not None and advantage < 0:
+                        pg = torch.minimum(pg, torch.full_like(pg, -cfg["dual_clip"] * advantage))
+                if keep is not None:
+                    pg = pg * keep
+                loss = loss + pg_w * (pg.sum() / keep.sum().clamp(min=1) if keep is not None else pg.mean())
+                if entropy is not None:
+                    loss = loss - entropy_coef * pg_w * entropy[i].mean()
+                    metrics["entropy"].append(float(entropy[i].detach().mean()))
                 if ref is not None:
                     kl = _kl(new[i], ref[i])
+                    if keep is not None:
+                        kl = kl * keep
                     if group is None:
                         loss = loss + cfg["kl_coef"] * kl_w * torch.clamp(kl, -10, 10).mean()
                     else:
                         loss = loss + cfg["kl_coef"] * kl_w * torch.clamp(kl, 0, 10).sum() / pair_tokens[group[0]]
                     metrics["kl"].append(float(kl.detach().mean()))
+                    metrics["kl_clamped"].append(float(torch.clamp(kl.detach(), 0, 10).mean()))
                 metrics["pg_loss"].append(float(pg.detach().mean()))
                 metrics["ppo_kl"].append(float(-log_ratio.detach().mean()))
                 metrics["clipfrac"].append(float(((ratio.detach() - 1).abs() > cfg["clip"]).float().mean()))
@@ -202,3 +233,59 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
     result["seconds_train"] = time.time() - timing["ref"]
     result["calls"] = len(samples)
     return result
+
+
+# ---- critic (PPO with GAE, the AgentGym-RL / verl DataParallelPPOCritic settings) ----------------------
+CRITIC = dict(lr=1e-5, cliprange_value=0.5, minibatch=16, grad_clip=1.0)
+
+
+def critic_values(policy, samples, tokens_per_batch=8192, token_level=False):
+    """Value of every sample's prompt under its role's critic (no gradient); with `token_level` a list of the values
+    before each response token."""
+    result = [0.0] * len(samples)
+    with torch.no_grad():
+        for role, chunk in forward_chunks(samples, list(range(len(samples))), tokens_per_batch):
+            prompts = [samples[i]["prompt_ids"] for i in chunk]
+            if token_level:
+                values = [v.tolist() for v in policy.token_values(role, prompts, [samples[i]["response_ids"] for i in chunk])]
+            else:
+                values = policy.values(role, prompts).tolist()
+            for i, v in zip(chunk, values):
+                result[i] = v
+    return result
+
+
+def critic_update(policy, samples, returns, old_values, tokens_per_batch=8192, lr=None, cliprange_value=None):
+    """One pass over the calls of each role in order, minibatches of 16, clipped value loss as verl
+    compute_value_loss: 0.5 * mean(max((V - R)^2, (clip(V, V_old -+ c) - R)^2)). A fresh Adam per update and role.
+    With per-token `returns` / `old_values` (lists) the mean is over the response tokens of the minibatch."""
+    cfg = dict(CRITIC, **{k: v for k, v in (("lr", lr), ("cliprange_value", cliprange_value)) if v is not None})
+    token_level = bool(samples) and isinstance(returns[0], list)
+    metrics = {"value_loss": [], "value_clipfrac": [], "grad_norm": []}
+    for role in sorted(policy.critics):
+        params = policy.critic_parameters(role)
+        optimizer = torch.optim.Adam(params, lr=cfg["lr"])
+        index = [i for i, s in enumerate(samples) if s["agent_index"] == role
+                 and (not token_level or len(s["response_ids"]))]
+        for start in range(0, len(index), cfg["minibatch"]):
+            batch = index[start:start + cfg["minibatch"]]
+            denominator = sum(len(returns[i]) for i in batch) if token_level else len(batch)
+            optimizer.zero_grad(set_to_none=True)
+            for _, chunk in forward_chunks(samples, batch, tokens_per_batch):
+                prompts = [samples[i]["prompt_ids"] for i in chunk]
+                if token_level:
+                    values = torch.cat(policy.token_values(role, prompts, [samples[i]["response_ids"] for i in chunk]))
+                    target = torch.tensor([r for i in chunk for r in returns[i]], device=values.device)
+                    old = torch.tensor([v for i in chunk for v in old_values[i]], device=values.device)
+                else:
+                    values = policy.values(role, prompts)
+                    target = torch.tensor([returns[i] for i in chunk], device=values.device)
+                    old = torch.tensor([old_values[i] for i in chunk], device=values.device)
+                clipped = old + torch.clamp(values - old, -cfg["cliprange_value"], cfg["cliprange_value"])
+                loss = 0.5 * torch.maximum((values - target) ** 2, (clipped - target) ** 2)
+                (loss.sum() / denominator).backward()
+                metrics["value_loss"] += loss.detach().tolist()
+                metrics["value_clipfrac"] += ((values - old).abs() > cfg["cliprange_value"]).float().tolist()
+            metrics["grad_norm"].append(float(torch.nn.utils.clip_grad_norm_(params, cfg["grad_clip"])))
+            optimizer.step()
+    return {k: (sum(v) / len(v) if v else 0.0) for k, v in metrics.items()}
