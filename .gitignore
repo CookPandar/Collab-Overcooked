@@ -23,4 +23,16 @@ openai_key.txt
 embedding_cache.json
 *.pkl
 *.log
-runs/
+runs/*
+!runs/think_judge/
+runs/think_judge/*
+!runs/think_judge/*.py
+!runs/think_judge/*.sh
+!runs/think_judge/*.md
+!runs/think_judge/DELETED_20261026.txt
+!runs/think_judge/configs/
+runs/think_judge/configs/*
+!runs/think_judge/configs/*.yaml
+!runs/think_judge/gigpo_check/
+runs/think_judge/gigpo_check/*
+!runs/think_judge/gigpo_check/*.py

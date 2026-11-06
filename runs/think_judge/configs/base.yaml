@@ -1,0 +1,25 @@
+# Think-reward experiment: Level-2 RL from the Level 1-2 Think SFT adapters, Level-3 zero-shot evaluation.
+model: /datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+adapters:
+  chef: runs/think_judge/sft_think_l12/Chef
+  assistant: runs/think_judge/sft_think_l12/Assistant
+level: 2
+updates: 20
+episodes_per_update: 4
+horizon: 50
+horizon_schedule: [[3, 20], [6, 35]]
+response_protocol: think_action
+max_new_tokens: 384
+temperature: 0.7
+objective: agentgym
+lr: 1.0e-5
+kl_coef: 0.02
+reward: {format_penalty: 0.2, validator_penalty: 0.1, ites_weight: 1.0, tes_beta: 0.95}
+terminal_reward: 2.0
+judge: {env_file: ~/ParaCook/.env.shuaiapi.local, model: gpt-5.6-terra, workers: 8}
+checkpoint_every: 25
+rollout_workers: 4
+tokens_per_batch: 4096
+vllm_python: /home/zhangshuwen/vllm/bin/python
+vllm_kv_cache_gib: 6
+seed: 261008

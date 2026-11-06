@@ -1,0 +1,44 @@
+model: /datacache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+adapters:
+  chef: runs/think_judge/sft_think_l12/Chef
+  assistant: runs/think_judge/sft_think_l12/Assistant
+level: 2
+response_protocol: think_action
+max_new_tokens: 384
+temperature: 0.7
+objective: agentgym
+lr: 1.0e-5
+tokens_per_batch: 4096
+vllm_python: /home/zhangshuwen/vllm/bin/python
+vllm_kv_cache_gib: 6
+seed: 261008
+tasks: [baked_pumpkin_slices, boiled_green_bean_slices, boiled_potato_slices]
+horizon: 50
+horizon_schedule: [[3, 20], [6, 35]]
+judge: null
+think_reward: {mode: none, weight: 0.0}
+checkpoint_every: 25
+save_every: 25
+rollout_workers: 8
+# ---- team-grounded reward (2026-11-03, docs/reward_redesign.md; offline gate
+# /archive/public/zhangshuwen/reward_redesign_20261103/) ----
+# team reward per timestep = 2 x team reference-progress increment + 2 at delivery (units of the old terminal
+# reward 2); team return, discount 0.7 per timestep; local: invalid output (incl. no Action) -1 with A capped at
+# it, rejected action -0.4, -0.02 per call (= the offline-gated 1 / 1 / 0.5 / 0.2 / 0.01, x2; smoke: x1 gave grad norm 0.05)
+reward_scheme: team
+team: {gamma: 0.7, progress_weight: 2.0, success_reward: 2.0, call_cost: 0.02, shaping: delta}
+reward: {format_penalty: 1.0, validator_penalty: 0.4, ites_weight: 1.0, tes_beta: 0.95, empty_invalid: true}
+terminal_reward: 2.0   # unused under reward_scheme team
+# optimisation: 16 shuffled optimizer steps per role per update (fixed; the 16-call minibatches gave 31 -> 299); stronger KL to the SFT policy, tighter guard
+update_steps: 16
+kl_coef: 0.05
+kl_guard: {min_token_logprob: -9.21, max_update_kl: 0.05, max_ref_kl: 0.2, lr_decay: 0.5, min_lr_scale: 0.1}
+episodes_per_update: 12
+group_size: 4
+updates: 50
+# PPO, call-level critic on the team rewards (each role's call chain), local terms kept local, whitening only
+# when the std exceeds 1; per-call discount 0.85 ~ 0.7 per timestep at ~2 calls per timestep
+advantage_estimator: gae
+critic: {level: call, lr: 1.0e-5, head_lr: 1.0e-4, epochs: 2, persistent: true, gamma: 0.85, lam: 0.95,
+         cliprange_value: 0.5, warmup: 0, gates: [format], local_penalties: true, std_floor: 1.0}
+output_dir: runs/think_judge/rl/l2tm_ppo
