@@ -243,7 +243,7 @@ class CallCredit:
 
     def __init__(self, order, format_penalty=0.2, validator_penalty=0.1, ites_weight=1.0, tes_beta=0.95,
                  collab_weight=0.0, uncoop_penalty=0.0, uncoop_kinds=("repeat", "idle"), collab_mode="promise",
-                 collab_window=5):
+                 collab_window=5, chatter_limit=2, empty_invalid=False):
         self.references = load_references(order)
         # collaboration reward (port of the v1 ProcessRewardTracker option): a Collab request is credited with the
         # TES gain the requested action would give the teammate, once per gain; the teammate is credited the same
@@ -265,7 +265,14 @@ class CallCredit:
         self.uncoop_penalty = -abs(uncoop_penalty)
         self.uncoop_kinds = tuple(uncoop_kinds)  # which of "repeat" / "idle" are penalized
         self.sent = {0: set(), 1: set()}  # each agent's Collab messages since the last executed action
+        # "chatter" (uncoop kind): the agent already sent `chatter_limit` messages since the last executed action
+        # of either agent, whatever their text (paraphrased repeats escape "repeat")
+        self.chatter_limit = chatter_limit
+        self.n_sent = {0: 0, 1: 0}
         self.format_penalty = -abs(format_penalty)
+        # empty_invalid: a reply without any action (no Action field, mostly cut off at max_new_tokens) gets the
+        # format penalty too (it is an invalid output; by default it is a free no-op)
+        self.empty_invalid = empty_invalid
         self.validator_penalty = -abs(validator_penalty)
         self.ites_weight = ites_weight
         self.tes_beta = tes_beta
@@ -300,6 +307,7 @@ class CallCredit:
             "collab": 0.0,
             "uncooperative": None,
             "repeat": False,      # a Collab message the agent already sent since the last executed action
+            "msg_index": None,    # Collab message: how many the agent sent before it since the last executed action
             "requests": 0,        # uptake: new requests of this call / how many of them the teammate took up
             "uptaken": 0,
         }
@@ -352,6 +360,7 @@ class CallCredit:
         after = max((tes(history, ref, self.tes_beta) for ref in self.references[agent_index]), default=0.0)
         record["validated_action"] = action
         self.sent = {0: set(), 1: set()}  # the kitchen changed: a message may be repeated
+        self.n_sent = {0: 0, 1: 0}
         record["ites"] = self.ites_weight * (after - self.scores[agent_index])
         self.scores[agent_index] = after
         if self.collab_weight and self.collab_mode == "uptake":
@@ -419,17 +428,24 @@ class CallCredit:
         message = normalize_action(action_field(record["response"]))
         repeat = message in self.sent[record["agent_index"]]
         self.sent[record["agent_index"]].add(message)
+        record["msg_index"] = self.n_sent[record["agent_index"]]
+        self.n_sent[record["agent_index"]] += 1
         return repeat
 
     def uncooperative(self, record):
         """"repeat": a Collab message the agent already sent since the last executed action (of either agent; so
-        alternating two messages is a repeat too); "idle": a wait while the agent's next reference step can be done
+        alternating two messages is a repeat too); "chatter": any Collab message after the agent's first
+        `chatter_limit` messages since the last executed action; "idle": a wait while the agent's next reference step can be done
         now (next_step_ready); else None. Only the kinds in `uncoop_kinds` are returned."""
         agent_index = record["agent_index"]
         action = action_field(record["response"])
         mode = response_mode(record["response"])
         if mode == "communication":
-            return "repeat" if record["repeat"] and "repeat" in self.uncoop_kinds else None
+            if record["repeat"] and "repeat" in self.uncoop_kinds:
+                return "repeat"
+            if "chatter" in self.uncoop_kinds and record["msg_index"] >= self.chatter_limit:
+                return "chatter"
+            return None
         if mode == "wait" and record["call_type"] in REWARDABLE_CALL_TYPES and "idle" in self.uncoop_kinds:
             steps = next_steps(self.histories[agent_index], self.references[agent_index])
             if steps and all(next_step_ready(s, record["observation"], agent_index) for s in steps):
@@ -448,7 +464,7 @@ class CallCredit:
     def rewards(self, record):
         """(mode, format_reward, validator_reward, ites_reward) of a call record."""
         mode = response_mode(record["response"])
-        if mode in {"mixed", "multi_embodied", "malformed"}:
+        if mode in {"mixed", "multi_embodied", "malformed"} or (mode == "empty" and self.empty_invalid):
             return mode, self.format_penalty, 0.0, 0.0
         fmt = self.format_penalty if record["format_error"] else 0.0
         if mode in {"communication", "wait"}:

@@ -116,6 +116,7 @@ def run_episode(policy, order, horizon, *, seed, response_protocol="action_only"
             "collab_reward": credit.collab_reward(record),
             "uncooperative": record["uncooperative"],
             "repeat": record.get("repeat", False),
+            "msg_index": record.get("msg_index"),
             "collab_requests": record.get("requests", 0),
             "uptaken": record.get("uptaken", 0),
             "terminal_reward": 0.0,

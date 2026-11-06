@@ -23,12 +23,14 @@ import yaml
 
 from collab_overcooked.config import TASK_LEVELS
 
-from .advantages import (centered_judge_scores, check_gates, compute_advantages, gae_advantages, gated,
-                         grpo_advantages, normalize_advantages, ratio_scale, redundant_calls, think_advantages,
+from .advantages import (advantage_metrics, team_advantages, team_metrics, team_progress, team_returns,
+                         category_scores, centered_judge_scores, check_gates, compute_advantages, gae_advantages,
+                         gated, grpo_advantages, normalize_advantages, ratio_scale, redundant_calls, think_advantages,
                          think_weight, token_gae_advantages)
 from .rule_rewards import extract, rewards, rule_signal
 from .policy import CRITIC_ADAPTERS, ROLE_ADAPTERS, LoraPolicy
 from .serving import VLLMServer
+from .collab_rm_judge import CollabRMJudge
 from .think_judge import ThinkJudge, judge_episode, judgeable
 from .update import critic_update, critic_values, next_lr_scale, ppo_update
 
@@ -71,10 +73,43 @@ DEFAULTS = {
     "advantage_estimator": "reinforce",
     "group_size": 4,
     "grpo_gates": [],                  # our GRPO variant: "invalid" and / or "failure" (see grpo_advantages)
+    # GRPO corrections (grpo_advantages; the defaults keep verl's outcome GRPO): grpo_norm "none" = Dr.GRPO (no
+    # division by the group std); grpo_score "outcome": the trajectory score leaves out the format / validator
+    # penalties, which stay local to their call; grpo_min_spread: DAPO, groups whose scores span <= it are dropped
+    # (group advantage 0); grpo_step_weight > 0: GiGPO step-level advantage over same-anchor-state calls
+    "grpo_norm": "std",
+    "grpo_score": "all",
+    "grpo_min_spread": None,
+    "grpo_step_weight": 0.0,
+    "grpo_step_gamma": 0.95,
+    "grpo_step_norm": None,            # None: as grpo_norm
     "critic": {"lr": 1e-5, "cliprange_value": 0.5, "gamma": 1.0, "lam": 1.0, "level": "call", "warmup": 0,
-               "gates": []},          # gates: as grpo_gates, applied to the (per-token) GAE advantages
+               "gates": [],           # gates: as grpo_gates, applied to the (per-token) GAE advantages
+               # head_lr: value-head learning rate (default lr); epochs: passes per update; persistent: keep the
+               # critic Adam across updates. warmup_ev: train the critic only (actor frozen) until the explained
+               # variance of the critic on each new batch, measured before training on it, is >= warmup_ev for
+               # warmup_patience consecutive updates (at most warmup_max updates); `updates` then counts actor
+               # updates. replay: during that warmup also fit the last `replay` batches (with lam 1 the returns
+               # do not depend on the critic) without value clipping.
+               "head_lr": None, "epochs": 1, "persistent": False, "warmup_ev": None, "warmup_patience": 2,
+               "warmup_max": 40, "warmup_window": 1, "replay": 0,  # warmup_window: mean EV of the last k batches
+               # local_penalties: format / validator penalties kept out of the GAE rewards and added to the call's own
+               # advantage (call level only); std_floor: whiten with max(std, std_floor)
+               "local_penalties": False, "std_floor": 0.0},
+    # reward scheme "team" (docs/reward_redesign.md, advantages.team_*): one team reward per timestep, the team's
+    # reference progress increment (both agents' validated kitchen actions) + success_reward at delivery; every
+    # call gets the team return (discount team.gamma per timestep) minus a baseline (team.baseline: group_time =
+    # other episodes of the same group at the same timestep, batch, none), no std division, + its local terms:
+    # format penalty (invalid output, advantage capped at the penalty), validator penalty, -call_cost.
+    # Estimator "team" uses these advantages; "gae" uses the team rewards with the local terms kept local.
+    # ITES and terminal_reward are not used then (ITES is still logged).
+    "reward_scheme": "env",            # env | team
+    "team": {"gamma": 0.7, "progress_weight": 1.0, "success_reward": 1.0, "call_cost": 0.01,
+             "baseline": "group_time", "shaping": "delta"},
+    "update_steps": None,              # agentgym: optimizer steps per role per update over shuffled calls (None: 16-call minibatches in order)
     "advantage_norm": None,            # "role": (A - mean) / std over the calls of each role in the update batch;
                                        # "role_sign": the same, clipped so that no advantage changes sign
+    "advantage_std_floor": 0.0,        # advantage_norm role / role_sign: divide by max(std, floor) (0: plain std)
     "reward": {"format_penalty": 0.2, "validator_penalty": 0.1, "ites_weight": 1.0, "tes_beta": 0.95},
     "terminal_reward": 2.0,
     "intra_gamma": 1.0,                # < 1: the k-th call of an agent in a timestep gets intra_gamma^k of the
@@ -92,8 +127,11 @@ DEFAULTS = {
     # rules_combine "mean": the weighted mean of the rules instead of the sum; scale "ratio": per role, the centered
     # think signal is rescaled to std = `ratio` x std(A) of the batch (advantages.ratio_scale); center "role_type":
     # centered within (role, action kind) groups (message / wait / kitchen action) instead of per role
+    # category: a rule critic instead of a judge, {category: score} over advantages.CATEGORIES (e.g. act_progress,
+    # msg_pos2, wait), one fixed score per call by its category (docs/reward_shaping.md section 8)
     "think_reward": {"mode": "none", "weight": 0.5, "anneal_to": None, "anneal": None, "grounding_weight": 0.0,
-                     "scale": None, "rules": None, "rules_combine": "sum", "ratio": 0.25, "center": "role"},
+                     "scale": None, "rules": None, "rules_combine": "sum", "ratio": 0.25, "center": "role",
+                     "category": None},
     "judge": None,                     # ThinkJudge kwargs, e.g. {env_file: ~/ParaCook/.env.shuaiapi.local, model: gpt-5.5}
     "save_rollouts": True,             # rollouts/uNNNNN.jsonl.gz: every call with its rewards and judgement
     "save_every": 25,                  # rollouts and judge annotations only of update 1, every save_every-th and the last
@@ -120,6 +158,16 @@ def load_config(path, overrides=()):
         if not cfg[key]:
             raise ValueError(f"config needs `{key}`")
     return cfg
+
+
+_REFERENCES = {}
+
+
+def load_references_cached(order):
+    if order not in _REFERENCES:
+        from .credit import load_references
+        _REFERENCES[order] = load_references(order)
+    return _REFERENCES[order]
 
 
 def next_stage(adaptive, stage, progress):
@@ -312,7 +360,7 @@ def save_rollouts(path, episodes, transitions, scores, pairs):
                 "adv_think": adv_think, "adv_action": adv_action, "action_start": t.get("action_start"),
                 "value": t["value"][0] if isinstance(t.get("value"), list) and t["value"] else t.get("value"),
                 "redundancy_reward": t.get("redundancy_reward", 0.0), "repeat": t.get("repeat"),
-                "collab_requests": t.get("collab_requests"), "uptaken": t.get("uptaken"),
+                "msg_index": t.get("msg_index"), "collab_requests": t.get("collab_requests"), "uptaken": t.get("uptaken"),
                 "response_tokens": len(t["response_ids"])}) + "\n")
         for e in episodes:
             f.write(json.dumps({"episode_summary": e["episode_id"], "order": e["order"], "success": e["success"],
@@ -330,6 +378,7 @@ def summarize(episodes):
         "collab_per_episode": sum(t.get("collab_reward", 0.0) for t in calls) / n,
         "calls_per_episode": len(calls) / n,
         "repeat_per_episode": sum(t.get("uncooperative") == "repeat" for t in calls) / n,
+        "chatter_per_episode": sum(t.get("uncooperative") == "chatter" for t in calls) / n,
         "idle_per_episode": sum(t.get("uncooperative") == "idle" for t in calls) / n,
         "format_error_rate": sum(t["format_reward"] < 0 for t in calls) / max(1, len(calls)),
         "validator_error_rate": sum(t["validator_reward"] < 0 for t in calls) / max(1, len(calls)),
@@ -345,6 +394,7 @@ def comm_metrics(calls):
     messages = [t for t in calls if t.get("action_mode") == "communication"]
     steps = {(t.get("episode"), t["agent_index"], t["timestep"]) for t in calls}
     result = {"comm/repeat_share": sum(bool(t.get("repeat")) for t in messages) / max(1, len(messages)),
+              "comm/chatter_share": sum((t.get("msg_index") or 0) >= 2 for t in messages) / max(1, len(messages)),
               "comm/calls_per_agent_step": len(calls) / max(1, len(steps))}
     for role, name in ROLES.items():
         mine = [t for t in calls if t["agent_index"] == role]
@@ -409,8 +459,10 @@ def main(argv=None):
         served = server.load_adapters(current, f"u{state['update']}")
         policy = LoraPolicy(cfg["model"], current, initial, device=device)
         estimator = cfg["advantage_estimator"]
-        if estimator not in ("reinforce", "grpo", "gae"):
+        if estimator not in ("reinforce", "grpo", "gae", "team"):
             raise ValueError(f"unknown advantage_estimator {estimator}")
+        if estimator == "team" and cfg["reward_scheme"] != "team":
+            raise ValueError("advantage_estimator team needs reward_scheme team")
         if estimator != "reinforce" and cfg["advantage_norm"]:
             raise ValueError("advantage_norm only applies to the reinforce estimator")
         if estimator == "grpo" and cfg["episodes_per_update"] % cfg["group_size"]:
@@ -422,6 +474,8 @@ def main(argv=None):
             check_gates(critic_cfg["gates"])
             if critic_cfg["level"] not in ("call", "token"):
                 raise ValueError(f"unknown critic level {critic_cfg['level']}")
+            if critic_cfg["level"] == "token" and (critic_cfg["local_penalties"] or critic_cfg["std_floor"]):
+                raise ValueError("critic.local_penalties / std_floor need critic.level call")
             if state["update"]:  # resume: the critic saved with the checkpoint
                 saved = {i: checkpoints / f"u{state['update']:05d}" / CRITIC_ADAPTERS[i] for i in ROLES}
                 policy.add_critics(saved, {i: saved[i] / "value_head.pt" for i in ROLES})
@@ -430,13 +484,23 @@ def main(argv=None):
         pool = multiprocessing.get_context("spawn").Pool(cfg["rollout_workers"], _init_worker, (cfg["model"],))
         n_tasks, per_update = len(cfg["tasks"]), cfg["episodes_per_update"]
         judge_log = str(out / "judge_annotations" / f"rank{rank}.jsonl")
-        judge = ThinkJudge(**dict({"log_path": judge_log}, **cfg["judge"])) if cfg.get("judge") else None
         think_cfg = dict(DEFAULTS["think_reward"], **(cfg.get("think_reward") or {}))
+        # the rule critic (think_reward.category) needs no judge: a judge left in the config would only cost API calls
+        judge_cls = CollabRMJudge if (cfg.get("judge") or {}).get("type") == "collab_rm" else ThinkJudge
+        judge = (judge_cls(**dict({"log_path": judge_log}, **cfg["judge"]))
+                 if cfg.get("judge") and not think_cfg["category"] else None)
         if estimator == "gae" and critic_cfg["level"] == "token" and think_cfg["mode"] != "none":
             raise ValueError("the token-level critic only runs with think mode none")
-        if think_cfg["mode"] != "none" and judge is None:
+        if think_cfg["mode"] != "none" and judge is None and not think_cfg["category"]:
             raise ValueError("think_reward.mode needs a `judge`")
-        for update in range(state["update"] + 1, cfg["updates"] + 1):
+        warmup_ev = critic_cfg["warmup_ev"] if estimator == "gae" else None
+        last_update = cfg["updates"] + (critic_cfg["warmup_max"] if warmup_ev is not None else 0)
+        replay = []  # (samples, returns) of the last critic-only batches
+        for update in range(state["update"] + 1, last_update + 1):
+            if warmup_ev is not None and state.get("actor_updates", 0) >= cfg["updates"]:
+                break
+            critic_only = estimator == "gae" and (update <= critic_cfg["warmup"]
+                                                  or (warmup_ev is not None and not state.get("critic_ready")))
             started = time.time()
             adaptive = cfg["horizon_adaptive"]
             horizon = adaptive["stages"][state.get("stage", 0)] if adaptive else horizon_at(cfg, update)
@@ -446,8 +510,8 @@ def main(argv=None):
             jobs = []
             for e in range(rank, per_update, world):
                 episode_id = (update - 1) * per_update + e
-                # grpo: `group_size` consecutive episodes play the same order (one group)
-                slot = episode_id // cfg["group_size"] if estimator == "grpo" else episode_id
+                # grpo / team: `group_size` consecutive episodes play the same order (one group)
+                slot = episode_id // cfg["group_size"] if estimator in ("grpo", "team") else episode_id
                 jobs.append({"cfg": cfg, "url": server.url, "served": served, "horizon": horizon,
                              "order": cfg["tasks"][slot % n_tasks], "episode_id": episode_id,
                              "seed": cfg["seed"] + episode_id * 100003})
@@ -458,6 +522,7 @@ def main(argv=None):
                 judge.context = {"run": str(out), "update": update, "think_mode": think_cfg["mode"]}
                 n_judged = (rule_episodes(judge, local, think_cfg["rules"], think_cfg["rules_combine"])
                             if think_cfg["rules"]
+                            else judge.judge_episodes(local) if isinstance(judge, CollabRMJudge)
                             else judge_episodes(judge, local))
                 n_failed = sum(1 for e in local for t in e["transitions"]
                                if t.get("judge") is not None and t["judge"].get("score") is None)
@@ -471,12 +536,35 @@ def main(argv=None):
                                 success=e["success"])
                            for e in episodes for t in e["transitions"]]
             critic_metrics, asleep = {}, False
+            if think_cfg["category"]:  # rule critic: a fixed score per call category, no judge
+                for t, (score, cat) in zip(transitions, category_scores(transitions, think_cfg["category"])):
+                    t["judge"] = {"score": score, "category": cat}
             if cfg["redundancy_penalty"]:
                 for t, flag in zip(transitions, redundant_calls(transitions)):
                     t["redundancy_reward"] = -cfg["redundancy_penalty"] if flag else 0.0
                     t["reward"] += t["redundancy_reward"]
-            if estimator == "grpo":
-                advantages = grpo_advantages(transitions, gates=cfg["grpo_gates"])
+            grpo_stats = {}
+            if cfg["reward_scheme"] == "team":
+                team_cfg = dict(DEFAULTS["team"], **(cfg.get("team") or {}))
+                for t in transitions:
+                    t["validated_action"] = t["judge_record"]["validated_action"]
+                    t["call_cost"] = -abs(team_cfg["call_cost"])
+                progress = team_progress(transitions, load_references_cached)
+                curves = team_returns(transitions, progress, team_cfg["gamma"], team_cfg["progress_weight"],
+                                      team_cfg["success_reward"], team_cfg["shaping"])
+                for t, p in zip(transitions, progress):
+                    t["team_progress"] = p
+                    t["reward"] = t["team_reward"] + t["format_reward"] + t["validator_reward"] + t["call_cost"]
+                    t["terminal_reward"] = 0.0
+            elif cfg["reward_scheme"] != "env":
+                raise ValueError(f"unknown reward_scheme {cfg['reward_scheme']}")
+            if estimator == "team":
+                advantages = team_advantages(transitions, curves, team_cfg["gamma"], team_cfg["baseline"], grpo_stats)
+            elif estimator == "grpo":
+                advantages = grpo_advantages(transitions, gates=cfg["grpo_gates"], norm=cfg["grpo_norm"],
+                                             score=cfg["grpo_score"], min_spread=cfg["grpo_min_spread"],
+                                             stats=grpo_stats, step_weight=cfg["grpo_step_weight"],
+                                             step_gamma=cfg["grpo_step_gamma"], step_norm=cfg["grpo_step_norm"])
             elif estimator == "gae":
                 server.sleep()  # the critic forward passes need the GPU memory of vLLM
                 asleep = True
@@ -492,7 +580,9 @@ def main(argv=None):
                                         for t, adv in zip(transitions, token_advantages)]
                     advantages = [sum(a) / len(a) if a else 0.0 for a in token_advantages]
                 else:
-                    advantages, returns = gae_advantages(transitions, values, critic_cfg["gamma"], critic_cfg["lam"])
+                    advantages, returns = gae_advantages(transitions, values, critic_cfg["gamma"], critic_cfg["lam"],
+                                                         local_penalties=critic_cfg["local_penalties"],
+                                                         std_floor=critic_cfg["std_floor"])
                     advantages = [min(a, 0.0) if gated(t, critic_cfg["gates"]) else a
                                   for t, a in zip(transitions, advantages)]
                 for t, v in zip(transitions, values):
@@ -502,9 +592,11 @@ def main(argv=None):
             advantages = [max(-cfg["advantage_clip"], min(cfg["advantage_clip"], a)) for a in advantages]
             if cfg["advantage_norm"] in ("role", "role_sign"):
                 advantages = normalize_advantages(transitions, advantages, cfg["advantage_clip"],
-                                                  keep_sign=cfg["advantage_norm"] == "role_sign")
+                                                  keep_sign=cfg["advantage_norm"] == "role_sign",
+                                                  std_floor=cfg["advantage_std_floor"])
             elif cfg["advantage_norm"]:
                 raise ValueError(f"unknown advantage_norm {cfg['advantage_norm']}")
+            adv_metrics = advantage_metrics(transitions, advantages)
             raw = [think_signal(t.get("judge"), think_cfg["grounding_weight"]) for t in transitions]
             think = centered_judge_scores(transitions, raw, think_cfg["center"])
             think_scale = think_scale_assistant = 1.0
@@ -536,8 +628,20 @@ def main(argv=None):
             if not asleep:
                 server.sleep()  # the GPU memory of vLLM goes to the update
             if estimator == "gae":  # verl updates the critic, then the actor
-                critic_metrics = critic_update(policy, samples, returns, values, cfg["tokens_per_batch"],
-                                               critic_cfg["lr"], critic_cfg["cliprange_value"])
+                fit_samples, fit_returns, fit_values = samples, returns, values
+                if critic_only and critic_cfg["replay"]:
+                    for old_samples, old_returns in replay:
+                        fit_samples, fit_returns = fit_samples + old_samples, fit_returns + old_returns
+                    fit_values = values + [[0.0] * len(r) if isinstance(r, list) else 0.0
+                                           for _, rs in replay for r in rs]
+                critic_metrics = critic_update(policy, fit_samples, fit_returns, fit_values, cfg["tokens_per_batch"],
+                                               critic_cfg["lr"],
+                                               None if critic_only and critic_cfg["replay"]
+                                               else critic_cfg["cliprange_value"],
+                                               head_lr=critic_cfg["head_lr"], epochs=critic_cfg["epochs"],
+                                               persistent=critic_cfg["persistent"], seed=cfg["seed"] + update)
+                if critic_only and critic_cfg["replay"]:
+                    replay = (replay + [([dict(x) for x in samples], returns)])[-critic_cfg["replay"]:]
                 flat_r, flat_v = returns, values
                 if critic_cfg["level"] == "token":
                     flat_r, flat_v = [r for rs in returns for r in rs], [v for vs in values for v in vs]
@@ -548,7 +652,7 @@ def main(argv=None):
                 var_e = sum((r - v) ** 2 for r, v in zip(flat_r, flat_v)) / max(1, len(flat_r))
                 critic_metrics["explained_var"] = 1 - var_e / var_r if var_r > 0 else 0.0
             lr = cfg["lr"] * state["lr_scale"]
-            if estimator == "gae" and update <= critic_cfg["warmup"]:  # verl trainer.critic_warmup
+            if critic_only:  # verl trainer.critic_warmup (or until the critic reaches warmup_ev)
                 metrics = {"pg_loss": 0.0, "kl": 0.0, "ppo_kl": 0.0, "clipfrac": 0.0, "grad_norm": 0.0,
                            "update_kl": 0.0, "critic_warmup": 1}
             else:
@@ -558,7 +662,8 @@ def main(argv=None):
                                      lr=lr, tokens_per_batch=cfg["tokens_per_batch"], kl_coef=cfg["kl_coef"],
                                      entropy_coef=cfg["entropy_coef"],
                                      seed=cfg["seed"] + update, rank=rank, world=world,
-                                     min_token_logprob=(guard or {}).get("min_token_logprob"))
+                                     min_token_logprob=(guard or {}).get("min_token_logprob"),
+                                     update_steps=cfg["update_steps"])
                 if guard:
                     metrics["reverted"] = int(kl_anomaly(guard, metrics))
                     if metrics["reverted"]:
@@ -578,7 +683,16 @@ def main(argv=None):
             if adaptive:  # episodes are gathered on every rank, so all ranks agree on the stage
                 progress = progress + [summarize(episodes)["ites_per_episode"] / 2]
                 stage, progress = (stage + 1, []) if next_stage(adaptive, stage, progress) > stage else (stage, progress)
-            state = {"update": update, "lr_scale": lr_scale, "stage": stage, "stage_progress": progress}
+            ready, streak = state.get("critic_ready", False), state.get("critic_streak", 0)
+            history = state.get("critic_ev", [])
+            if warmup_ev is not None and not ready:  # explained variance before fitting this batch: held out
+                history = (history + [critic_metrics.get("explained_var", 0.0)])[-critic_cfg["warmup_window"]:]
+                smoothed = sum(history) / len(history)
+                streak = streak + 1 if (smoothed >= warmup_ev and len(history) == critic_cfg["warmup_window"]) else 0
+                ready = streak >= critic_cfg["warmup_patience"] or update >= critic_cfg["warmup_max"]
+            state = {"update": update, "lr_scale": lr_scale, "stage": stage, "stage_progress": progress,
+                     "actor_updates": state.get("actor_updates", 0) + (not critic_only),
+                     "critic_ready": ready, "critic_streak": streak, "critic_ev": history}
 
             directory = checkpoints / f"u{update:05d}"
             if rank == 0:
@@ -587,7 +701,8 @@ def main(argv=None):
             served = server.load_adapters({i: directory / ROLE_ADAPTERS[i] for i in ROLES}, f"u{update}")
             if rank == 0:
                 think_tokens = [t["action_start"] for t in transitions if t.get("action_start") is not None]
-                record = {"update": update, "horizon": horizon, "lr": lr, **summarize(episodes),
+                record = {"update": update, "horizon": horizon, "lr": lr, "critic_only": int(critic_only),
+                          "actor_updates": state["actor_updates"], **summarize(episodes),
                           **judge_metrics(transitions), "think/weight": weight, "think/scale": think_scale,
                           "think/scale_assistant": think_scale_assistant,
                           "think/reasoning_tokens": sum(think_tokens) / max(1, len(think_tokens)),
@@ -602,6 +717,8 @@ def main(argv=None):
                           "orders": [e["order"] for e in episodes],
                           **{f"update/{k}": v for k, v in metrics.items()},
                           **{f"critic/{k}": v for k, v in critic_metrics.items()},
+                          **{f"grpo/{k}": v for k, v in grpo_stats.items()}, **adv_metrics,
+                          **(team_metrics(transitions, advantages) if cfg["reward_scheme"] == "team" else {}),
                           "time/collect": collect_seconds, "time/update": update_seconds,
                           "time/total": time.time() - started}
                 with (out / "metrics.jsonl").open("a") as f:

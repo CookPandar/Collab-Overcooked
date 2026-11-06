@@ -143,3 +143,52 @@ def test_ratio_scale_sets_the_think_std_per_role():
     assert scaled[4] == pytest.approx(0.1 * factors[1])
     flat, f = ratio_scale(calls, advantages, [0.0] * 6, raw, 0.25)
     assert f == {0: 0.0, 1: 0.0} and flat == [0.0] * 6
+
+
+def test_chatter_counts_messages_since_the_last_executed_action():
+    credit = CallCredit(ORDER, uncoop_penalty=0.1, uncoop_kinds=["repeat", "chatter"], chatter_limit=2)
+    a = respond(credit, 0, 0, 0, FETCH_MSG)
+    b = respond(credit, 0, 0, 1, 'Collab(ack(Assistant, "go"))')
+    c = respond(credit, 0, 0, 2, 'Collab(ack(Assistant, "go now"))')   # paraphrase: not a repeat, but chatter
+    d = respond(credit, 0, 0, 3, FETCH_MSG)                            # repeat wins over chatter
+    assert [record(credit, x)["msg_index"] for x in (a, b, c, d)] == [0, 1, 2, 3]
+    assert [record(credit, x)["uncooperative"] for x in (a, b, c, d)] == [None, None, "chatter", "repeat"]
+    execute(credit, respond(credit, 1, 0, 0, FETCH), FETCH)
+    e = respond(credit, 0, 1, 0, 'Collab(ack(Assistant, "go now"))')
+    assert record(credit, e)["msg_index"] == 0 and record(credit, e)["uncooperative"] is None
+
+
+def test_chatter_off_by_default():
+    credit = CallCredit(ORDER, uncoop_penalty=0.1, uncoop_kinds=["repeat"])
+    calls = [respond(credit, 0, 0, k, f'Collab(ack(Assistant, "m{k}"))') for k in range(4)]
+    assert all(record(credit, x)["uncooperative"] is None for x in calls)
+
+
+def test_normalize_std_floor():
+    from baselines.rl.advantages import normalize_advantages
+    calls = [dict(agent_index=0, format_reward=0.0)] * 4
+    small = [0.1, -0.1, 0.1, -0.1]
+    assert normalize_advantages(calls, small) == pytest.approx([1, -1, 1, -1], abs=1e-4)
+    assert normalize_advantages(calls, small, std_floor=1.0) == pytest.approx(small, abs=1e-5)
+    large = [2.0, -2.0, 2.0, -2.0]
+    assert normalize_advantages(calls, large, std_floor=1.0) == pytest.approx([1, -1, 1, -1], abs=1e-4)
+
+
+def test_call_categories_rule_critic():
+    from baselines.rl.advantages import call_categories, category_scores
+
+    def call(ts, ci, agent, mode, response, val=0.0, ites=0.0, fmt=0.0):
+        return {"episode": 0, "timestep": ts, "call_index": ci, "agent_index": agent, "action_mode": mode,
+                "response": response, "validator_reward": val, "sequence_reward": ites, "format_reward": fmt}
+
+    msg_a = 'Think: x\nAction: Collab("Assistant: pickup(pumpkin)")'
+    msg_b = 'Think: x\nAction: Collab("Assistant: cut(pumpkin)")'
+    calls = [call(0, 0, 0, "communication", msg_a), call(0, 1, 0, "communication", msg_b),
+             call(0, 2, 0, "communication", msg_a), call(0, 3, 0, "communication", 'Think: x\nAction: Collab("c")'),
+             call(0, 4, 1, "planner_main", "Action: pickup(pumpkin)", ites=0.2),
+             call(1, 5, 0, "communication", msg_a), call(1, 6, 1, "planner_main", "Action: cut(x)", val=-0.1),
+             call(1, 7, 1, "wait", "Action: wait(1)"), call(1, 8, 1, "planner_main", "Action: x", fmt=-0.2)]
+    assert call_categories(calls) == ["msg_pos1", "msg_pos2", "msg_repeat", "msg_pos3", "act_progress", "msg_pos1",
+                                      "act_rejected", "wait", None]
+    scores = category_scores(calls, {"act_progress": 0.8, "msg_pos1": 0.0})
+    assert scores[4] == (0.8, "act_progress") and scores[0] == (0.0, "msg_pos1") and scores[1] == (None, "msg_pos2")

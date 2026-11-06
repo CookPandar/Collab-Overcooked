@@ -94,10 +94,22 @@ def _kl(new, ref):
     return torch.exp(x) - x - 1
 
 
-def _optimizer_steps(samples, objective, rng):
-    """List of optimizer steps; each is a list of (sample index, pg weight, kl weight, kl normalizer group)."""
+def _optimizer_steps(samples, objective, rng, update_steps=None):
+    """List of optimizer steps; each is a list of (sample index, pg weight, kl weight, kl normalizer group).
+    update_steps (agentgym only): instead of minibatches of 16 calls in call order (so the number of optimizer
+    steps grows with the number of calls, and a minibatch holds consecutive calls of one episode), each role's
+    calls are shuffled and split into `update_steps` minibatches of (nearly) equal size, loss = their mean."""
     cfg = OBJECTIVES[objective]
     steps = []
+    if objective == "agentgym" and update_steps:
+        for role in (0, 1):
+            role_indices = [i for i, s in enumerate(samples) if s["agent_index"] == role]
+            rng.shuffle(role_indices)
+            k = min(update_steps, len(role_indices))
+            for j in range(k):
+                chunk = role_indices[j::k]
+                steps.append([(i, 1.0 / len(chunk), 1.0 / len(chunk), None) for i in chunk])
+        return steps
     if objective == "agentgym":
         for role in (0, 1):
             role_indices = [i for i, s in enumerate(samples) if s["agent_index"] == role]
@@ -120,7 +132,7 @@ def _optimizer_steps(samples, objective, rng):
 
 
 def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, tokens_per_batch=8192,
-               kl_coef=None, entropy_coef=0.0, seed=0, rank=0, world=1, min_token_logprob=None):
+               kl_coef=None, entropy_coef=0.0, seed=0, rank=0, world=1, min_token_logprob=None, update_steps=None):
     """`samples`: dicts with agent_index, prompt_ids, response_ids (LongTensor) and advantage; identical on all
     ranks. `entropy_coef`: verl actor entropy bonus, - entropy_coef * token-mean entropy per call (weighted as the
     pg loss). `min_token_logprob`: tokens whose recomputed old log-prob is below it (sampled by vLLM but nearly
@@ -130,7 +142,7 @@ def ppo_update(policy, samples, objective="agentgym", temperature=0.7, lr=1e-5, 
     if kl_coef is not None:
         cfg["kl_coef"] = kl_coef
     samples = [s for s in samples if len(s["response_ids"]) > 0]
-    steps = _optimizer_steps(samples, objective, random.Random(seed))
+    steps = _optimizer_steps(samples, objective, random.Random(seed), update_steps)
     step_chunks = [list(forward_chunks(samples, [i for i, *_ in step], tokens_per_batch))[rank::world]
                    for step in steps]
     all_chunks = [c for chunks in step_chunks for c in chunks]
@@ -255,20 +267,40 @@ def critic_values(policy, samples, tokens_per_batch=8192, token_level=False):
     return result
 
 
-def critic_update(policy, samples, returns, old_values, tokens_per_batch=8192, lr=None, cliprange_value=None):
-    """One pass over the calls of each role in order, minibatches of 16, clipped value loss as verl
-    compute_value_loss: 0.5 * mean(max((V - R)^2, (clip(V, V_old -+ c) - R)^2)). A fresh Adam per update and role.
+def critic_update(policy, samples, returns, old_values, tokens_per_batch=8192, lr=None, cliprange_value=None,
+                  head_lr=None, epochs=1, persistent=False, seed=0):
+    """`epochs` passes over the calls of each role, minibatches of 16, clipped value loss as verl
+    compute_value_loss: 0.5 * mean(max((V - R)^2, (clip(V, V_old -+ c) - R)^2)) (cliprange_value None: no clip).
+    A fresh Adam per update and role, or with `persistent` one Adam per role kept across updates (policy attribute);
+    `head_lr`: learning rate of the value head (default `lr`; the head starts at zero, the LoRA from the actor).
     With per-token `returns` / `old_values` (lists) the mean is over the response tokens of the minibatch."""
     cfg = dict(CRITIC, **{k: v for k, v in (("lr", lr), ("cliprange_value", cliprange_value)) if v is not None})
+    no_clip = cliprange_value is None
     token_level = bool(samples) and isinstance(returns[0], list)
     metrics = {"value_loss": [], "value_clipfrac": [], "grad_norm": []}
+    optimizers = getattr(policy, "critic_optimizers", None) if persistent else None
+    if persistent and optimizers is None:
+        optimizers = policy.critic_optimizers = {}
+    rng = random.Random(seed)
     for role in sorted(policy.critics):
         params = policy.critic_parameters(role)
-        optimizer = torch.optim.Adam(params, lr=cfg["lr"])
+        head = list(policy.value_heads[role].parameters())
+        groups = [{"params": [p for p in params if all(p is not h for h in head)], "lr": cfg["lr"]},
+                  {"params": head, "lr": head_lr or cfg["lr"]}]
+        optimizer = optimizers.get(role) if optimizers is not None else None
+        if optimizer is None:
+            optimizer = torch.optim.Adam(groups)
+            if optimizers is not None:
+                optimizers[role] = optimizer
         index = [i for i, s in enumerate(samples) if s["agent_index"] == role
                  and (not token_level or len(s["response_ids"]))]
-        for start in range(0, len(index), cfg["minibatch"]):
-            batch = index[start:start + cfg["minibatch"]]
+        order = []
+        for epoch in range(epochs):  # the first pass in order (as before), later passes shuffled
+            batch_order = list(index)
+            if epoch:
+                rng.shuffle(batch_order)
+            order += [batch_order[k:k + cfg["minibatch"]] for k in range(0, len(batch_order), cfg["minibatch"])]
+        for batch in order:
             denominator = sum(len(returns[i]) for i in batch) if token_level else len(batch)
             optimizer.zero_grad(set_to_none=True)
             for _, chunk in forward_chunks(samples, batch, tokens_per_batch):
@@ -281,7 +313,8 @@ def critic_update(policy, samples, returns, old_values, tokens_per_batch=8192, l
                     values = policy.values(role, prompts)
                     target = torch.tensor([returns[i] for i in chunk], device=values.device)
                     old = torch.tensor([old_values[i] for i in chunk], device=values.device)
-                clipped = old + torch.clamp(values - old, -cfg["cliprange_value"], cfg["cliprange_value"])
+                clipped = values if no_clip else old + torch.clamp(values - old, -cfg["cliprange_value"],
+                                                                    cfg["cliprange_value"])
                 loss = 0.5 * torch.maximum((values - target) ** 2, (clipped - target) ** 2)
                 (loss.sum() / denominator).backward()
                 metrics["value_loss"] += loss.detach().tolist()
